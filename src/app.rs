@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
@@ -74,6 +75,12 @@ impl NodeAttrPanelDock {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeAttrSortColumn {
+    NodeId,
+    TableColumn(usize),
+}
+
 pub struct SpectralApp {
     #[cfg(not(target_arch = "wasm32"))]
     mgf_path: String,
@@ -116,8 +123,11 @@ pub struct SpectralApp {
     show_node_attributes_panel: bool,
     node_attr_search_query: String,
     node_attr_panel_dock: NodeAttrPanelDock,
+    node_attr_sort_column: NodeAttrSortColumn,
+    node_attr_sort_ascending: bool,
     node_attr_bottom_height: f32,
     node_attr_right_width: f32,
+    pending_center_node_id: Option<usize>,
 
     #[cfg(target_arch = "wasm32")]
     upload_promise: Option<poll_promise::Promise<Result<UploadedFile, String>>>,
@@ -165,8 +175,11 @@ impl SpectralApp {
             show_node_attributes_panel: true,
             node_attr_search_query: String::new(),
             node_attr_panel_dock: NodeAttrPanelDock::Bottom,
+            node_attr_sort_column: NodeAttrSortColumn::NodeId,
+            node_attr_sort_ascending: true,
             node_attr_bottom_height: 260.0,
             node_attr_right_width: 560.0,
+            pending_center_node_id: None,
             #[cfg(target_arch = "wasm32")]
             upload_promise: None,
         }
@@ -184,6 +197,7 @@ impl SpectralApp {
         self.layout_low_motion_streak = 0;
         self.request_fit_view = false;
         self.view_state.dragging_node_id = None;
+        self.pending_center_node_id = None;
     }
 
     fn set_loaded_spectra(&mut self, loaded: LoadedSpectra) {
@@ -197,6 +211,17 @@ impl SpectralApp {
             loaded.source_label
         ));
         self.error_message = None;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reset_node_attribute_table_state(&mut self, table_columns: usize) {
+        self.node_attr_search_query.clear();
+        self.node_attr_sort_column = if table_columns > 0 {
+            NodeAttrSortColumn::TableColumn(0)
+        } else {
+            NodeAttrSortColumn::NodeId
+        };
+        self.node_attr_sort_ascending = true;
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -224,7 +249,7 @@ impl SpectralApp {
                 let cols = loaded.table.columns.len();
                 if is_node {
                     self.node_attributes = Some(loaded);
-                    self.node_attr_search_query.clear();
+                    self.reset_node_attribute_table_state(cols);
                 } else {
                     self.edge_attributes = Some(loaded);
                 }
@@ -564,6 +589,79 @@ impl SpectralApp {
         self.view_state.pan = egui::Vec2::new(-center_x * scaled, -center_y * scaled);
     }
 
+    fn center_view_on_node(&mut self, canvas_size: egui::Vec2, node_id: usize) -> bool {
+        if canvas_size.x <= 1.0 || canvas_size.y <= 1.0 {
+            return false;
+        }
+        let Some(pos) = self.positions.get(&node_id) else {
+            return false;
+        };
+        let base_scale = (canvas_size.x.min(canvas_size.y) * 0.4).max(1e-6);
+        let scaled = base_scale * self.view_state.zoom;
+        self.view_state.pan = egui::Vec2::new(-pos[0] * scaled, -pos[1] * scaled);
+        true
+    }
+
+    fn focus_view_on_node_set(
+        &mut self,
+        canvas_size: egui::Vec2,
+        component_nodes: &[usize],
+        node_id: usize,
+    ) -> bool {
+        if canvas_size.x <= 1.0 || canvas_size.y <= 1.0 {
+            return false;
+        }
+        if component_nodes.is_empty() {
+            return self.center_view_on_node(canvas_size, node_id);
+        }
+
+        let mut min_x = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        let mut found = 0usize;
+
+        for member_id in component_nodes {
+            let Some(pos) = self.positions.get(member_id) else {
+                continue;
+            };
+            found += 1;
+            min_x = min_x.min(pos[0]);
+            max_x = max_x.max(pos[0]);
+            min_y = min_y.min(pos[1]);
+            max_y = max_y.max(pos[1]);
+        }
+
+        if found == 0 {
+            return self.center_view_on_node(canvas_size, node_id);
+        }
+
+        // Fit full component with generous margins so all nodes remain visible.
+        let padding = (found as f32).sqrt() * 0.02 + 0.25;
+        min_x -= padding;
+        max_x += padding;
+        min_y -= padding;
+        max_y += padding;
+
+        let width = (max_x - min_x).max(0.05);
+        let height = (max_y - min_y).max(0.05);
+        let base_scale = (canvas_size.x.min(canvas_size.y) * 0.4).max(1e-6);
+        let half_w = (canvas_size.x * 0.5 - 64.0).max(32.0);
+        let half_h = (canvas_size.y * 0.5 - 64.0).max(32.0);
+        let half_span_x = (width * 0.5).max(0.05);
+        let half_span_y = (height * 0.5).max(0.05);
+        let zoom_x = half_w / (half_span_x * base_scale);
+        let zoom_y = half_h / (half_span_y * base_scale);
+        let fit_zoom = zoom_x.min(zoom_y);
+        self.view_state.zoom = (fit_zoom * 0.94).clamp(0.02, 16.0);
+
+        let center_x = (min_x + max_x) * 0.5;
+        let center_y = (min_y + max_y) * 0.5;
+        let scaled = base_scale * self.view_state.zoom;
+        self.view_state.pan = egui::Vec2::new(-center_x * scaled, -center_y * scaled);
+        true
+    }
+
     fn node_attribute_key_for_node(&self, node: &crate::network::NetworkNode) -> Option<String> {
         match self.node_attr_match_field {
             NodeAttrMatchField::NodeId => Some(node.id.to_string()),
@@ -678,6 +776,7 @@ impl SpectralApp {
             ui.label("No node attributes table loaded.");
             return;
         };
+        let column_names = table.table.columns.clone();
 
         let visible_ids =
             visible_node_ids_for_view(network, self.component_selection, self.hide_singletons);
@@ -688,6 +787,9 @@ impl SpectralApp {
             let Some(node) = node_by_id.get(node_id) else {
                 continue;
             };
+            if self.hide_singletons && node.degree == 0 {
+                continue;
+            }
             let Some(key) = self.node_attribute_key_for_node(node) else {
                 continue;
             };
@@ -702,30 +804,58 @@ impl SpectralApp {
                 egui::TextEdit::singleline(&mut self.node_attr_search_query)
                     .hint_text("Filter matched rows..."),
             );
-            if ui.button("Clear").clicked() {
+            if ui.button("Clear search").clicked() {
                 self.node_attr_search_query.clear();
             }
         });
 
-        let query = self.node_attr_search_query.trim().to_lowercase();
+        let query = self.node_attr_search_query.trim().to_ascii_lowercase();
         let matched_count = matched_rows.len();
-        let filtered_rows: Vec<(usize, usize)> = if query.is_empty() {
-            matched_rows
-        } else {
-            matched_rows
-                .iter()
-                .copied()
-                .filter(|(node_id, row_idx)| {
-                    if node_id.to_string().to_lowercase().contains(&query) {
-                        return true;
+        let mut filtered_rows: Vec<(usize, usize)> = matched_rows
+            .iter()
+            .copied()
+            .filter(|(node_id, row_idx)| {
+                let node_id_text = node_id.to_string();
+                let node_id_lower = node_id_text.to_ascii_lowercase();
+                let Some(row) = table.row(*row_idx) else {
+                    return false;
+                };
+
+                if query.is_empty() {
+                    return true;
+                }
+                if node_id_lower.contains(&query) {
+                    return true;
+                }
+                row.iter()
+                    .any(|value| value.to_ascii_lowercase().contains(&query))
+            })
+            .collect();
+
+        filtered_rows.sort_by(
+            |(left_node_id, left_row_idx), (right_node_id, right_row_idx)| {
+                let ordering = match self.node_attr_sort_column {
+                    NodeAttrSortColumn::NodeId => left_node_id.cmp(right_node_id),
+                    NodeAttrSortColumn::TableColumn(col_idx) => {
+                        let left_value = table
+                            .row(*left_row_idx)
+                            .and_then(|row| row.get(col_idx))
+                            .map_or("", String::as_str);
+                        let right_value = table
+                            .row(*right_row_idx)
+                            .and_then(|row| row.get(col_idx))
+                            .map_or("", String::as_str);
+                        compare_node_attr_values(left_value, right_value)
                     }
-                    table.row(*row_idx).is_some_and(|row| {
-                        row.iter()
-                            .any(|value| value.to_lowercase().contains(&query))
-                    })
-                })
-                .collect()
-        };
+                };
+
+                if self.node_attr_sort_ascending {
+                    ordering
+                } else {
+                    ordering.reverse()
+                }
+            },
+        );
 
         ui.small(format!(
             "Matched rows for visible nodes: {} / {} (shown: {})",
@@ -761,8 +891,15 @@ impl SpectralApp {
             ui.label("No visible node matched the current key/match-field selection.");
         }
 
-        let table_height = ui.available_height().max(1.0);
+        let table_height = ui.available_height().max(120.0);
         let text_height = ui.text_style_height(&egui::TextStyle::Body).max(18.0);
+        let sort_column = self.node_attr_sort_column;
+        let sort_ascending = self.node_attr_sort_ascending;
+        let feature_id_column_idx = column_names
+            .iter()
+            .position(|name| normalized_column_name(name) == "featureid");
+        let mut clicked_sort: Option<NodeAttrSortColumn> = None;
+        let mut clicked_feature_id: Option<String> = None;
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), table_height),
             egui::Layout::top_down(egui::Align::Min),
@@ -775,23 +912,40 @@ impl SpectralApp {
                             .striped(true)
                             .resizable(true)
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                            .column(Column::auto().at_least(72.0))
                             .min_scrolled_height(0.0)
                             .max_scroll_height(table_height)
                             .vscroll(true);
 
                         for _ in &table.table.columns {
-                            table_builder = table_builder.column(Column::auto().at_least(120.0));
+                            table_builder = table_builder.column(
+                                Column::initial(170.0)
+                                    .at_least(120.0)
+                                    .clip(false)
+                                    .resizable(true),
+                            );
                         }
 
                         table_builder
                             .header(text_height + 4.0, |mut header| {
-                                header.col(|ui| {
-                                    ui.strong("node_id");
-                                });
-                                for col in &table.table.columns {
+                                for (col_idx, col_name) in column_names.iter().enumerate() {
                                     header.col(|ui| {
-                                        ui.strong(col);
+                                        let sort_col = NodeAttrSortColumn::TableColumn(col_idx);
+                                        let label = sort_header_label(
+                                            sort_column,
+                                            sort_ascending,
+                                            sort_col,
+                                            col_name,
+                                        );
+                                        if ui
+                                            .add(
+                                                egui::Label::new(label)
+                                                    .truncate()
+                                                    .sense(egui::Sense::click()),
+                                            )
+                                            .clicked()
+                                        {
+                                            clicked_sort = Some(sort_col);
+                                        }
                                     });
                                 }
                             })
@@ -800,24 +954,27 @@ impl SpectralApp {
                                     let idx = row.index();
                                     let (node_id, row_idx) = filtered_rows[idx];
                                     let maybe_row = table.row(row_idx);
+                                    let is_selected = Some(node_id) == self.selected_node_id;
 
-                                    row.col(|ui| {
-                                        if Some(node_id) == self.selected_node_id {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(220, 180, 80),
-                                                node_id.to_string(),
-                                            );
-                                        } else {
-                                            ui.label(node_id.to_string());
-                                        }
-                                    });
-
-                                    for col_idx in 0..table.table.columns.len() {
+                                    for col_idx in 0..column_names.len() {
                                         row.col(|ui| {
                                             let value = maybe_row
                                                 .and_then(|r| r.get(col_idx))
                                                 .map_or("", String::as_str);
-                                            ui.label(value);
+                                            if Some(col_idx) == feature_id_column_idx {
+                                                if !value.trim().is_empty()
+                                                    && ui.link(value).clicked()
+                                                {
+                                                    clicked_feature_id = Some(value.to_string());
+                                                }
+                                            } else if is_selected {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(220, 180, 80),
+                                                    value,
+                                                );
+                                            } else {
+                                                ui.add(egui::Label::new(value).truncate());
+                                            }
                                         });
                                     }
                                 });
@@ -825,6 +982,34 @@ impl SpectralApp {
                     });
             },
         );
+
+        if let Some(clicked) = clicked_sort {
+            if self.node_attr_sort_column == clicked {
+                self.node_attr_sort_ascending = !self.node_attr_sort_ascending;
+            } else {
+                self.node_attr_sort_column = clicked;
+                self.node_attr_sort_ascending = true;
+            }
+            ui.ctx().request_repaint();
+        }
+
+        if let Some(feature_id) = clicked_feature_id {
+            let feature_id = feature_id.trim().to_string();
+            if !feature_id.is_empty() {
+                let maybe_node_id = find_node_id_by_feature_id(network, &feature_id);
+                if let Some(node_id) = maybe_node_id {
+                    self.selected_node_id = Some(node_id);
+                    self.pending_center_node_id = Some(node_id);
+                    self.status_message =
+                        Some(format!("Selected feature_id={feature_id} (node {node_id})"));
+                    self.error_message = None;
+                } else {
+                    self.error_message =
+                        Some(format!("Feature ID not found in network: {feature_id}"));
+                }
+                ui.ctx().request_repaint();
+            }
+        }
     }
 
     fn draw_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1247,6 +1432,26 @@ impl SpectralApp {
             self.fit_view_to_visible_nodes(canvas_size, &visible);
             self.request_fit_view = false;
         }
+        if let Some(node_id) = self.pending_center_node_id.take()
+            && visible_set.contains(&node_id)
+        {
+            let component_members = self.network.as_ref().and_then(|net| {
+                let component_id = net
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == node_id)
+                    .map(|n| n.component_id)?;
+                net.components.get(component_id).cloned()
+            });
+            let focused = if let Some(component_members) = component_members {
+                self.focus_view_on_node_set(canvas_size, &component_members, node_id)
+            } else {
+                self.center_view_on_node(canvas_size, node_id)
+            };
+            if !focused {
+                self.pending_center_node_id = Some(node_id);
+            }
+        }
 
         let network = self.network.as_ref().expect("network presence checked");
         let interaction = draw_network(
@@ -1268,6 +1473,8 @@ impl SpectralApp {
         }
         if let Some(node_id) = interaction.clicked_node_id {
             self.selected_node_id = Some(node_id);
+            self.pending_center_node_id = Some(node_id);
+            ui.ctx().request_repaint();
         } else if interaction.clicked_empty_canvas {
             self.selected_node_id = None;
         }
@@ -1337,7 +1544,7 @@ impl SpectralApp {
         }
     }
 
-    fn draw_selected_node_panel(&self, ui: &mut egui::Ui) {
+    fn draw_selected_node_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Node Properties");
         ui.separator();
 
@@ -1364,10 +1571,16 @@ impl SpectralApp {
         };
 
         ui.monospace(format!("Node index: {}", node.id));
-        ui.monospace(format!(
-            "Feature ID: {}",
-            node.feature_id.as_deref().unwrap_or("n/a")
-        ));
+        ui.horizontal(|ui| {
+            ui.monospace("Feature ID:");
+            if let Some(feature_id) = node.feature_id.as_deref() {
+                if ui.link(feature_id).clicked() {
+                    self.pending_center_node_id = Some(node.id);
+                }
+            } else {
+                ui.monospace("n/a");
+            }
+        });
         ui.monospace(format!("Display label: {}", node.label));
         ui.monospace(format!("Raw name: {}", node.raw_name));
         ui.monospace(format!(
@@ -1391,6 +1604,57 @@ impl SpectralApp {
             node.featurelist_feature_id.as_deref().unwrap_or("n/a")
         ));
     }
+}
+
+fn compare_node_attr_values(left: &str, right: &str) -> Ordering {
+    let left_trimmed = left.trim();
+    let right_trimmed = right.trim();
+    let left_numeric = left_trimmed.parse::<f64>();
+    let right_numeric = right_trimmed.parse::<f64>();
+    if let (Ok(left_number), Ok(right_number)) = (left_numeric, right_numeric)
+        && let Some(ordering) = left_number.partial_cmp(&right_number)
+    {
+        return ordering;
+    }
+
+    let left_lower = left_trimmed.to_ascii_lowercase();
+    let right_lower = right_trimmed.to_ascii_lowercase();
+    left_lower
+        .cmp(&right_lower)
+        .then_with(|| left_trimmed.cmp(right_trimmed))
+}
+
+fn sort_header_label(
+    current: NodeAttrSortColumn,
+    ascending: bool,
+    target: NodeAttrSortColumn,
+    base: &str,
+) -> String {
+    if current == target {
+        if ascending {
+            format!("{base} (asc)")
+        } else {
+            format!("{base} (desc)")
+        }
+    } else {
+        base.to_string()
+    }
+}
+
+fn normalized_column_name(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn find_node_id_by_feature_id(network: &SpectralNetwork, feature_id: &str) -> Option<usize> {
+    network.nodes.iter().find_map(|node| {
+        node.feature_id
+            .as_deref()
+            .filter(|node_feature_id| node_feature_id.trim() == feature_id)
+            .map(|_| node.id)
+    })
 }
 
 impl eframe::App for SpectralApp {
