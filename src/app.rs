@@ -79,6 +79,21 @@ impl NodeAttrPanelDock {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructurePanelMode {
+    SelectedNode,
+    SelectedSet,
+}
+
+impl StructurePanelMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SelectedNode => "Selected node",
+            Self::SelectedSet => "Selected set",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NodeAttrSortColumn {
     NodeId,
     TableColumn(usize),
@@ -101,6 +116,20 @@ struct DepictFetchResult {
     content_type: Option<String>,
     bytes: Vec<u8>,
     error: Option<String>,
+}
+
+struct DepictImageState {
+    image_uri: Option<String>,
+    image_bytes: Option<egui::load::Bytes>,
+    loading: bool,
+    error: Option<String>,
+}
+
+struct SelectedStructureEntry {
+    node_id: usize,
+    display_label: String,
+    smiles: String,
+    annotations: Vec<(String, String)>,
 }
 
 pub struct SpectralApp {
@@ -156,12 +185,14 @@ pub struct SpectralApp {
     node_attr_right_width: f32,
     pending_center_node_id: Option<usize>,
     table_node_filter: Option<HashSet<usize>>,
-    depict_request_key: Option<String>,
-    depict_loading: bool,
-    depict_image_uri: Option<String>,
-    depict_image_bytes: Option<egui::load::Bytes>,
-    depict_error_message: Option<String>,
-    depict_rx: Option<Receiver<DepictFetchResult>>,
+    depict_cache: HashMap<String, DepictImageState>,
+    depict_tx: std::sync::mpsc::Sender<DepictFetchResult>,
+    depict_rx: Receiver<DepictFetchResult>,
+    structure_panel_mode: StructurePanelMode,
+    show_selection_structures_detached: bool,
+    selection_structures_limit: usize,
+    selection_structures_image_height: f32,
+    structure_caption_columns: Vec<usize>,
 
     #[cfg(target_arch = "wasm32")]
     upload_promise: Option<poll_promise::Promise<Result<UploadedFile, String>>>,
@@ -170,6 +201,7 @@ pub struct SpectralApp {
 impl SpectralApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        let (depict_tx, depict_rx) = mpsc::channel();
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             mgf_path: DEFAULT_MGF_PATH.to_string(),
@@ -223,12 +255,14 @@ impl SpectralApp {
             node_attr_right_width: 560.0,
             pending_center_node_id: None,
             table_node_filter: None,
-            depict_request_key: None,
-            depict_loading: false,
-            depict_image_uri: None,
-            depict_image_bytes: None,
-            depict_error_message: None,
-            depict_rx: None,
+            depict_cache: HashMap::new(),
+            depict_tx,
+            depict_rx,
+            structure_panel_mode: StructurePanelMode::SelectedNode,
+            show_selection_structures_detached: false,
+            selection_structures_limit: 48,
+            selection_structures_image_height: 260.0,
+            structure_caption_columns: Vec::new(),
             #[cfg(target_arch = "wasm32")]
             upload_promise: None,
         }
@@ -283,6 +317,8 @@ impl SpectralApp {
                 None
             }
         });
+        self.structure_caption_columns =
+            default_structure_caption_columns(columns, self.depict_smiles_column);
         if table_columns == 0 {
             self.node_color_attr_column = 0;
             self.color_nodes_by_attribute = false;
@@ -763,27 +799,37 @@ impl SpectralApp {
         }
     }
 
-    fn clear_depiction_state(&mut self) {
-        self.depict_request_key = None;
-        self.depict_loading = false;
-        self.depict_image_uri = None;
-        self.depict_image_bytes = None;
-        self.depict_error_message = None;
-        self.depict_rx = None;
+    fn selected_visible_node(
+        &self,
+        network: &SpectralNetwork,
+    ) -> Option<crate::network::NetworkNode> {
+        let node_id = self.selected_node_id?;
+        let visible_set =
+            visible_node_set_for_view(network, self.component_selection, self.hide_singletons);
+        if !visible_set.contains(&node_id) {
+            return None;
+        }
+        network.nodes.iter().find(|n| n.id == node_id).cloned()
     }
 
     fn ensure_depiction_request(&mut self, request_key: String, uri: String) {
-        if self.depict_request_key.as_deref() == Some(request_key.as_str())
-            && (self.depict_loading || self.depict_image_bytes.is_some())
+        if self
+            .depict_cache
+            .get(&request_key)
+            .is_some_and(|state| state.loading || state.image_bytes.is_some())
         {
             return;
         }
 
-        self.depict_request_key = Some(request_key.clone());
-        self.depict_loading = true;
-        self.depict_image_uri = None;
-        self.depict_image_bytes = None;
-        self.depict_error_message = None;
+        self.depict_cache.insert(
+            request_key.clone(),
+            DepictImageState {
+                image_uri: None,
+                image_bytes: None,
+                loading: true,
+                error: None,
+            },
+        );
 
         let mut request = ehttp::Request::get(uri);
         request.headers = ehttp::Headers::new(&[
@@ -791,8 +837,7 @@ impl SpectralApp {
             ("Cache-Control", "no-cache"),
         ]);
 
-        let (tx, rx) = mpsc::channel();
-        self.depict_rx = Some(rx);
+        let tx = self.depict_tx.clone();
         ehttp::fetch(request, move |result| {
             let fetch_result = match result {
                 Ok(response) => {
@@ -827,53 +872,225 @@ impl SpectralApp {
     }
 
     fn poll_depiction(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.depict_rx else {
+        let mut received = false;
+        loop {
+            match self.depict_rx.try_recv() {
+                Ok(result) => {
+                    received = true;
+                    let entry = self
+                        .depict_cache
+                        .entry(result.request_key.clone())
+                        .or_insert(DepictImageState {
+                            image_uri: None,
+                            image_bytes: None,
+                            loading: false,
+                            error: None,
+                        });
+                    entry.loading = false;
+
+                    if let Some(err) = result.error {
+                        entry.error = Some(err);
+                        entry.image_uri = None;
+                        entry.image_bytes = None;
+                        continue;
+                    }
+
+                    let image_ext = detect_depict_image_extension(
+                        result.content_type.as_deref(),
+                        &result.bytes,
+                    );
+                    let Some(ext) = image_ext else {
+                        let preview = String::from_utf8(result.bytes)
+                            .ok()
+                            .map(|text| text.chars().take(200).collect::<String>())
+                            .unwrap_or_else(|| "<binary response>".to_string());
+                        entry.error = Some(format!(
+                            "Unsupported depiction response (content-type={:?}). Preview: {}",
+                            result.content_type, preview
+                        ));
+                        entry.image_uri = None;
+                        entry.image_bytes = None;
+                        continue;
+                    };
+
+                    let request_id = stable_hash(&result.request_key);
+                    entry.image_uri = Some(format!("bytes://np_depict_{request_id}.{ext}"));
+                    entry.image_bytes = Some(egui::load::Bytes::from(result.bytes));
+                    entry.error = None;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        if received || self.depict_cache.values().any(|entry| entry.loading) {
+            ctx.request_repaint();
+        }
+    }
+
+    fn draw_depiction_widget(&self, ui: &mut egui::Ui, request_key: &str, size: egui::Vec2) {
+        let Some(state) = self.depict_cache.get(request_key) else {
+            ui.add(egui::Spinner::new());
             return;
         };
 
-        match rx.try_recv() {
-            Ok(result) => {
-                self.depict_loading = false;
-                self.depict_rx = None;
-                if self.depict_request_key.as_deref() != Some(result.request_key.as_str()) {
-                    return;
-                }
-
-                if let Some(err) = result.error {
-                    self.depict_error_message = Some(err);
-                    return;
-                }
-
-                let image_ext =
-                    detect_depict_image_extension(result.content_type.as_deref(), &result.bytes);
-                let Some(ext) = image_ext else {
-                    let preview = String::from_utf8(result.bytes)
-                        .ok()
-                        .map(|text| text.chars().take(200).collect::<String>())
-                        .unwrap_or_else(|| "<binary response>".to_string());
-                    self.depict_error_message = Some(format!(
-                        "Unsupported depiction response (content-type={:?}). Preview: {}",
-                        result.content_type, preview
-                    ));
-                    return;
-                };
-
-                let request_id = stable_hash(&result.request_key);
-                self.depict_image_uri = Some(format!("bytes://np_depict_{request_id}.{ext}"));
-                self.depict_image_bytes = Some(egui::load::Bytes::from(result.bytes));
-                self.depict_error_message = None;
-            }
-            Err(TryRecvError::Empty) => {
-                if self.depict_loading {
-                    ctx.request_repaint();
-                }
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.depict_loading = false;
-                self.depict_rx = None;
-                self.depict_error_message = Some("depict request channel disconnected".to_string());
-            }
+        if state.loading {
+            ui.add(egui::Spinner::new());
+            return;
         }
+        if let (Some(uri), Some(bytes)) = (&state.image_uri, &state.image_bytes) {
+            ui.add(
+                egui::Image::from_bytes(uri.clone(), bytes.clone())
+                    .fit_to_exact_size(size)
+                    .maintain_aspect_ratio(true),
+            );
+            return;
+        }
+        if let Some(err) = &state.error {
+            ui.small(err);
+            return;
+        }
+        ui.small("Depiction unavailable.");
+    }
+
+    fn selected_structures_from_node_selection(&self) -> Vec<SelectedStructureEntry> {
+        let Some(network) = self.network.as_ref() else {
+            return Vec::new();
+        };
+        let Some(table) = self.node_attributes.as_ref() else {
+            return Vec::new();
+        };
+        let Some(smiles_col_idx) = self.depict_smiles_column else {
+            return Vec::new();
+        };
+        let Some(filter) = self.table_node_filter.as_ref() else {
+            return Vec::new();
+        };
+
+        let node_by_id: HashMap<usize, &crate::network::NetworkNode> =
+            network.nodes.iter().map(|n| (n.id, n)).collect();
+        let mut node_ids: Vec<usize> = filter.iter().copied().collect();
+        node_ids.sort_unstable();
+        node_ids.dedup();
+
+        node_ids
+            .into_iter()
+            .filter_map(|node_id| {
+                let node = node_by_id.get(&node_id)?;
+                let key = self.node_attribute_key_for_node(node)?;
+                let row = table.find_row(&key)?;
+                let smiles = row.get(smiles_col_idx)?.trim();
+                if smiles.is_empty() {
+                    return None;
+                }
+                let display_label = node
+                    .feature_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| node.label.clone());
+                let annotations = self
+                    .structure_caption_columns
+                    .iter()
+                    .filter_map(|idx| {
+                        let col_name = table.table.columns.get(*idx)?;
+                        let value = row.get(*idx)?.trim();
+                        if value.is_empty() {
+                            None
+                        } else {
+                            Some((col_name.clone(), value.to_string()))
+                        }
+                    })
+                    .collect();
+                Some(SelectedStructureEntry {
+                    node_id,
+                    display_label,
+                    smiles: smiles.to_string(),
+                    annotations,
+                })
+            })
+            .collect()
+    }
+
+    fn draw_selected_structures_gallery(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Max structures");
+            ui.add(
+                egui::DragValue::new(&mut self.selection_structures_limit)
+                    .range(1..=500)
+                    .speed(1.0),
+            );
+            ui.label("Image height");
+            ui.add(
+                egui::DragValue::new(&mut self.selection_structures_image_height)
+                    .range(140.0..=700.0)
+                    .speed(1.0),
+            );
+        });
+        if self.table_node_filter.is_none() {
+            ui.small("Use rectangle selection on the graph to choose nodes.");
+            return;
+        }
+        if self.depict_smiles_column.is_none() {
+            ui.small("Select a SMILES column in the left panel.");
+            return;
+        }
+
+        let selected_structures = self.selected_structures_from_node_selection();
+        if selected_structures.is_empty() {
+            ui.small("No SMILES available for the selected nodes.");
+            return;
+        }
+
+        let max_items = self.selection_structures_limit.max(1);
+        let structures: Vec<&SelectedStructureEntry> =
+            selected_structures.iter().take(max_items).collect();
+        if selected_structures.len() > structures.len() {
+            ui.small(format!(
+                "Showing {} / {} structures (increase Max structures to show more).",
+                structures.len(),
+                selected_structures.len()
+            ));
+        } else {
+            ui.small(format!("Showing {} structures.", structures.len()));
+        }
+
+        let gallery_height = ui.available_height().max(260.0);
+        egui::ScrollArea::vertical()
+            .max_height(gallery_height)
+            .show(ui, |ui| {
+                for entry in structures {
+                    ui.group(|ui| {
+                        let card_width = ui.available_width().max(260.0);
+                        let card_height =
+                            self.selection_structures_image_height.clamp(140.0, 700.0);
+                        let depict_uri = naturalproducts_depict_uri(
+                            &entry.smiles,
+                            card_width as u32,
+                            card_height as u32,
+                        );
+                        self.ensure_depiction_request(depict_uri.clone(), depict_uri.clone());
+                        self.draw_depiction_widget(
+                            ui,
+                            &depict_uri,
+                            egui::vec2(card_width, card_height),
+                        );
+                        if ui.link(&entry.display_label).clicked() {
+                            self.selected_node_id = Some(entry.node_id);
+                            self.pending_center_node_id = Some(entry.node_id);
+                        }
+                        if entry.annotations.is_empty() {
+                            ui.small("No additional structure metadata selected.");
+                        } else {
+                            for (column, value) in &entry.annotations {
+                                ui.add(egui::Label::new(format!("{column}: {value}")).wrap());
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+            });
     }
 
     fn node_attribute_coloring(
@@ -1111,6 +1328,20 @@ impl SpectralApp {
             visible_node_ids_for_view(network, self.component_selection, self.hide_singletons);
         let node_by_id: HashMap<usize, &crate::network::NetworkNode> =
             network.nodes.iter().map(|n| (n.id, n)).collect();
+        let feature_to_node_id: HashMap<String, usize> = network
+            .nodes
+            .iter()
+            .filter_map(|n| {
+                n.feature_id.as_deref().and_then(|fid| {
+                    let trimmed = fid.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some((trimmed.to_string(), n.id))
+                    }
+                })
+            })
+            .collect();
         let mut matched_rows: Vec<(usize, usize)> = Vec::new();
         for node_id in &visible_ids {
             let Some(node) = node_by_id.get(node_id) else {
@@ -1225,7 +1456,7 @@ impl SpectralApp {
             ui.label("No visible node matched the current key/match-field selection.");
         }
 
-        let table_height = ui.available_height().max(120.0);
+        let table_height = (ui.available_height() * 0.58).clamp(120.0, 420.0);
         let text_height = ui.text_style_height(&egui::TextStyle::Body).max(18.0);
         let sort_column = self.node_attr_sort_column;
         let sort_ascending = self.node_attr_sort_ascending;
@@ -1330,10 +1561,11 @@ impl SpectralApp {
         if let Some(feature_id) = clicked_feature_id {
             let feature_id = feature_id.trim().to_string();
             if !feature_id.is_empty() {
-                let maybe_node_id = find_node_id_by_feature_id(network, &feature_id);
+                let maybe_node_id = feature_to_node_id.get(&feature_id).copied();
                 if let Some(node_id) = maybe_node_id {
                     self.selected_node_id = Some(node_id);
                     self.pending_center_node_id = Some(node_id);
+                    self.structure_panel_mode = StructurePanelMode::SelectedNode;
                     self.status_message =
                         Some(format!("Selected feature_id={feature_id} (node {node_id})"));
                     self.error_message = None;
@@ -1436,6 +1668,20 @@ impl SpectralApp {
 
             ui.group(|ui| {
                 ui.label("Structure depiction");
+                egui::ComboBox::from_label("Structure view mode")
+                    .selected_text(self.structure_panel_mode.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.structure_panel_mode,
+                            StructurePanelMode::SelectedNode,
+                            StructurePanelMode::SelectedNode.label(),
+                        );
+                        ui.selectable_value(
+                            &mut self.structure_panel_mode,
+                            StructurePanelMode::SelectedSet,
+                            StructurePanelMode::SelectedSet.label(),
+                        );
+                    });
                 if let Some(table) = &self.node_attributes {
                     let selected_text = self
                         .depict_smiles_column
@@ -1450,12 +1696,40 @@ impl SpectralApp {
                                 ui.selectable_value(&mut self.depict_smiles_column, Some(idx), col);
                             }
                         });
+                    self.structure_caption_columns
+                        .retain(|idx| *idx < table.table.columns.len());
+                    ui.separator();
+                    ui.label("Text columns shown under each depicted structure");
+                    egui::ScrollArea::vertical()
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            for (idx, col) in table.table.columns.iter().enumerate() {
+                                if Some(idx) == self.depict_smiles_column {
+                                    continue;
+                                }
+                                let mut selected = self.structure_caption_columns.contains(&idx);
+                                if ui.checkbox(&mut selected, col).changed() {
+                                    if selected {
+                                        if !self.structure_caption_columns.contains(&idx) {
+                                            self.structure_caption_columns.push(idx);
+                                        }
+                                    } else {
+                                        self.structure_caption_columns
+                                            .retain(|existing| *existing != idx);
+                                    }
+                                }
+                            }
+                        });
+                    self.structure_caption_columns.sort_unstable();
                     ui.small(
                         "Selected SMILES values are rendered in the right panel via api.naturalproducts.net.",
                     );
                 } else {
                     ui.small("Load a node attributes TSV to choose a SMILES column.");
                 }
+                ui.small(
+                    "Modes are exclusive: either depict one selected node or depict structures from rectangle-selected nodes.",
+                );
             });
 
             ui.separator();
@@ -1583,13 +1857,29 @@ impl SpectralApp {
         });
 
         ui.separator();
-        egui::ComboBox::from_label("Metric")
-            .selected_text(self.selected_metric.label())
-            .show_ui(ui, |ui| {
-                for metric in SimilarityMetric::ALL {
-                    ui.selectable_value(&mut self.selected_metric, metric, metric.label());
-                }
-            });
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_label("Metric")
+                .selected_text(self.selected_metric.label())
+                .show_ui(ui, |ui| {
+                    for metric in SimilarityMetric::ALL {
+                        ui.selectable_value(&mut self.selected_metric, metric, metric.label());
+                    }
+                });
+
+            let can_start = !self.is_computing() && !self.spectra.is_empty();
+            if ui
+                .add_enabled(
+                    can_start,
+                    egui::Button::new(format!("Run {}", self.selected_metric.label())),
+                )
+                .clicked()
+            {
+                self.start_compute();
+            }
+            if self.is_computing() && ui.button("Cancel").clicked() {
+                self.cancel_compute();
+            }
+        });
 
         ui.collapsing("Similarity Params (required)", |ui| {
             ui.horizontal(|ui| {
@@ -1606,34 +1896,16 @@ impl SpectralApp {
             });
         });
 
-        ui.separator();
-        ui.collapsing("Compute", |ui| {
-            let can_start = !self.is_computing() && !self.spectra.is_empty();
-            if ui
-                .add_enabled(
-                    can_start,
-                    egui::Button::new(format!("Run {}", self.selected_metric.label())),
-                )
-                .clicked()
-            {
-                self.start_compute();
-            }
-
-            if self.is_computing() {
-                if ui.button("Cancel").clicked() {
-                    self.cancel_compute();
-                }
-
-                if let Some((done, total)) = self.compute_progress() {
-                    let frac = if total == 0 {
-                        0.0
-                    } else {
-                        done as f32 / total as f32
-                    };
-                    ui.add(egui::ProgressBar::new(frac).text(format!("{done}/{total}")));
-                }
-            }
-        });
+        if self.is_computing()
+            && let Some((done, total)) = self.compute_progress()
+        {
+            let frac = if total == 0 {
+                0.0
+            } else {
+                done as f32 / total as f32
+            };
+            ui.add(egui::ProgressBar::new(frac).text(format!("{done}/{total}")));
+        }
 
         ui.separator();
         ui.label("Network Controls");
@@ -1909,6 +2181,7 @@ impl SpectralApp {
             } else {
                 let filter: HashSet<usize> = box_ids.iter().copied().collect();
                 self.table_node_filter = Some(filter);
+                self.structure_panel_mode = StructurePanelMode::SelectedSet;
                 self.status_message = Some(format!(
                     "Rectangle selected {} node(s); table filtered",
                     box_ids.len()
@@ -1941,6 +2214,7 @@ impl SpectralApp {
         } else if let Some(node_id) = interaction.clicked_node_id {
             self.selected_node_id = Some(node_id);
             self.pending_center_node_id = Some(node_id);
+            self.structure_panel_mode = StructurePanelMode::SelectedNode;
             ui.ctx().request_repaint();
         } else if interaction.clicked_empty_canvas {
             self.selected_node_id = None;
@@ -2016,74 +2290,58 @@ impl SpectralApp {
         ui.separator();
 
         let Some(network) = &self.network else {
-            self.clear_depiction_state();
             ui.label("No network loaded.");
             return;
         };
 
-        let Some(node_id) = self.selected_node_id else {
-            self.clear_depiction_state();
-            ui.label("Select a node in the graph.");
-            return;
-        };
-
-        let visible_set =
-            visible_node_set_for_view(network, self.component_selection, self.hide_singletons);
-        if !visible_set.contains(&node_id) {
-            self.clear_depiction_state();
-            ui.label("Selected node is not visible in current scope.");
-            return;
-        }
-
-        let Some(node) = network.nodes.iter().find(|n| n.id == node_id) else {
-            self.clear_depiction_state();
-            ui.label("Selected node is not visible in current scope.");
-            return;
-        };
-
-        ui.monospace(format!("Node index: {}", node.id));
-        ui.horizontal(|ui| {
-            ui.monospace("Feature ID:");
-            if let Some(feature_id) = node.feature_id.as_deref() {
-                if ui.link(feature_id).clicked() {
-                    self.pending_center_node_id = Some(node.id);
+        let selected_node = self.selected_visible_node(network);
+        if let Some(node) = selected_node.as_ref() {
+            ui.monospace(format!("Node index: {}", node.id));
+            ui.horizontal(|ui| {
+                ui.monospace("Feature ID:");
+                if let Some(feature_id) = node.feature_id.as_deref() {
+                    if ui.link(feature_id).clicked() {
+                        self.pending_center_node_id = Some(node.id);
+                    }
+                } else {
+                    ui.monospace("n/a");
                 }
-            } else {
-                ui.monospace("n/a");
-            }
-        });
-        ui.monospace(format!("Display label: {}", node.label));
-        ui.monospace(format!("Raw name: {}", node.raw_name));
-        ui.monospace(format!(
-            "Parent mass (precursor m/z): {:.6}",
-            node.precursor_mz
-        ));
-        ui.monospace(format!("Peak count: {}", node.num_peaks));
-        ui.monospace(format!("Degree: {}", node.degree));
-        ui.monospace(format!("Component: {}", node.component_id));
-        ui.monospace(format!("Scans: {}", node.scans.as_deref().unwrap_or("n/a")));
-        ui.monospace(format!(
-            "Filename: {}",
-            node.filename.as_deref().unwrap_or("n/a")
-        ));
-        ui.monospace(format!(
-            "Source scan USI: {}",
-            node.source_scan_usi.as_deref().unwrap_or("n/a")
-        ));
-        ui.monospace(format!(
-            "Featurelist feature ID: {}",
-            node.featurelist_feature_id.as_deref().unwrap_or("n/a")
-        ));
+            });
+            ui.monospace(format!("Display label: {}", node.label));
+            ui.monospace(format!("Raw name: {}", node.raw_name));
+            ui.monospace(format!(
+                "Parent mass (precursor m/z): {:.6}",
+                node.precursor_mz
+            ));
+            ui.monospace(format!("Peak count: {}", node.num_peaks));
+            ui.monospace(format!("Degree: {}", node.degree));
+            ui.monospace(format!("Component: {}", node.component_id));
+            ui.monospace(format!("Scans: {}", node.scans.as_deref().unwrap_or("n/a")));
+            ui.monospace(format!(
+                "Filename: {}",
+                node.filename.as_deref().unwrap_or("n/a")
+            ));
+            ui.monospace(format!(
+                "Source scan USI: {}",
+                node.source_scan_usi.as_deref().unwrap_or("n/a")
+            ));
+            ui.monospace(format!(
+                "Featurelist feature ID: {}",
+                node.featurelist_feature_id.as_deref().unwrap_or("n/a")
+            ));
+        } else if self.selected_node_id.is_some() {
+            ui.label("Selected node is not visible in current scope.");
+        } else {
+            ui.label("Select a node in the graph.");
+        }
 
         ui.separator();
         ui.label("Structure");
         if self.node_attributes.is_none() {
-            self.clear_depiction_state();
             ui.small("No node attributes table loaded.");
             return;
         }
         let Some(smiles_col_idx) = self.depict_smiles_column else {
-            self.clear_depiction_state();
             ui.small("Select a SMILES column in the left panel.");
             return;
         };
@@ -2093,38 +2351,66 @@ impl SpectralApp {
             .and_then(|table| table.table.columns.get(smiles_col_idx))
             .cloned()
         else {
-            self.clear_depiction_state();
             ui.small("Selected SMILES column is out of range.");
             return;
         };
-        let Some(smiles) = self.selected_node_smiles(node) else {
-            self.clear_depiction_state();
-            ui.small(format!(
-                "No SMILES found for this node using column '{col_name}'."
-            ));
-            return;
-        };
 
-        ui.small(format!("SMILES column: {col_name}"));
-        ui.small(format!("SMILES: {smiles}"));
-        let img_width = ui.available_width().clamp(180.0, 480.0);
-        let img_height = (img_width * 0.7).clamp(120.0, 360.0);
-        let depict_uri = naturalproducts_depict_uri(&smiles, img_width as u32, img_height as u32);
-        self.ensure_depiction_request(depict_uri.clone(), depict_uri.clone());
-        if self.depict_loading {
-            ui.add(egui::Spinner::new());
-            ui.small("Loading depiction...");
-        } else if let (Some(uri), Some(bytes)) = (&self.depict_image_uri, &self.depict_image_bytes)
-        {
-            ui.add(
-                egui::Image::from_bytes(uri.clone(), bytes.clone())
-                    .max_width(img_width)
-                    .maintain_aspect_ratio(true),
-            );
-        } else if let Some(err) = &self.depict_error_message {
-            ui.colored_label(egui::Color32::from_rgb(190, 50, 50), err);
+        ui.horizontal(|ui| {
+            ui.label("Mode:");
+            egui::ComboBox::from_id_salt("structure_mode_right_panel")
+                .selected_text(self.structure_panel_mode.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.structure_panel_mode,
+                        StructurePanelMode::SelectedNode,
+                        StructurePanelMode::SelectedNode.label(),
+                    );
+                    ui.selectable_value(
+                        &mut self.structure_panel_mode,
+                        StructurePanelMode::SelectedSet,
+                        StructurePanelMode::SelectedSet.label(),
+                    );
+                });
+        });
+
+        match self.structure_panel_mode {
+            StructurePanelMode::SelectedNode => {
+                self.show_selection_structures_detached = false;
+                let Some(node) = selected_node.as_ref() else {
+                    ui.small("Select a visible node to depict its structure.");
+                    return;
+                };
+                let Some(smiles) = self.selected_node_smiles(node) else {
+                    ui.small(format!(
+                        "No SMILES found for this node using column '{col_name}'."
+                    ));
+                    return;
+                };
+
+                ui.small(format!("SMILES column: {col_name}"));
+                ui.small(format!("SMILES: {smiles}"));
+                let img_width = ui.available_width().clamp(180.0, 480.0);
+                let img_height = (img_width * 0.7).clamp(120.0, 360.0);
+                let depict_uri =
+                    naturalproducts_depict_uri(&smiles, img_width as u32, img_height as u32);
+                self.ensure_depiction_request(depict_uri.clone(), depict_uri.clone());
+                self.draw_depiction_widget(ui, &depict_uri, egui::vec2(img_width, img_height));
+                ui.hyperlink_to("Open structure in browser", depict_uri);
+            }
+            StructurePanelMode::SelectedSet => {
+                ui.horizontal(|ui| {
+                    ui.small(format!("SMILES column: {col_name}"));
+                    if ui.button("Open in window").clicked() {
+                        self.show_selection_structures_detached = true;
+                    }
+                });
+                if let Some(filter_len) = self.table_node_filter.as_ref().map(HashSet::len) {
+                    ui.small(format!("Rectangle-selected nodes: {filter_len}"));
+                }
+                ui.add_space(4.0);
+                self.draw_selected_structures_gallery(ui);
+            }
         }
-        ui.hyperlink_to("Open structure in browser", depict_uri);
     }
 }
 
@@ -2172,7 +2458,7 @@ fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 fn naturalproducts_depict_uri(smiles: &str, width: u32, height: u32) -> String {
     let encoded_smiles = urlencoding::encode(smiles);
     format!(
-        "https://api.naturalproducts.net/latest/depict/2D_enhanced?smiles={encoded_smiles}&width={width}&height={height}&style=bow"
+        "https://api.naturalproducts.net/latest/depict/2D_enhanced?smiles={encoded_smiles}&width={width}&height={height}&style=bow&zoom=2.2&abbreviate=off"
     )
 }
 
@@ -2256,13 +2542,39 @@ fn normalized_column_name(name: &str) -> String {
         .collect()
 }
 
-fn find_node_id_by_feature_id(network: &SpectralNetwork, feature_id: &str) -> Option<usize> {
-    network.nodes.iter().find_map(|node| {
-        node.feature_id
-            .as_deref()
-            .filter(|node_feature_id| node_feature_id.trim() == feature_id)
-            .map(|_| node.id)
-    })
+#[cfg(not(target_arch = "wasm32"))]
+fn default_structure_caption_columns(columns: &[String], smiles_col: Option<usize>) -> Vec<usize> {
+    let mut picks = Vec::new();
+    let mut seen = HashSet::new();
+    for (idx, name) in columns.iter().enumerate() {
+        if Some(idx) == smiles_col {
+            continue;
+        }
+        let normalized = normalized_column_name(name);
+        let preferred = normalized.contains("name")
+            || normalized.contains("canopus")
+            || normalized.contains("class")
+            || normalized.contains("annotation")
+            || normalized.contains("compound")
+            || normalized.contains("superclass");
+        if preferred && seen.insert(idx) {
+            picks.push(idx);
+        }
+        if picks.len() >= 4 {
+            return picks;
+        }
+    }
+
+    for (idx, _name) in columns.iter().enumerate() {
+        if Some(idx) == smiles_col || seen.contains(&idx) {
+            continue;
+        }
+        picks.push(idx);
+        if picks.len() >= 2 {
+            break;
+        }
+    }
+    picks
 }
 
 impl eframe::App for SpectralApp {
@@ -2328,6 +2640,25 @@ impl eframe::App for SpectralApp {
             if !open {
                 self.show_node_attributes_panel = false;
             }
+        }
+
+        if self.show_selection_structures_detached
+            && self.structure_panel_mode == StructurePanelMode::SelectedSet
+        {
+            let mut open = true;
+            egui::Window::new("Selected Structures")
+                .id(egui::Id::new("selected_structures_window"))
+                .resizable(true)
+                .default_size(egui::vec2(920.0, 560.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    self.draw_selected_structures_gallery(ui);
+                });
+            if !open {
+                self.show_selection_structures_detached = false;
+            }
+        } else if self.show_selection_structures_detached {
+            self.show_selection_structures_detached = false;
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
