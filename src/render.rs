@@ -9,14 +9,18 @@ pub struct GraphViewState {
     pub pan: Vec2,
     pub zoom: f32,
     pub dragging_node_id: Option<usize>,
+    pub box_select_start: Option<Pos2>,
+    pub box_select_current: Option<Pos2>,
 }
 
 pub struct GraphInteraction {
     pub hovered_node_id: Option<usize>,
     pub clicked_node_id: Option<usize>,
     pub clicked_empty_canvas: bool,
+    pub fit_full_network_requested: bool,
     pub pan_delta: Vec2,
     pub dragged_node: Option<(usize, [f32; 2])>,
+    pub box_selected_node_ids: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -127,12 +131,47 @@ pub fn draw_network(
     );
 
     let clicked_primary = response.clicked_by(PointerButton::Primary);
+    let fit_full_network_requested = response.double_clicked_by(PointerButton::Primary);
     let pointer_latest = ui.input(|i| i.pointer.latest_pos());
     let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
     let primary_down = ui.input(|i| i.pointer.primary_down());
+    let primary_released = ui.input(|i| i.pointer.primary_released());
     if primary_pressed {
-        view_state.dragging_node_id =
+        let picked_node =
             pointer_latest.and_then(|pointer| hit_test_node(pointer, &node_geometry, 4.0));
+        view_state.dragging_node_id = picked_node;
+        if picked_node.is_some() {
+            view_state.box_select_start = None;
+            view_state.box_select_current = None;
+        } else {
+            view_state.box_select_start = pointer_latest;
+            view_state.box_select_current = pointer_latest;
+        }
+    }
+    if primary_down
+        && view_state.dragging_node_id.is_none()
+        && view_state.box_select_start.is_some()
+    {
+        view_state.box_select_current = pointer_latest;
+    }
+
+    let mut box_selected_node_ids: Option<Vec<usize>> = None;
+    if primary_released
+        && let (Some(start), Some(end)) = (
+            view_state.box_select_start.take(),
+            view_state.box_select_current.take(),
+        )
+        && start.distance(end) >= 4.0
+    {
+        let select_rect = Rect::from_two_pos(start, end);
+        let mut selected = node_geometry
+            .iter()
+            .filter(|node| select_rect.contains(node.pos))
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        selected.sort_unstable();
+        selected.dedup();
+        box_selected_node_ids = Some(selected);
     }
     if !primary_down {
         view_state.dragging_node_id = None;
@@ -147,9 +186,7 @@ pub fn draw_network(
         response.hover_pos()
     };
     let pointer_delta = ui.input(|i| i.pointer.delta());
-    let pan_delta = if response.dragged_by(PointerButton::Secondary)
-        || (primary_down && view_state.dragging_node_id.is_none())
-    {
+    let pan_delta = if response.dragged_by(PointerButton::Secondary) {
         pointer_delta
     } else {
         Vec2::ZERO
@@ -169,11 +206,33 @@ pub fn draw_network(
         None
     };
 
+    if primary_down
+        && view_state.dragging_node_id.is_none()
+        && let (Some(start), Some(end)) =
+            (view_state.box_select_start, view_state.box_select_current)
+        && start.distance(end) >= 2.0
+    {
+        let select_rect = Rect::from_two_pos(start, end);
+        painter.rect_filled(
+            select_rect,
+            0.0,
+            Color32::from_rgba_unmultiplied(90, 140, 220, 28),
+        );
+        painter.rect_stroke(
+            select_rect,
+            0.0,
+            Stroke::new(1.0, Color32::from_rgb(90, 140, 220)),
+            egui::StrokeKind::Outside,
+        );
+    }
+
     resolve_interaction(
         pointer_pos,
         clicked_primary,
+        fit_full_network_requested,
         pan_delta,
         dragged_node,
+        box_selected_node_ids,
         &node_geometry,
     )
 }
@@ -211,8 +270,10 @@ fn hit_test_node(pointer: Pos2, nodes: &[NodeScreenGeom], pick_padding: f32) -> 
 fn resolve_interaction(
     pointer_pos: Option<Pos2>,
     clicked_primary: bool,
+    fit_full_network_requested: bool,
     pan_delta: Vec2,
     dragged_node: Option<(usize, [f32; 2])>,
+    box_selected_node_ids: Option<Vec<usize>>,
     node_geometry: &[NodeScreenGeom],
 ) -> GraphInteraction {
     let hovered_node_id =
@@ -227,8 +288,10 @@ fn resolve_interaction(
         hovered_node_id,
         clicked_node_id,
         clicked_empty_canvas,
+        fit_full_network_requested,
         pan_delta,
         dragged_node,
+        box_selected_node_ids,
     }
 }
 
@@ -286,24 +349,30 @@ mod tests {
             radius: 5.0,
         }];
 
-        let interaction = resolve_interaction(None, false, Vec2::new(3.0, -2.0), None, &nodes);
+        let interaction =
+            resolve_interaction(None, false, false, Vec2::new(3.0, -2.0), None, None, &nodes);
 
         assert_eq!(interaction.clicked_node_id, None);
         assert!(!interaction.clicked_empty_canvas);
+        assert!(!interaction.fit_full_network_requested);
         assert_eq!(interaction.pan_delta, Vec2::new(3.0, -2.0));
+        assert!(interaction.box_selected_node_ids.is_none());
     }
 
     #[test]
-    fn primary_background_drag_emits_pan_delta() {
+    fn primary_background_drag_does_not_pan() {
         let nodes = vec![NodeScreenGeom {
             id: 1,
             pos: Pos2::new(0.0, 0.0),
             radius: 3.0,
         }];
 
-        let interaction = resolve_interaction(None, false, Vec2::new(-4.0, 1.0), None, &nodes);
+        let interaction =
+            resolve_interaction(None, false, false, Vec2::ZERO, None, Some(vec![1]), &nodes);
         assert_eq!(interaction.clicked_node_id, None);
-        assert_eq!(interaction.pan_delta, Vec2::new(-4.0, 1.0));
+        assert!(!interaction.fit_full_network_requested);
+        assert_eq!(interaction.pan_delta, Vec2::ZERO);
+        assert_eq!(interaction.box_selected_node_ids, Some(vec![1]));
     }
 
     #[test]

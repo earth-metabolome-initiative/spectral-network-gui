@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
@@ -128,6 +128,7 @@ pub struct SpectralApp {
     node_attr_bottom_height: f32,
     node_attr_right_width: f32,
     pending_center_node_id: Option<usize>,
+    table_node_filter: Option<HashSet<usize>>,
 
     #[cfg(target_arch = "wasm32")]
     upload_promise: Option<poll_promise::Promise<Result<UploadedFile, String>>>,
@@ -162,6 +163,8 @@ impl SpectralApp {
                 pan: egui::Vec2::ZERO,
                 zoom: 1.0,
                 dragging_node_id: None,
+                box_select_start: None,
+                box_select_current: None,
             },
             hovered_node_id: None,
             selected_node_id: None,
@@ -180,6 +183,7 @@ impl SpectralApp {
             node_attr_bottom_height: 260.0,
             node_attr_right_width: 560.0,
             pending_center_node_id: None,
+            table_node_filter: None,
             #[cfg(target_arch = "wasm32")]
             upload_promise: None,
         }
@@ -197,7 +201,10 @@ impl SpectralApp {
         self.layout_low_motion_streak = 0;
         self.request_fit_view = false;
         self.view_state.dragging_node_id = None;
+        self.view_state.box_select_start = None;
+        self.view_state.box_select_current = None;
         self.pending_center_node_id = None;
+        self.table_node_filter = None;
     }
 
     fn set_loaded_spectra(&mut self, loaded: LoadedSpectra) {
@@ -778,6 +785,15 @@ impl SpectralApp {
         };
         let column_names = table.table.columns.clone();
 
+        if let Some(filter_len) = self.table_node_filter.as_ref().map(|f| f.len()) {
+            ui.horizontal(|ui| {
+                ui.small(format!("Rectangle filter: {} node(s)", filter_len));
+                if ui.button("Clear rectangle filter").clicked() {
+                    self.table_node_filter = None;
+                }
+            });
+        }
+
         let visible_ids =
             visible_node_ids_for_view(network, self.component_selection, self.hide_singletons);
         let node_by_id: HashMap<usize, &crate::network::NetworkNode> =
@@ -788,6 +804,11 @@ impl SpectralApp {
                 continue;
             };
             if self.hide_singletons && node.degree == 0 {
+                continue;
+            }
+            if let Some(filter) = &self.table_node_filter
+                && !filter.contains(node_id)
+            {
                 continue;
             }
             let Some(key) = self.node_attribute_key_for_node(node) else {
@@ -1270,19 +1291,9 @@ impl SpectralApp {
             );
         });
         ui.horizontal(|ui| {
-            if ui.button("Fit to view").clicked() {
-                self.layout_running = false;
-                self.request_fit_view = true;
-            }
             if ui.button("Fit full network").clicked() {
                 self.layout_running = false;
                 self.component_selection = ComponentSelection::All;
-                self.request_fit_view = true;
-            }
-            if ui.button("Reset view").clicked() {
-                self.layout_running = false;
-                self.view_state.pan = egui::Vec2::ZERO;
-                self.view_state.zoom = 1.0;
                 self.request_fit_view = true;
             }
         });
@@ -1464,6 +1475,30 @@ impl SpectralApp {
         );
         self.hovered_node_id = interaction.hovered_node_id;
         self.view_state.pan += interaction.pan_delta;
+        if let Some(box_ids) = interaction.box_selected_node_ids {
+            if box_ids.is_empty() {
+                self.table_node_filter = None;
+                self.status_message =
+                    Some("Rectangle selection is empty; table filter cleared".to_string());
+            } else {
+                let filter: HashSet<usize> = box_ids.iter().copied().collect();
+                self.table_node_filter = Some(filter);
+                self.status_message = Some(format!(
+                    "Rectangle selected {} node(s); table filtered",
+                    box_ids.len()
+                ));
+                if box_ids.len() == 1 {
+                    self.selected_node_id = box_ids.first().copied();
+                    self.pending_center_node_id = self.selected_node_id;
+                } else if self
+                    .selected_node_id
+                    .is_some_and(|selected| !box_ids.contains(&selected))
+                {
+                    self.selected_node_id = None;
+                }
+            }
+            ui.ctx().request_repaint();
+        }
         if let Some((node_id, delta)) = interaction.dragged_node
             && let Some(pos) = self.positions.get_mut(&node_id)
         {
@@ -1471,7 +1506,13 @@ impl SpectralApp {
             pos[1] += delta[1];
             ui.ctx().request_repaint();
         }
-        if let Some(node_id) = interaction.clicked_node_id {
+        if interaction.fit_full_network_requested {
+            self.layout_running = false;
+            self.component_selection = ComponentSelection::All;
+            self.pending_center_node_id = None;
+            self.request_fit_view = true;
+            ui.ctx().request_repaint();
+        } else if let Some(node_id) = interaction.clicked_node_id {
             self.selected_node_id = Some(node_id);
             self.pending_center_node_id = Some(node_id);
             ui.ctx().request_repaint();
