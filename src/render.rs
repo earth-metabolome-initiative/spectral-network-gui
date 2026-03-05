@@ -35,6 +35,7 @@ pub fn draw_network(
     network: &SpectralNetwork,
     positions: &HashMap<usize, [f32; 2]>,
     visible: &HashSet<usize>,
+    node_fill_colors: Option<&HashMap<usize, Color32>>,
     view_state: &mut GraphViewState,
     selected_node_id: Option<usize>,
 ) -> GraphInteraction {
@@ -108,7 +109,11 @@ pub fn draw_network(
         }
 
         let radius = (2.0 + (node.degree as f32).sqrt() * 0.8).clamp(2.5, 10.0);
-        painter.circle_filled(pos, radius, component_color(node.component_id));
+        let fill = node_fill_colors
+            .and_then(|colors| colors.get(&node.id))
+            .copied()
+            .unwrap_or_else(|| component_color(node.component_id));
+        painter.circle_filled(pos, radius, fill);
         node_geometry.push(NodeScreenGeom {
             id: node.id,
             pos,

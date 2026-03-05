@@ -122,6 +122,8 @@ pub struct SpectralApp {
     node_attributes: Option<LoadedAttributeTable>,
     edge_attributes: Option<LoadedAttributeTable>,
     node_attr_match_field: NodeAttrMatchField,
+    color_nodes_by_attribute: bool,
+    node_color_attr_column: usize,
     show_node_attributes_panel: bool,
     node_attr_search_query: String,
     node_attr_panel_dock: NodeAttrPanelDock,
@@ -178,6 +180,8 @@ impl SpectralApp {
             node_attributes: None,
             edge_attributes: None,
             node_attr_match_field: NodeAttrMatchField::NodeId,
+            color_nodes_by_attribute: false,
+            node_color_attr_column: 0,
             show_node_attributes_panel: true,
             node_attr_search_query: String::new(),
             node_attr_panel_dock: NodeAttrPanelDock::Bottom,
@@ -232,6 +236,12 @@ impl SpectralApp {
             NodeAttrSortColumn::NodeId
         };
         self.node_attr_sort_ascending = true;
+        if table_columns == 0 {
+            self.node_color_attr_column = 0;
+            self.color_nodes_by_attribute = false;
+        } else if self.node_color_attr_column >= table_columns {
+            self.node_color_attr_column = 0;
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -690,6 +700,107 @@ impl SpectralApp {
             NodeAttrMatchField::RawName => Some(node.raw_name.clone()),
             NodeAttrMatchField::Label => Some(node.label.clone()),
         }
+    }
+
+    fn node_attribute_color_map(
+        &self,
+        network: &SpectralNetwork,
+        visible: &HashSet<usize>,
+    ) -> Option<HashMap<usize, egui::Color32>> {
+        if !self.color_nodes_by_attribute {
+            return None;
+        }
+        let table = self.node_attributes.as_ref()?;
+        let column_count = table.table.columns.len();
+        if column_count == 0 {
+            return None;
+        }
+        let column_idx = self
+            .node_color_attr_column
+            .min(column_count.saturating_sub(1));
+
+        let mut colors = HashMap::with_capacity(visible.len());
+        for node in &network.nodes {
+            if visible.contains(&node.id) {
+                colors.insert(node.id, egui::Color32::from_gray(120));
+            }
+        }
+
+        let mut values: Vec<(usize, String)> = Vec::new();
+        values.reserve(visible.len());
+        for node in &network.nodes {
+            if !visible.contains(&node.id) {
+                continue;
+            }
+            let Some(key) = self.node_attribute_key_for_node(node) else {
+                continue;
+            };
+            let Some(row) = table.find_row(&key) else {
+                continue;
+            };
+            let Some(raw_value) = row.get(column_idx) else {
+                continue;
+            };
+            let value = raw_value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            values.push((node.id, value.to_string()));
+        }
+
+        if values.is_empty() {
+            return Some(colors);
+        }
+
+        let mut numeric_values: Vec<(usize, f64)> = Vec::with_capacity(values.len());
+        let mut all_numeric = true;
+        for (node_id, value) in &values {
+            match value.parse::<f64>() {
+                Ok(num) => numeric_values.push((*node_id, num)),
+                Err(_) => {
+                    all_numeric = false;
+                    break;
+                }
+            }
+        }
+
+        if all_numeric {
+            let mut min_value = f64::INFINITY;
+            let mut max_value = f64::NEG_INFINITY;
+            for (_, value) in &numeric_values {
+                min_value = min_value.min(*value);
+                max_value = max_value.max(*value);
+            }
+            let span = (max_value - min_value).abs();
+            if span <= f64::EPSILON {
+                for (node_id, _) in numeric_values {
+                    colors.insert(node_id, diverging_color(0.5));
+                }
+            } else {
+                for (node_id, value) in numeric_values {
+                    let t = ((value - min_value) / (max_value - min_value)) as f32;
+                    colors.insert(node_id, diverging_color(t));
+                }
+            }
+            return Some(colors);
+        }
+
+        let mut categories: Vec<String> = values.iter().map(|(_, value)| value.clone()).collect();
+        categories.sort();
+        categories.dedup();
+        let category_to_index: HashMap<String, usize> = categories
+            .into_iter()
+            .enumerate()
+            .map(|(idx, category)| (category, idx))
+            .collect();
+
+        for (node_id, value) in values {
+            if let Some(index) = category_to_index.get(&value) {
+                colors.insert(node_id, categorical_color(*index));
+            }
+        }
+
+        Some(colors)
     }
 
     fn draw_attribute_table_setup(
@@ -1185,6 +1296,43 @@ impl SpectralApp {
         });
 
         ui.separator();
+        ui.collapsing("Style", |ui| {
+            ui.checkbox(
+                &mut self.color_nodes_by_attribute,
+                "Color nodes from node attribute column",
+            );
+            if self.color_nodes_by_attribute {
+                if let Some(table) = &self.node_attributes {
+                    if table.table.columns.is_empty() {
+                        ui.small("Loaded node table has no columns.");
+                    } else {
+                        if self.node_color_attr_column >= table.table.columns.len() {
+                            self.node_color_attr_column = 0;
+                        }
+                        let selected_column = table
+                            .table
+                            .columns
+                            .get(self.node_color_attr_column)
+                            .cloned()
+                            .unwrap_or_else(|| "<invalid>".to_string());
+                        egui::ComboBox::from_label("Color column")
+                            .selected_text(selected_column)
+                            .show_ui(ui, |ui| {
+                                for (idx, col_name) in table.table.columns.iter().enumerate() {
+                                    ui.selectable_value(&mut self.node_color_attr_column, idx, col_name);
+                                }
+                            });
+                        ui.small(
+                            "Categorical values use a qualitative palette; numeric values use a divergent gradient.",
+                        );
+                    }
+                } else {
+                    ui.small("Load a node attributes TSV to enable attribute-based colors.");
+                }
+            }
+        });
+
+        ui.separator();
         egui::ComboBox::from_label("Metric")
             .selected_text(self.selected_metric.label())
             .show_ui(ui, |ui| {
@@ -1491,11 +1639,13 @@ impl SpectralApp {
         }
 
         let network = self.network.as_ref().expect("network presence checked");
+        let node_colors = self.node_attribute_color_map(network, &visible_set);
         let interaction = draw_network(
             ui,
             network,
             &self.positions,
             &visible_set,
+            node_colors.as_ref(),
             &mut self.view_state,
             self.selected_node_id,
         );
@@ -1671,6 +1821,47 @@ impl SpectralApp {
             node.featurelist_feature_id.as_deref().unwrap_or("n/a")
         ));
     }
+}
+
+fn categorical_color(index: usize) -> egui::Color32 {
+    const PALETTE: [egui::Color32; 12] = [
+        egui::Color32::from_rgb(31, 119, 180),
+        egui::Color32::from_rgb(255, 127, 14),
+        egui::Color32::from_rgb(44, 160, 44),
+        egui::Color32::from_rgb(214, 39, 40),
+        egui::Color32::from_rgb(148, 103, 189),
+        egui::Color32::from_rgb(140, 86, 75),
+        egui::Color32::from_rgb(227, 119, 194),
+        egui::Color32::from_rgb(127, 127, 127),
+        egui::Color32::from_rgb(188, 189, 34),
+        egui::Color32::from_rgb(23, 190, 207),
+        egui::Color32::from_rgb(57, 106, 177),
+        egui::Color32::from_rgb(218, 124, 48),
+    ];
+    PALETTE[index % PALETTE.len()]
+}
+
+fn diverging_color(t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let low = egui::Color32::from_rgb(49, 54, 149);
+    let mid = egui::Color32::from_rgb(246, 246, 246);
+    let high = egui::Color32::from_rgb(165, 0, 38);
+    if t <= 0.5 {
+        lerp_color(low, mid, t * 2.0)
+    } else {
+        lerp_color(mid, high, (t - 0.5) * 2.0)
+    }
+}
+
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |x: u8, y: u8| -> u8 { (x as f32 + (y as f32 - x as f32) * t).round() as u8 };
+    egui::Color32::from_rgba_unmultiplied(
+        lerp(a.r(), b.r()),
+        lerp(a.g(), b.g()),
+        lerp(a.b(), b.b()),
+        lerp(a.a(), b.a()),
+    )
 }
 
 fn compare_node_attr_values(left: &str, right: &str) -> Ordering {
