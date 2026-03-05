@@ -420,6 +420,7 @@ mod tests {
                 precursor_mz: precursor,
                 num_peaks: peaks.len(),
             },
+            peaks: Arc::new(peaks.to_vec()),
             spectrum: Arc::new(spec),
         }
     }

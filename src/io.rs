@@ -47,6 +47,7 @@ pub struct SpectrumMeta {
 #[derive(Clone)]
 pub struct SpectrumRecord {
     pub meta: SpectrumMeta,
+    pub peaks: Arc<Vec<(f64, f64)>>,
     pub spectrum: Arc<GenericSpectrum<f64, f64>>,
 }
 
@@ -391,6 +392,7 @@ fn to_records(parsed: Vec<ParsedSpectrum>) -> Result<Vec<SpectrumRecord>, String
                 precursor_mz: spec.precursor_mz,
                 num_peaks: spec.peaks.len(),
             },
+            peaks: Arc::new(spec.peaks),
             spectrum: Arc::new(spectrum),
         });
     }
