@@ -99,6 +99,12 @@ enum NodeAttrSortColumn {
     TableColumn(usize),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpectrumZoomContext {
+    Single(usize),
+    Mirror { node_a: usize, node_b: usize },
+}
+
 struct NodeColoring {
     fills: HashMap<usize, egui::Color32>,
     mode: NodeColorMode,
@@ -130,6 +136,15 @@ struct SelectedStructureEntry {
     display_label: String,
     smiles: String,
     annotations: Vec<(String, String)>,
+}
+
+struct MirrorSpectrumData<'a> {
+    top_node_id: usize,
+    top_label: &'a str,
+    top_peaks: &'a [(f64, f64)],
+    bottom_node_id: usize,
+    bottom_label: &'a str,
+    bottom_peaks: &'a [(f64, f64)],
 }
 
 pub struct SpectralApp {
@@ -168,6 +183,7 @@ pub struct SpectralApp {
     view_state: GraphViewState,
     hovered_node_id: Option<usize>,
     selected_node_id: Option<usize>,
+    secondary_selected_node_id: Option<usize>,
 
     native_compute: Option<NativeComputeHandle>,
     incremental_compute: Option<IncrementalComputeState>,
@@ -200,11 +216,12 @@ pub struct SpectralApp {
     selection_structures_image_height: f32,
     structure_caption_columns: Vec<usize>,
     selected_spectrum_peak: Option<(usize, f64, f64)>,
-    spectrum_zoom_node_id: Option<usize>,
+    spectrum_zoom_context: Option<SpectrumZoomContext>,
     spectrum_zoom_mz_range: Option<(f64, f64)>,
     spectrum_zoom_int_range: Option<(f64, f64)>,
     spectrum_drag_start: Option<egui::Pos2>,
     spectrum_drag_current: Option<egui::Pos2>,
+    spectrum_similarity_cache: Option<(usize, usize, Option<f64>)>,
 
     #[cfg(target_arch = "wasm32")]
     upload_promise: Option<poll_promise::Promise<Result<UploadedFile, String>>>,
@@ -253,6 +270,7 @@ impl SpectralApp {
             },
             hovered_node_id: None,
             selected_node_id: None,
+            secondary_selected_node_id: None,
             native_compute: None,
             incremental_compute: None,
             status_message: None,
@@ -282,11 +300,12 @@ impl SpectralApp {
             selection_structures_image_height: 260.0,
             structure_caption_columns: Vec::new(),
             selected_spectrum_peak: None,
-            spectrum_zoom_node_id: None,
+            spectrum_zoom_context: None,
             spectrum_zoom_mz_range: None,
             spectrum_zoom_int_range: None,
             spectrum_drag_start: None,
             spectrum_drag_current: None,
+            spectrum_similarity_cache: None,
             #[cfg(target_arch = "wasm32")]
             upload_promise: None,
         }
@@ -298,6 +317,7 @@ impl SpectralApp {
         self.positions.clear();
         self.hovered_node_id = None;
         self.selected_node_id = None;
+        self.secondary_selected_node_id = None;
         self.component_selection = ComponentSelection::All;
         self.layout_running = false;
         self.layout_mean_displacement = 0.0;
@@ -308,6 +328,77 @@ impl SpectralApp {
         self.view_state.box_select_current = None;
         self.pending_center_node_id = None;
         self.table_node_filter = None;
+        self.clear_spectrum_view_state();
+        self.spectrum_similarity_cache = None;
+    }
+
+    fn clear_spectrum_view_state(&mut self) {
+        self.selected_spectrum_peak = None;
+        self.spectrum_zoom_context = None;
+        self.spectrum_zoom_mz_range = None;
+        self.spectrum_zoom_int_range = None;
+        self.spectrum_drag_start = None;
+        self.spectrum_drag_current = None;
+    }
+
+    fn set_single_selected_node(&mut self, node_id: usize, center: bool) {
+        self.selected_node_id = Some(node_id);
+        self.secondary_selected_node_id = None;
+        if center {
+            self.pending_center_node_id = Some(node_id);
+        }
+    }
+
+    fn clear_selected_nodes(&mut self) {
+        self.selected_node_id = None;
+        self.secondary_selected_node_id = None;
+    }
+
+    fn toggle_selected_node_with_modifier(&mut self, node_id: usize) {
+        let primary = self.selected_node_id;
+        let secondary = self.secondary_selected_node_id;
+        if primary == Some(node_id) {
+            if let Some(other) = secondary {
+                self.selected_node_id = Some(other);
+                self.secondary_selected_node_id = None;
+            } else {
+                self.clear_selected_nodes();
+            }
+            return;
+        }
+        if secondary == Some(node_id) {
+            self.secondary_selected_node_id = None;
+            return;
+        }
+        match primary {
+            None => {
+                self.selected_node_id = Some(node_id);
+                self.secondary_selected_node_id = None;
+            }
+            Some(current_primary) => {
+                self.selected_node_id = Some(node_id);
+                self.secondary_selected_node_id = Some(current_primary);
+            }
+        }
+    }
+
+    fn selected_mirror_pair(&self) -> Option<(usize, usize)> {
+        let first = self.selected_node_id?;
+        let second = self.secondary_selected_node_id?;
+        if first == second {
+            None
+        } else {
+            Some((first, second))
+        }
+    }
+
+    fn normalize_selected_pair(&mut self) {
+        if self.selected_node_id.is_none() {
+            self.secondary_selected_node_id = None;
+        }
+        if self.selected_node_id == self.secondary_selected_node_id {
+            self.secondary_selected_node_id = None;
+        }
     }
 
     fn set_loaded_spectra(&mut self, loaded: LoadedSpectra) {
@@ -575,6 +666,13 @@ impl SpectralApp {
             self.component_selection,
             self.hide_singletons,
         );
+        self.secondary_selected_node_id = keep_selected_if_visible(
+            self.secondary_selected_node_id,
+            &network,
+            self.component_selection,
+            self.hide_singletons,
+        );
+        self.normalize_selected_pair();
         let layout = force_directed_layout(
             &network,
             &visible,
@@ -852,6 +950,57 @@ impl SpectralApp {
         network.nodes.iter().find(|n| n.id == node_id).cloned()
     }
 
+    fn visible_node_by_id(
+        &self,
+        network: &SpectralNetwork,
+        node_id: usize,
+    ) -> Option<crate::network::NetworkNode> {
+        let visible_set =
+            visible_node_set_for_view(network, self.component_selection, self.hide_singletons);
+        if !visible_set.contains(&node_id) {
+            return None;
+        }
+        network.nodes.iter().find(|n| n.id == node_id).cloned()
+    }
+
+    fn spectrum_peaks_for_node(&self, node_id: usize) -> Option<Vec<(f64, f64)>> {
+        self.spectra
+            .iter()
+            .find(|record| record.meta.id == node_id)
+            .map(|record| record.peaks.as_ref().clone())
+    }
+
+    fn similarity_for_pair(&mut self, node_a: usize, node_b: usize) -> Option<f64> {
+        let (left, right) = if node_a <= node_b {
+            (node_a, node_b)
+        } else {
+            (node_b, node_a)
+        };
+        if let Some((cached_left, cached_right, cached_value)) = self.spectrum_similarity_cache
+            && cached_left == left
+            && cached_right == right
+        {
+            return cached_value;
+        }
+
+        let score = self.pair_scores.as_ref().and_then(|pairs| {
+            pairs.iter().find_map(|pair| {
+                let (pair_left, pair_right) = if pair.left <= pair.right {
+                    (pair.left, pair.right)
+                } else {
+                    (pair.right, pair.left)
+                };
+                if pair_left == left && pair_right == right {
+                    Some(pair.score)
+                } else {
+                    None
+                }
+            })
+        });
+        self.spectrum_similarity_cache = Some((left, right, score));
+        score
+    }
+
     fn ensure_depiction_request(&mut self, request_key: String, uri: String) {
         if self
             .depict_cache
@@ -998,8 +1147,9 @@ impl SpectralApp {
             ui.small("No peaks available for this spectrum.");
             return;
         }
-        if self.spectrum_zoom_node_id != Some(node_id) {
-            self.spectrum_zoom_node_id = Some(node_id);
+        let current_context = SpectrumZoomContext::Single(node_id);
+        if self.spectrum_zoom_context != Some(current_context) {
+            self.spectrum_zoom_context = Some(current_context);
             self.spectrum_zoom_mz_range = None;
             self.spectrum_zoom_int_range = None;
             self.spectrum_drag_start = None;
@@ -1117,10 +1267,11 @@ impl SpectralApp {
             self.spectrum_drag_start = Some(pointer);
             self.spectrum_drag_current = Some(pointer);
         }
-        if primary_down && self.spectrum_drag_start.is_some() {
-            if let Some(pointer) = pointer_clamped {
-                self.spectrum_drag_current = Some(pointer);
-            }
+        if primary_down
+            && self.spectrum_drag_start.is_some()
+            && let Some(pointer) = pointer_clamped
+        {
+            self.spectrum_drag_current = Some(pointer);
         }
 
         let mut zoom_applied = false;
@@ -1241,30 +1392,378 @@ impl SpectralApp {
             axis_color,
         );
 
-        if let Some((mz, intensity, top, _)) = hovered_peak {
+        if let Some((mz, _, top, _)) = hovered_peak {
             painter.text(
                 top + egui::vec2(6.0, -4.0),
                 egui::Align2::LEFT_BOTTOM,
-                format!("m/z {:.4} | int. {}", mz, compact_sci(intensity)),
+                format!("m/z {:.4}", mz),
                 font.clone(),
                 egui::Color32::BLACK,
             );
-            ui.small(format!(
-                "Hover peak: m/z {:.4} | int. {}",
-                mz,
-                compact_sci(intensity)
-            ));
-        } else if let Some((selected_node_id, mz, intensity)) = self.selected_spectrum_peak
+            ui.small(format!("Hover peak: m/z {:.4}", mz));
+        } else if let Some((selected_node_id, mz, _)) = self.selected_spectrum_peak
             && selected_node_id == node_id
         {
-            ui.small(format!(
-                "Selected peak: m/z {:.4} | int. {}",
-                mz,
-                compact_sci(intensity)
-            ));
+            ui.small(format!("Selected peak: m/z {:.4}", mz));
         }
         ui.small("Drag rectangle to zoom. Double-click to reset.");
         ui.small(format!("Peaks: {}", peaks.len()));
+    }
+
+    fn draw_mirror_spectrum_plot(&mut self, ui: &mut egui::Ui, data: MirrorSpectrumData<'_>) {
+        let MirrorSpectrumData {
+            top_node_id,
+            top_label,
+            top_peaks,
+            bottom_node_id,
+            bottom_label,
+            bottom_peaks,
+        } = data;
+        if top_peaks.is_empty() || bottom_peaks.is_empty() {
+            ui.small("Mirror plot unavailable: one of the selected nodes has no peaks.");
+            return;
+        }
+
+        let (node_a, node_b) = if top_node_id <= bottom_node_id {
+            (top_node_id, bottom_node_id)
+        } else {
+            (bottom_node_id, top_node_id)
+        };
+        let current_context = SpectrumZoomContext::Mirror { node_a, node_b };
+        if self.spectrum_zoom_context != Some(current_context) {
+            self.spectrum_zoom_context = Some(current_context);
+            self.spectrum_zoom_mz_range = None;
+            self.spectrum_zoom_int_range = None;
+            self.spectrum_drag_start = None;
+            self.spectrum_drag_current = None;
+            self.selected_spectrum_peak = None;
+        }
+
+        let desired_size = egui::vec2(ui.available_width().max(220.0), 280.0);
+        let (response, painter) = ui.allocate_painter(desired_size, egui::Sense::click_and_drag());
+        let rect = response.rect;
+        let plot_rect = egui::Rect::from_min_max(
+            rect.left_top() + egui::vec2(44.0, 10.0),
+            rect.right_bottom() - egui::vec2(12.0, 28.0),
+        );
+        if !plot_rect.is_positive() {
+            return;
+        }
+
+        let full_min_mz = top_peaks
+            .iter()
+            .chain(bottom_peaks.iter())
+            .map(|(mz, _)| *mz)
+            .fold(f64::INFINITY, f64::min);
+        let full_max_mz = top_peaks
+            .iter()
+            .chain(bottom_peaks.iter())
+            .map(|(mz, _)| *mz)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let full_max_intensity = top_peaks
+            .iter()
+            .chain(bottom_peaks.iter())
+            .map(|(_, intensity)| *intensity)
+            .fold(0.0_f64, f64::max)
+            .max(1e-9);
+        if !full_min_mz.is_finite() || !full_max_mz.is_finite() || full_max_mz <= full_min_mz {
+            ui.small("Mirror plot unavailable: invalid m/z span.");
+            return;
+        }
+
+        let (view_min_mz, view_max_mz) = self
+            .spectrum_zoom_mz_range
+            .filter(|(lo, hi)| hi > lo)
+            .unwrap_or((full_min_mz, full_max_mz));
+        let (_, view_max_int) = self
+            .spectrum_zoom_int_range
+            .filter(|(lo, hi)| hi > lo)
+            .unwrap_or((0.0, full_max_intensity));
+        let view_min_int = 0.0;
+        let mz_span = (view_max_mz - view_min_mz).max(1e-9);
+        let int_span = (view_max_int - view_min_int).max(1e-9);
+        let half_height = (plot_rect.height() * 0.5).max(1.0);
+        let center_y = plot_rect.center().y;
+
+        let x_to_mz = |x: f32| -> f64 {
+            let t = ((x - plot_rect.left()) / plot_rect.width()).clamp(0.0, 1.0) as f64;
+            view_min_mz + t * mz_span
+        };
+        let y_to_abs_int = |y: f32| -> f64 {
+            let t = ((center_y - y).abs() / half_height).clamp(0.0, 1.0) as f64;
+            view_min_int + t * int_span
+        };
+
+        painter.rect_filled(plot_rect, 0.0, egui::Color32::WHITE);
+        painter.rect_stroke(
+            plot_rect,
+            0.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(130)),
+            egui::StrokeKind::Outside,
+        );
+
+        let axis_color = egui::Color32::from_gray(70);
+        painter.line_segment(
+            [
+                egui::pos2(plot_rect.left(), center_y),
+                egui::pos2(plot_rect.right(), center_y),
+            ],
+            egui::Stroke::new(1.0, axis_color),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(plot_rect.left(), plot_rect.top()),
+                egui::pos2(plot_rect.left(), plot_rect.bottom()),
+            ],
+            egui::Stroke::new(1.0, axis_color),
+        );
+
+        let mut drawn_top = Vec::with_capacity(top_peaks.len().min(8000));
+        for (mz, intensity) in top_peaks.iter().take(8000) {
+            if *mz < view_min_mz || *mz > view_max_mz || *intensity < view_min_int {
+                continue;
+            }
+            let x = plot_rect.left() + (((*mz - view_min_mz) / mz_span) as f32) * plot_rect.width();
+            let y = center_y
+                - ((((*intensity - view_min_int) / int_span).clamp(0.0, 1.0)) as f32) * half_height;
+            let tip = egui::pos2(x, y);
+            let base = egui::pos2(x, center_y);
+            painter.line_segment(
+                [base, tip],
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 120, 210)),
+            );
+            drawn_top.push((*mz, *intensity, tip, base));
+        }
+
+        let mut drawn_bottom = Vec::with_capacity(bottom_peaks.len().min(8000));
+        for (mz, intensity) in bottom_peaks.iter().take(8000) {
+            if *mz < view_min_mz || *mz > view_max_mz || *intensity < view_min_int {
+                continue;
+            }
+            let x = plot_rect.left() + (((*mz - view_min_mz) / mz_span) as f32) * plot_rect.width();
+            let y = center_y
+                + ((((*intensity - view_min_int) / int_span).clamp(0.0, 1.0)) as f32) * half_height;
+            let tip = egui::pos2(x, y);
+            let base = egui::pos2(x, center_y);
+            painter.line_segment(
+                [base, tip],
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(210, 95, 60)),
+            );
+            drawn_bottom.push((*mz, *intensity, tip, base));
+        }
+
+        let clamp_to_plot = |pointer: egui::Pos2| -> egui::Pos2 {
+            egui::pos2(
+                pointer.x.clamp(plot_rect.left(), plot_rect.right()),
+                pointer.y.clamp(plot_rect.top(), plot_rect.bottom()),
+            )
+        };
+        let pointer_latest = ui.input(|i| i.pointer.latest_pos());
+        let pointer_clamped = pointer_latest.map(clamp_to_plot);
+        let pointer_in_plot = pointer_latest.filter(|pointer| plot_rect.contains(*pointer));
+        let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+        let primary_down = ui.input(|i| i.pointer.primary_down());
+        let primary_released = ui.input(|i| i.pointer.primary_released());
+        if primary_pressed && let Some(pointer) = pointer_in_plot.map(clamp_to_plot) {
+            self.spectrum_drag_start = Some(pointer);
+            self.spectrum_drag_current = Some(pointer);
+        }
+        if primary_down
+            && self.spectrum_drag_start.is_some()
+            && let Some(pointer) = pointer_clamped
+        {
+            self.spectrum_drag_current = Some(pointer);
+        }
+
+        let mut zoom_applied = false;
+        if primary_released
+            && let (Some(start), Some(current)) = (
+                self.spectrum_drag_start.take(),
+                self.spectrum_drag_current.take(),
+            )
+        {
+            let selection_rect = egui::Rect::from_two_pos(start, current).intersect(plot_rect);
+            if selection_rect.width() >= 6.0 && selection_rect.height() >= 6.0 {
+                let mut mz_a = x_to_mz(selection_rect.left());
+                let mut mz_b = x_to_mz(selection_rect.right());
+                if mz_b < mz_a {
+                    std::mem::swap(&mut mz_a, &mut mz_b);
+                }
+                let max_int =
+                    y_to_abs_int(selection_rect.top()).max(y_to_abs_int(selection_rect.bottom()));
+                if mz_b - mz_a > 1e-9 && max_int > 1e-9 {
+                    self.spectrum_zoom_mz_range = Some((mz_a, mz_b));
+                    self.spectrum_zoom_int_range = Some((0.0, max_int));
+                    zoom_applied = true;
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+        if primary_down
+            && let (Some(start), Some(current)) =
+                (self.spectrum_drag_start, self.spectrum_drag_current)
+        {
+            let selection_rect = egui::Rect::from_two_pos(start, current).intersect(plot_rect);
+            if selection_rect.is_positive() {
+                painter.rect_filled(
+                    selection_rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(50, 120, 220, 30),
+                );
+                painter.rect_stroke(
+                    selection_rect,
+                    0.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 120, 220)),
+                    egui::StrokeKind::Outside,
+                );
+            }
+        }
+        if response.double_clicked() {
+            self.spectrum_zoom_mz_range = None;
+            self.spectrum_zoom_int_range = None;
+            self.spectrum_drag_start = None;
+            self.spectrum_drag_current = None;
+            self.selected_spectrum_peak = None;
+            ui.ctx().request_repaint();
+        }
+
+        if response.clicked() && !zoom_applied && self.spectrum_drag_start.is_none() {
+            if let Some(pointer) = response
+                .interact_pointer_pos()
+                .filter(|p| plot_rect.contains(*p))
+            {
+                let top_hit = nearest_peak(pointer, &drawn_top, 10.0)
+                    .map(|(mz, intensity, _, _)| (top_node_id, mz, intensity));
+                let bottom_hit = nearest_peak(pointer, &drawn_bottom, 10.0)
+                    .map(|(mz, intensity, _, _)| (bottom_node_id, mz, intensity));
+                self.selected_spectrum_peak = top_hit.or(bottom_hit);
+            } else {
+                self.selected_spectrum_peak = None;
+            }
+        }
+
+        let hovered_peak = response
+            .hover_pos()
+            .filter(|pointer| plot_rect.contains(*pointer))
+            .and_then(|pointer| {
+                let top =
+                    nearest_peak(pointer, &drawn_top, 8.0).map(|(mz, intensity, tip, base)| {
+                        (
+                            top_node_id,
+                            mz,
+                            intensity,
+                            tip,
+                            point_to_segment_distance_sq(pointer, tip, base),
+                        )
+                    });
+                let bottom =
+                    nearest_peak(pointer, &drawn_bottom, 8.0).map(|(mz, intensity, tip, base)| {
+                        (
+                            bottom_node_id,
+                            mz,
+                            intensity,
+                            tip,
+                            point_to_segment_distance_sq(pointer, tip, base),
+                        )
+                    });
+                match (top, bottom) {
+                    (Some(t), Some(b)) => {
+                        if t.4 <= b.4 {
+                            Some((t.0, t.1, t.2, t.3))
+                        } else {
+                            Some((b.0, b.1, b.2, b.3))
+                        }
+                    }
+                    (Some(t), None) => Some((t.0, t.1, t.2, t.3)),
+                    (None, Some(b)) => Some((b.0, b.1, b.2, b.3)),
+                    (None, None) => None,
+                }
+            });
+
+        let font = egui::FontId::proportional(11.0);
+        painter.text(
+            egui::pos2(plot_rect.center().x, rect.bottom() - 6.0),
+            egui::Align2::CENTER_BOTTOM,
+            "m/z",
+            font.clone(),
+            axis_color,
+        );
+        painter.text(
+            egui::pos2(rect.left() + 4.0, plot_rect.top()),
+            egui::Align2::LEFT_TOP,
+            "int.",
+            font.clone(),
+            axis_color,
+        );
+        painter.text(
+            egui::pos2(plot_rect.left(), rect.bottom() - 6.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{view_min_mz:.2}"),
+            font.clone(),
+            axis_color,
+        );
+        painter.text(
+            egui::pos2(plot_rect.right(), rect.bottom() - 6.0),
+            egui::Align2::RIGHT_BOTTOM,
+            format!("{view_max_mz:.2}"),
+            font.clone(),
+            axis_color,
+        );
+        painter.text(
+            egui::pos2(rect.left() + 4.0, center_y - 2.0),
+            egui::Align2::LEFT_BOTTOM,
+            "0",
+            font.clone(),
+            axis_color,
+        );
+        painter.text(
+            egui::pos2(rect.left() + 4.0, plot_rect.top() + 12.0),
+            egui::Align2::LEFT_TOP,
+            compact_sci(view_max_int),
+            font.clone(),
+            axis_color,
+        );
+        painter.text(
+            egui::pos2(rect.left() + 4.0, plot_rect.bottom() - 12.0),
+            egui::Align2::LEFT_BOTTOM,
+            compact_sci(view_max_int),
+            font.clone(),
+            axis_color,
+        );
+
+        if let Some((hover_node_id, mz, _, tip)) = hovered_peak {
+            painter.text(
+                tip + egui::vec2(6.0, -4.0),
+                egui::Align2::LEFT_BOTTOM,
+                format!("m/z {:.4}", mz),
+                font.clone(),
+                egui::Color32::BLACK,
+            );
+            let node_label = if hover_node_id == top_node_id {
+                top_label
+            } else {
+                bottom_label
+            };
+            ui.small(format!("Hover peak ({node_label}): m/z {:.4}", mz));
+        } else if let Some((selected_node_id, mz, _)) = self.selected_spectrum_peak
+            && (selected_node_id == top_node_id || selected_node_id == bottom_node_id)
+        {
+            let node_label = if selected_node_id == top_node_id {
+                top_label
+            } else {
+                bottom_label
+            };
+            ui.small(format!("Selected peak ({node_label}): m/z {:.4}", mz));
+        }
+
+        ui.small(format!(
+            "Top: {} ({} peaks) | Bottom: {} ({} peaks)",
+            top_label,
+            top_peaks.len(),
+            bottom_label,
+            bottom_peaks.len()
+        ));
+        ui.small("Drag rectangle to zoom both spectra. Double-click to reset.");
     }
 
     fn selected_structures_from_node_selection(&self) -> Vec<SelectedStructureEntry> {
@@ -1391,8 +1890,7 @@ impl SpectralApp {
                             egui::vec2(card_width, card_height),
                         );
                         if ui.link(&entry.display_label).clicked() {
-                            self.selected_node_id = Some(entry.node_id);
-                            self.pending_center_node_id = Some(entry.node_id);
+                            self.set_single_selected_node(entry.node_id, true);
                         }
                         if entry.annotations.is_empty() {
                             ui.small("No additional structure metadata selected.");
@@ -1877,8 +2375,7 @@ impl SpectralApp {
             if !feature_id.is_empty() {
                 let maybe_node_id = feature_to_node_id.get(&feature_id).copied();
                 if let Some(node_id) = maybe_node_id {
-                    self.selected_node_id = Some(node_id);
-                    self.pending_center_node_id = Some(node_id);
+                    self.set_single_selected_node(node_id, true);
                     self.structure_panel_mode = StructurePanelMode::SelectedNode;
                     self.status_message =
                         Some(format!("Selected feature_id={feature_id} (node {node_id})"));
@@ -2385,6 +2882,13 @@ impl SpectralApp {
                     self.component_selection,
                     self.hide_singletons,
                 );
+                self.secondary_selected_node_id = keep_selected_if_visible(
+                    self.secondary_selected_node_id,
+                    network,
+                    self.component_selection,
+                    self.hide_singletons,
+                );
+                self.normalize_selected_pair();
                 self.layout_running = false;
                 self.request_fit_view = true;
             }
@@ -2504,17 +3008,34 @@ impl SpectralApp {
             }
         }
 
-        let network = self.network.as_ref().expect("network presence checked");
-        let node_coloring = self.node_attribute_coloring(network, &visible_set);
-        let interaction = draw_network(
-            ui,
-            network,
-            &self.positions,
-            &visible_set,
-            node_coloring.as_ref().map(|coloring| &coloring.fills),
-            &mut self.view_state,
-            self.selected_node_id,
-        );
+        let node_coloring = {
+            let network = self.network.as_ref().expect("network presence checked");
+            self.node_attribute_coloring(network, &visible_set)
+        };
+        let selected_ring_ids = {
+            let mut ids = Vec::with_capacity(2);
+            if let Some(node_id) = self.selected_node_id {
+                ids.push(node_id);
+            }
+            if let Some(node_id) = self.secondary_selected_node_id
+                && !ids.contains(&node_id)
+            {
+                ids.push(node_id);
+            }
+            ids
+        };
+        let interaction = {
+            let network = self.network.as_ref().expect("network presence checked");
+            draw_network(
+                ui,
+                network,
+                &self.positions,
+                &visible_set,
+                node_coloring.as_ref().map(|coloring| &coloring.fills),
+                &mut self.view_state,
+                selected_ring_ids.as_slice(),
+            )
+        };
         self.hovered_node_id = interaction.hovered_node_id;
         self.view_state.pan += interaction.pan_delta;
         if let Some(box_ids) = interaction.box_selected_node_ids {
@@ -2531,13 +3052,14 @@ impl SpectralApp {
                     box_ids.len()
                 ));
                 if box_ids.len() == 1 {
-                    self.selected_node_id = box_ids.first().copied();
-                    self.pending_center_node_id = self.selected_node_id;
+                    if let Some(node_id) = box_ids.first().copied() {
+                        self.set_single_selected_node(node_id, true);
+                    }
                 } else if self
                     .selected_node_id
                     .is_some_and(|selected| !box_ids.contains(&selected))
                 {
-                    self.selected_node_id = None;
+                    self.clear_selected_nodes();
                 }
             }
             ui.ctx().request_repaint();
@@ -2556,26 +3078,37 @@ impl SpectralApp {
             self.request_fit_view = true;
             ui.ctx().request_repaint();
         } else if let Some(node_id) = interaction.clicked_node_id {
-            self.selected_node_id = Some(node_id);
+            let toggle_two_nodes = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+            if toggle_two_nodes {
+                self.toggle_selected_node_with_modifier(node_id);
+            } else {
+                self.set_single_selected_node(node_id, false);
+            }
             self.pending_center_node_id = Some(node_id);
             self.structure_panel_mode = StructurePanelMode::SelectedNode;
             ui.ctx().request_repaint();
-        } else if interaction.clicked_empty_canvas {
-            self.selected_node_id = None;
+        } else if interaction.clicked_empty_canvas
+            && !ui.input(|i| i.modifiers.ctrl || i.modifiers.command)
+        {
+            self.clear_selected_nodes();
+            ui.ctx().request_repaint();
         }
         if self.layout_running
             && interaction.dragged_node.is_none()
             && interaction.pan_delta.length_sq() <= f32::EPSILON
             && !visible.is_empty()
         {
-            let relaxed = force_directed_layout(
-                network,
-                &visible,
-                &self.positions,
-                2,
-                self.node_force,
-                self.edge_force,
-            );
+            let relaxed = {
+                let network = self.network.as_ref().expect("network presence checked");
+                force_directed_layout(
+                    network,
+                    &visible,
+                    &self.positions,
+                    2,
+                    self.node_force,
+                    self.edge_force,
+                )
+            };
             self.layout_mean_displacement = relaxed.mean_displacement;
             for (node_id, pos) in relaxed.positions {
                 self.positions.insert(node_id, pos);
@@ -2601,7 +3134,10 @@ impl SpectralApp {
 
         ui.separator();
         let visible_nodes = visible.clone();
-        let visible_edges = network
+        let visible_edges = self
+            .network
+            .as_ref()
+            .expect("network presence checked")
             .edges
             .iter()
             .filter(|e| visible_set.contains(&e.source) && visible_set.contains(&e.target))
@@ -2610,11 +3146,21 @@ impl SpectralApp {
             "Visible: {} node(s), {} edge(s), {} component(s) total",
             visible_nodes.len(),
             visible_edges,
-            network.components.len()
+            self.network
+                .as_ref()
+                .expect("network presence checked")
+                .components
+                .len()
         ));
 
         if let Some(node_id) = self.hovered_node_id
-            && let Some(node) = network.nodes.iter().find(|n| n.id == node_id)
+            && let Some(node) = self
+                .network
+                .as_ref()
+                .expect("network presence checked")
+                .nodes
+                .iter()
+                .find(|n| n.id == node_id)
         {
             ui.label(format!(
                 "Hover node {} | label={} | raw={} | precursor_mz={:.4} | peaks={} | degree={} | component={}",
@@ -2634,17 +3180,17 @@ impl SpectralApp {
         ui.separator();
 
         let Some(network) = &self.network else {
-            self.selected_spectrum_peak = None;
-            self.spectrum_zoom_node_id = None;
-            self.spectrum_zoom_mz_range = None;
-            self.spectrum_zoom_int_range = None;
-            self.spectrum_drag_start = None;
-            self.spectrum_drag_current = None;
+            self.clear_spectrum_view_state();
             ui.label("No network loaded.");
             return;
         };
 
         let selected_node = self.selected_visible_node(network);
+        let mirror_nodes = self.selected_mirror_pair().and_then(|(top_id, bottom_id)| {
+            let top = self.visible_node_by_id(network, top_id)?;
+            let bottom = self.visible_node_by_id(network, bottom_id)?;
+            Some((top, bottom))
+        });
         if let Some(node) = selected_node.as_ref() {
             ui.monospace(format!("Node index: {}", node.id));
             ui.horizontal(|ui| {
@@ -2682,31 +3228,53 @@ impl SpectralApp {
 
             ui.separator();
             ui.label("Spectrum");
-            let selected_peaks = self
-                .spectra
-                .iter()
-                .find(|record| record.meta.id == node.id)
-                .map(|record| record.peaks.clone());
-            if let Some(peaks) = selected_peaks {
-                self.draw_spectrum_plot(ui, node.id, peaks.as_slice());
+            if let Some((top_node, bottom_node)) = mirror_nodes {
+                let similarity_score = self.similarity_for_pair(top_node.id, bottom_node.id);
+                if let Some(score) = similarity_score {
+                    ui.small(format!(
+                        "{} similarity: {:.2}",
+                        self.selected_metric.label(),
+                        score
+                    ));
+                } else {
+                    ui.small(format!("{} similarity: n/a", self.selected_metric.label()));
+                }
+                ui.small(format!(
+                    "Mirror comparison: node {} vs node {}",
+                    top_node.id, bottom_node.id
+                ));
+                let top_peaks = self.spectrum_peaks_for_node(top_node.id);
+                let bottom_peaks = self.spectrum_peaks_for_node(bottom_node.id);
+                if let (Some(top_peaks), Some(bottom_peaks)) = (top_peaks, bottom_peaks) {
+                    let top_label = format!("{} [{}]", top_node.label, top_node.id);
+                    let bottom_label = format!("{} [{}]", bottom_node.label, bottom_node.id);
+                    self.draw_mirror_spectrum_plot(
+                        ui,
+                        MirrorSpectrumData {
+                            top_node_id: top_node.id,
+                            top_label: &top_label,
+                            top_peaks: top_peaks.as_slice(),
+                            bottom_node_id: bottom_node.id,
+                            bottom_label: &bottom_label,
+                            bottom_peaks: bottom_peaks.as_slice(),
+                        },
+                    );
+                } else {
+                    ui.small("No spectrum data found for one of the selected nodes.");
+                }
             } else {
-                ui.small("No spectrum data found for this node.");
+                ui.small(format!("{} similarity: n/a", self.selected_metric.label()));
+                if let Some(peaks) = self.spectrum_peaks_for_node(node.id) {
+                    self.draw_spectrum_plot(ui, node.id, peaks.as_slice());
+                } else {
+                    ui.small("No spectrum data found for this node.");
+                }
             }
         } else if self.selected_node_id.is_some() {
-            self.selected_spectrum_peak = None;
-            self.spectrum_zoom_node_id = None;
-            self.spectrum_zoom_mz_range = None;
-            self.spectrum_zoom_int_range = None;
-            self.spectrum_drag_start = None;
-            self.spectrum_drag_current = None;
+            self.clear_spectrum_view_state();
             ui.label("Selected node is not visible in current scope.");
         } else {
-            self.selected_spectrum_peak = None;
-            self.spectrum_zoom_node_id = None;
-            self.spectrum_zoom_mz_range = None;
-            self.spectrum_zoom_int_range = None;
-            self.spectrum_drag_start = None;
-            self.spectrum_drag_current = None;
+            self.clear_spectrum_view_state();
             ui.label("Select a node in the graph.");
         }
 
@@ -2923,6 +3491,25 @@ fn nearest_peak(
         }
     }
     best.map(|(mz, intensity, top, base, _)| (mz, intensity, top, base))
+}
+
+fn point_to_segment_distance_sq(
+    pointer: egui::Pos2,
+    segment_start: egui::Pos2,
+    segment_end: egui::Pos2,
+) -> f32 {
+    let vx = segment_end.x - segment_start.x;
+    let vy = segment_end.y - segment_start.y;
+    let wx = pointer.x - segment_start.x;
+    let wy = pointer.y - segment_start.y;
+    let denom = vx * vx + vy * vy;
+    if denom <= f32::EPSILON {
+        return (pointer.x - segment_start.x).powi(2) + (pointer.y - segment_start.y).powi(2);
+    }
+    let t = ((wx * vx + wy * vy) / denom).clamp(0.0, 1.0);
+    let proj_x = segment_start.x + t * vx;
+    let proj_y = segment_start.y + t * vy;
+    (pointer.x - proj_x).powi(2) + (pointer.y - proj_y).powi(2)
 }
 
 fn compare_node_attr_values(left: &str, right: &str) -> Ordering {

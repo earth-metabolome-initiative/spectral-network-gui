@@ -37,7 +37,7 @@ pub fn draw_network(
     visible: &HashSet<usize>,
     node_fill_colors: Option<&HashMap<usize, Color32>>,
     view_state: &mut GraphViewState,
-    selected_node_id: Option<usize>,
+    selected_node_ids: &[usize],
 ) -> GraphInteraction {
     if view_state.zoom <= 0.0 {
         view_state.zoom = 1.0;
@@ -119,7 +119,7 @@ pub fn draw_network(
             pos,
             radius,
         });
-        if selected_node_id == Some(node.id) {
+        if selected_node_ids.contains(&node.id) {
             painter.circle_stroke(
                 pos,
                 radius + 2.5,
@@ -138,19 +138,26 @@ pub fn draw_network(
     let clicked_primary = response.clicked_by(PointerButton::Primary);
     let fit_full_network_requested = response.double_clicked_by(PointerButton::Primary);
     let pointer_latest = ui.input(|i| i.pointer.latest_pos());
+    let pointer_in_canvas = pointer_latest.filter(|pointer| rect.contains(*pointer));
     let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
     let primary_down = ui.input(|i| i.pointer.primary_down());
     let primary_released = ui.input(|i| i.pointer.primary_released());
     if primary_pressed {
-        let picked_node =
-            pointer_latest.and_then(|pointer| hit_test_node(pointer, &node_geometry, 4.0));
-        view_state.dragging_node_id = picked_node;
-        if picked_node.is_some() {
+        if let Some(pointer) = pointer_in_canvas {
+            let picked_node = hit_test_node(pointer, &node_geometry, 4.0);
+            view_state.dragging_node_id = picked_node;
+            if picked_node.is_some() {
+                view_state.box_select_start = None;
+                view_state.box_select_current = None;
+            } else {
+                view_state.box_select_start = Some(pointer);
+                view_state.box_select_current = Some(pointer);
+            }
+        } else {
+            // Ignore presses that start outside the network canvas (e.g. spectrum panel on the right).
+            view_state.dragging_node_id = None;
             view_state.box_select_start = None;
             view_state.box_select_current = None;
-        } else {
-            view_state.box_select_start = pointer_latest;
-            view_state.box_select_current = pointer_latest;
         }
     }
     if primary_down
