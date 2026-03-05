@@ -40,16 +40,25 @@ pub fn draw_network(
 
     let available = ui.available_size_before_wrap();
     let (response, painter) = ui.allocate_painter(available, Sense::click_and_drag());
+    let rect = response.rect;
 
     if response.hovered() {
         let scroll = ui.input(|i| i.raw_scroll_delta.y);
         if scroll.abs() > f32::EPSILON {
+            let old_zoom = view_state.zoom;
             let zoom_factor = (scroll * 0.002).exp().clamp(0.5, 2.0);
-            view_state.zoom = (view_state.zoom * zoom_factor).clamp(0.01, 20.0);
+            let new_zoom = (view_state.zoom * zoom_factor).clamp(0.01, 20.0);
+            if let Some(cursor) = response
+                .hover_pos()
+                .or_else(|| ui.input(|i| i.pointer.latest_pos()))
+            {
+                view_state.pan =
+                    pan_for_cursor_zoom(rect.center(), cursor, view_state.pan, old_zoom, new_zoom);
+            }
+            view_state.zoom = new_zoom;
         }
     }
 
-    let rect = response.rect;
     let center = rect.center() + view_state.pan;
     let scale = (rect.width().min(rect.height()) * 0.4 * view_state.zoom).max(1e-6);
 
@@ -137,8 +146,11 @@ pub fn draw_network(
     } else {
         response.hover_pos()
     };
+    let pointer_delta = ui.input(|i| i.pointer.delta());
     let pan_delta = if response.dragged_by(PointerButton::Secondary) {
-        ui.input(|i| i.pointer.delta())
+        pointer_delta
+    } else if primary_down && view_state.dragging_node_id.is_none() {
+        pointer_delta
     } else {
         Vec2::ZERO
     };
@@ -164,6 +176,21 @@ pub fn draw_network(
         dragged_node,
         &node_geometry,
     )
+}
+
+fn pan_for_cursor_zoom(
+    rect_center: Pos2,
+    cursor: Pos2,
+    pan: Vec2,
+    old_zoom: f32,
+    new_zoom: f32,
+) -> Vec2 {
+    if old_zoom <= f32::EPSILON {
+        return pan;
+    }
+    let ratio = new_zoom / old_zoom;
+    let cursor_from_center = cursor - rect_center;
+    pan * ratio + cursor_from_center * (1.0 - ratio)
 }
 
 fn hit_test_node(pointer: Pos2, nodes: &[NodeScreenGeom], pick_padding: f32) -> Option<usize> {
@@ -220,7 +247,7 @@ fn component_color(component_id: usize) -> Color32 {
 mod tests {
     use egui::{Pos2, Vec2};
 
-    use super::{NodeScreenGeom, hit_test_node, resolve_interaction};
+    use super::{NodeScreenGeom, hit_test_node, pan_for_cursor_zoom, resolve_interaction};
 
     #[test]
     fn hit_test_selects_nearest_node_inside_pick_radius() {
@@ -264,5 +291,31 @@ mod tests {
         assert_eq!(interaction.clicked_node_id, None);
         assert!(!interaction.clicked_empty_canvas);
         assert_eq!(interaction.pan_delta, Vec2::new(3.0, -2.0));
+    }
+
+    #[test]
+    fn primary_background_drag_emits_pan_delta() {
+        let nodes = vec![NodeScreenGeom {
+            id: 1,
+            pos: Pos2::new(0.0, 0.0),
+            radius: 3.0,
+        }];
+
+        let interaction = resolve_interaction(None, false, Vec2::new(-4.0, 1.0), None, &nodes);
+        assert_eq!(interaction.clicked_node_id, None);
+        assert_eq!(interaction.pan_delta, Vec2::new(-4.0, 1.0));
+    }
+
+    #[test]
+    fn cursor_zoom_keeps_cursor_anchor() {
+        let rect_center = Pos2::new(100.0, 100.0);
+        let cursor = Pos2::new(150.0, 100.0);
+        let pan = Vec2::new(0.0, 0.0);
+
+        let pan_zoom_in = pan_for_cursor_zoom(rect_center, cursor, pan, 1.0, 2.0);
+        let pan_zoom_out = pan_for_cursor_zoom(rect_center, cursor, pan, 2.0, 1.0);
+
+        assert_eq!(pan_zoom_in, Vec2::new(-50.0, 0.0));
+        assert_eq!(pan_zoom_out, Vec2::new(25.0, 0.0));
     }
 }
