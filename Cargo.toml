@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 eframe = { version = "0.31", default-features = true }
 egui = "0.31"
+egui_extras = "0.31"
 mass_spectrometry = { git = "https://github.com/earth-metabolome-initiative/mass-spectrometry-traits" }
 rfd = "0.15"
 poll-promise = { version = "0.3", features = ["web"] }

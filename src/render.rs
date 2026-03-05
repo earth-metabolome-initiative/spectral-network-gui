@@ -147,9 +147,9 @@ pub fn draw_network(
         response.hover_pos()
     };
     let pointer_delta = ui.input(|i| i.pointer.delta());
-    let pan_delta = if response.dragged_by(PointerButton::Secondary) {
-        pointer_delta
-    } else if primary_down && view_state.dragging_node_id.is_none() {
+    let pan_delta = if response.dragged_by(PointerButton::Secondary)
+        || (primary_down && view_state.dragging_node_id.is_none())
+    {
         pointer_delta
     } else {
         Vec2::ZERO

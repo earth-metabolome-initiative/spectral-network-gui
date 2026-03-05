@@ -3,7 +3,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use eframe::egui;
+use egui_extras::{Column, TableBuilder};
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::attributes::AttributeTable;
+use crate::attributes::LoadedAttributeTable;
 #[cfg(target_arch = "wasm32")]
 use crate::compute::NativeComputeHandle;
 use crate::compute::{
@@ -32,6 +36,42 @@ const DEFAULT_MGF_PATH: &str = "spectral-cosine-similarity/fixtures/mapp_batch_0
 struct UploadedFile {
     name: String,
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeAttrMatchField {
+    NodeId,
+    FeatureId,
+    RawName,
+    Label,
+}
+
+impl NodeAttrMatchField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NodeId => "node_id",
+            Self::FeatureId => "feature_id",
+            Self::RawName => "raw_name",
+            Self::Label => "label",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeAttrPanelDock {
+    Bottom,
+    Right,
+    Detached,
+}
+
+impl NodeAttrPanelDock {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bottom => "Bottom split",
+            Self::Right => "Right split",
+            Self::Detached => "Detached window",
+        }
+    }
 }
 
 pub struct SpectralApp {
@@ -69,6 +109,15 @@ pub struct SpectralApp {
 
     status_message: Option<String>,
     error_message: Option<String>,
+
+    node_attributes: Option<LoadedAttributeTable>,
+    edge_attributes: Option<LoadedAttributeTable>,
+    node_attr_match_field: NodeAttrMatchField,
+    show_node_attributes_panel: bool,
+    node_attr_search_query: String,
+    node_attr_panel_dock: NodeAttrPanelDock,
+    node_attr_bottom_height: f32,
+    node_attr_right_width: f32,
 
     #[cfg(target_arch = "wasm32")]
     upload_promise: Option<poll_promise::Promise<Result<UploadedFile, String>>>,
@@ -110,6 +159,14 @@ impl SpectralApp {
             incremental_compute: None,
             status_message: None,
             error_message: None,
+            node_attributes: None,
+            edge_attributes: None,
+            node_attr_match_field: NodeAttrMatchField::NodeId,
+            show_node_attributes_panel: true,
+            node_attr_search_query: String::new(),
+            node_attr_panel_dock: NodeAttrPanelDock::Bottom,
+            node_attr_bottom_height: 260.0,
+            node_attr_right_width: 560.0,
             #[cfg(target_arch = "wasm32")]
             upload_promise: None,
         }
@@ -154,6 +211,59 @@ impl SpectralApp {
             Ok(loaded) => self.set_loaded_spectra(loaded),
             Err(err) => {
                 self.error_message = Some(err);
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_attributes_from_tsv(&mut self, source_label: String, text: &str, is_node: bool) {
+        match AttributeTable::parse_tsv(text) {
+            Ok(table) => {
+                let loaded = LoadedAttributeTable::new(source_label.clone(), table);
+                let rows = loaded.table.rows.len();
+                let cols = loaded.table.columns.len();
+                if is_node {
+                    self.node_attributes = Some(loaded);
+                    self.node_attr_search_query.clear();
+                } else {
+                    self.edge_attributes = Some(loaded);
+                }
+                self.status_message = Some(format!(
+                    "Loaded {} attribute table: {} rows, {} columns from {}",
+                    if is_node { "node" } else { "edge" },
+                    rows,
+                    cols,
+                    source_label
+                ));
+                self.error_message = None;
+            }
+            Err(err) => {
+                self.error_message = Some(format!(
+                    "Failed to parse {} attributes: {err}",
+                    if is_node { "node" } else { "edge" }
+                ));
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pick_and_load_attributes(&mut self, is_node: bool) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("TSV", &["tsv", "txt"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                self.load_attributes_from_tsv(path.display().to_string(), &content, is_node);
+            }
+            Err(err) => {
+                self.error_message = Some(format!(
+                    "Failed to read attribute TSV {}: {err}",
+                    path.display()
+                ));
             }
         }
     }
@@ -454,6 +564,269 @@ impl SpectralApp {
         self.view_state.pan = egui::Vec2::new(-center_x * scaled, -center_y * scaled);
     }
 
+    fn node_attribute_key_for_node(&self, node: &crate::network::NetworkNode) -> Option<String> {
+        match self.node_attr_match_field {
+            NodeAttrMatchField::NodeId => Some(node.id.to_string()),
+            NodeAttrMatchField::FeatureId => node.feature_id.clone(),
+            NodeAttrMatchField::RawName => Some(node.raw_name.clone()),
+            NodeAttrMatchField::Label => Some(node.label.clone()),
+        }
+    }
+
+    fn draw_attribute_table_setup(
+        ui: &mut egui::Ui,
+        title: &str,
+        table: &mut Option<LoadedAttributeTable>,
+        show_match_field: bool,
+        node_attr_match_field: &mut NodeAttrMatchField,
+    ) {
+        ui.group(|ui| {
+            ui.label(title);
+            if let Some(loaded) = table.as_mut() {
+                ui.small(format!(
+                    "{} | rows={} cols={}",
+                    loaded.source_label,
+                    loaded.table.rows.len(),
+                    loaded.table.columns.len()
+                ));
+                let mut key_col = loaded.key_column();
+                egui::ComboBox::from_label("Key column")
+                    .selected_text(
+                        loaded
+                            .table
+                            .columns
+                            .get(key_col)
+                            .cloned()
+                            .unwrap_or_else(|| "<invalid>".to_string()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (idx, col) in loaded.table.columns.iter().enumerate() {
+                            ui.selectable_value(&mut key_col, idx, col);
+                        }
+                    });
+                if key_col != loaded.key_column() {
+                    loaded.set_key_column(key_col);
+                }
+
+                if show_match_field {
+                    egui::ComboBox::from_label("Node match field")
+                        .selected_text(node_attr_match_field.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                node_attr_match_field,
+                                NodeAttrMatchField::NodeId,
+                                NodeAttrMatchField::NodeId.label(),
+                            );
+                            ui.selectable_value(
+                                node_attr_match_field,
+                                NodeAttrMatchField::FeatureId,
+                                NodeAttrMatchField::FeatureId.label(),
+                            );
+                            ui.selectable_value(
+                                node_attr_match_field,
+                                NodeAttrMatchField::RawName,
+                                NodeAttrMatchField::RawName.label(),
+                            );
+                            ui.selectable_value(
+                                node_attr_match_field,
+                                NodeAttrMatchField::Label,
+                                NodeAttrMatchField::Label.label(),
+                            );
+                        });
+                }
+            } else {
+                ui.small("No table loaded");
+            }
+        });
+    }
+
+    fn draw_node_attributes_panel(&mut self, ui: &mut egui::Ui, panel_id_suffix: &str) {
+        ui.horizontal(|ui| {
+            let label = if self.show_node_attributes_panel {
+                "Hide node attributes"
+            } else {
+                "Show node attributes"
+            };
+            if ui.button(label).clicked() {
+                self.show_node_attributes_panel = !self.show_node_attributes_panel;
+            }
+            if let Some(table) = &self.node_attributes {
+                ui.small(format!(
+                    "Node TSV: {} rows | key={} | match={}",
+                    table.table.rows.len(),
+                    table
+                        .table
+                        .columns
+                        .get(table.key_column())
+                        .map_or("<none>", String::as_str),
+                    self.node_attr_match_field.label()
+                ));
+            } else {
+                ui.small("Load a node attributes TSV from the left panel.");
+            }
+        });
+
+        if !self.show_node_attributes_panel {
+            return;
+        }
+
+        let Some(network) = &self.network else {
+            ui.label("No network yet.");
+            return;
+        };
+        let Some(table) = &self.node_attributes else {
+            ui.label("No node attributes table loaded.");
+            return;
+        };
+
+        let visible_ids =
+            visible_node_ids_for_view(network, self.component_selection, self.hide_singletons);
+        let node_by_id: HashMap<usize, &crate::network::NetworkNode> =
+            network.nodes.iter().map(|n| (n.id, n)).collect();
+        let mut matched_rows: Vec<(usize, usize)> = Vec::new();
+        for node_id in &visible_ids {
+            let Some(node) = node_by_id.get(node_id) else {
+                continue;
+            };
+            let Some(key) = self.node_attribute_key_for_node(node) else {
+                continue;
+            };
+            if let Some(row_idx) = table.find_row_index(&key) {
+                matched_rows.push((*node_id, row_idx));
+            }
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Search");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.node_attr_search_query)
+                    .hint_text("Filter matched rows..."),
+            );
+            if ui.button("Clear").clicked() {
+                self.node_attr_search_query.clear();
+            }
+        });
+
+        let query = self.node_attr_search_query.trim().to_lowercase();
+        let matched_count = matched_rows.len();
+        let filtered_rows: Vec<(usize, usize)> = if query.is_empty() {
+            matched_rows
+        } else {
+            matched_rows
+                .iter()
+                .copied()
+                .filter(|(node_id, row_idx)| {
+                    if node_id.to_string().to_lowercase().contains(&query) {
+                        return true;
+                    }
+                    table.row(*row_idx).is_some_and(|row| {
+                        row.iter()
+                            .any(|value| value.to_lowercase().contains(&query))
+                    })
+                })
+                .collect()
+        };
+
+        ui.small(format!(
+            "Matched rows for visible nodes: {} / {} (shown: {})",
+            matched_count,
+            visible_ids.len(),
+            filtered_rows.len()
+        ));
+
+        let selected_row_idx = self
+            .selected_node_id
+            .and_then(|node_id| node_by_id.get(&node_id).copied())
+            .and_then(|node| self.node_attribute_key_for_node(node))
+            .and_then(|key| table.find_row_index(&key));
+
+        if let Some(row) = selected_row_idx.and_then(|row_idx| table.row(row_idx)) {
+            ui.collapsing("Selected node attributes", |ui| {
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    egui::Grid::new("selected_node_attr_grid")
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (col, value) in table.table.columns.iter().zip(row.iter()) {
+                                ui.label(col);
+                                ui.label(value);
+                                ui.end_row();
+                            }
+                        });
+                });
+            });
+        }
+
+        ui.separator();
+        if filtered_rows.is_empty() {
+            ui.label("No visible node matched the current key/match-field selection.");
+        }
+
+        let table_height = ui.available_height().max(1.0);
+        let text_height = ui.text_style_height(&egui::TextStyle::Body).max(18.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), table_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt(format!("node_attr_horizontal_scroll_{panel_id_suffix}"))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let mut table_builder = TableBuilder::new(ui)
+                            .striped(true)
+                            .resizable(true)
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .column(Column::auto().at_least(72.0))
+                            .min_scrolled_height(0.0)
+                            .max_scroll_height(table_height)
+                            .vscroll(true);
+
+                        for _ in &table.table.columns {
+                            table_builder = table_builder.column(Column::auto().at_least(120.0));
+                        }
+
+                        table_builder
+                            .header(text_height + 4.0, |mut header| {
+                                header.col(|ui| {
+                                    ui.strong("node_id");
+                                });
+                                for col in &table.table.columns {
+                                    header.col(|ui| {
+                                        ui.strong(col);
+                                    });
+                                }
+                            })
+                            .body(|body| {
+                                body.rows(text_height + 2.0, filtered_rows.len(), |mut row| {
+                                    let idx = row.index();
+                                    let (node_id, row_idx) = filtered_rows[idx];
+                                    let maybe_row = table.row(row_idx);
+
+                                    row.col(|ui| {
+                                        if Some(node_id) == self.selected_node_id {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 180, 80),
+                                                node_id.to_string(),
+                                            );
+                                        } else {
+                                            ui.label(node_id.to_string());
+                                        }
+                                    });
+
+                                    for col_idx in 0..table.table.columns.len() {
+                                        row.col(|ui| {
+                                            let value = maybe_row
+                                                .and_then(|r| r.get(col_idx))
+                                                .map_or("", String::as_str);
+                                            ui.label(value);
+                                        });
+                                    }
+                                });
+                            });
+                    });
+            },
+        );
+    }
+
     fn draw_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("Spectral Network");
         ui.separator();
@@ -505,6 +878,89 @@ impl SpectralApp {
                     stats.dropped_too_many_peaks,
                     stats.dropped_duplicate_mz,
                 ));
+            }
+        });
+
+        ui.separator();
+        ui.collapsing("Attributes TSV", |ui| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                ui.horizontal(|ui| {
+                    if ui.button("Load node attributes TSV").clicked() {
+                        self.pick_and_load_attributes(true);
+                    }
+                    if ui.button("Load edge attributes TSV").clicked() {
+                        self.pick_and_load_attributes(false);
+                    }
+                });
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                ui.small("TSV attribute loading is currently native-only.");
+            }
+
+            Self::draw_attribute_table_setup(
+                ui,
+                "Node attributes",
+                &mut self.node_attributes,
+                true,
+                &mut self.node_attr_match_field,
+            );
+            Self::draw_attribute_table_setup(
+                ui,
+                "Edge attributes",
+                &mut self.edge_attributes,
+                false,
+                &mut self.node_attr_match_field,
+            );
+
+            ui.separator();
+            ui.checkbox(
+                &mut self.show_node_attributes_panel,
+                "Show node attributes table panel",
+            );
+            egui::ComboBox::from_label("Table docking")
+                .selected_text(self.node_attr_panel_dock.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.node_attr_panel_dock,
+                        NodeAttrPanelDock::Bottom,
+                        NodeAttrPanelDock::Bottom.label(),
+                    );
+                    ui.selectable_value(
+                        &mut self.node_attr_panel_dock,
+                        NodeAttrPanelDock::Right,
+                        NodeAttrPanelDock::Right.label(),
+                    );
+                    ui.selectable_value(
+                        &mut self.node_attr_panel_dock,
+                        NodeAttrPanelDock::Detached,
+                        NodeAttrPanelDock::Detached.label(),
+                    );
+                });
+            match self.node_attr_panel_dock {
+                NodeAttrPanelDock::Bottom => {
+                    ui.horizontal(|ui| {
+                        ui.label("Bottom panel height");
+                        ui.add(
+                            egui::DragValue::new(&mut self.node_attr_bottom_height)
+                                .range(140.0..=1200.0)
+                                .speed(1.0),
+                        );
+                    });
+                }
+                NodeAttrPanelDock::Right => {
+                    ui.horizontal(|ui| {
+                        ui.label("Right panel width");
+                        ui.add(
+                            egui::DragValue::new(&mut self.node_attr_right_width)
+                                .range(220.0..=1800.0)
+                                .speed(1.0),
+                        );
+                    });
+                }
+                NodeAttrPanelDock::Detached => {}
             }
         });
 
@@ -957,6 +1413,49 @@ impl eframe::App for SpectralApp {
             .show(ctx, |ui| {
                 self.draw_selected_node_panel(ui);
             });
+
+        if self.node_attr_panel_dock == NodeAttrPanelDock::Right {
+            egui::SidePanel::right("node_attributes_side_panel")
+                .resizable(false)
+                .exact_width(if self.show_node_attributes_panel {
+                    self.node_attr_right_width
+                } else {
+                    58.0
+                })
+                .show(ctx, |ui| {
+                    self.draw_node_attributes_panel(ui, "right");
+                });
+        }
+
+        if self.node_attr_panel_dock == NodeAttrPanelDock::Bottom {
+            egui::TopBottomPanel::bottom("node_attributes_bottom_panel")
+                .resizable(false)
+                .exact_height(if self.show_node_attributes_panel {
+                    self.node_attr_bottom_height
+                } else {
+                    34.0
+                })
+                .show(ctx, |ui| {
+                    self.draw_node_attributes_panel(ui, "bottom");
+                });
+        }
+
+        if self.node_attr_panel_dock == NodeAttrPanelDock::Detached
+            && self.show_node_attributes_panel
+        {
+            let mut open = true;
+            egui::Window::new("Node Attributes Table")
+                .id(egui::Id::new("node_attributes_detached_window"))
+                .resizable(true)
+                .default_size(egui::vec2(980.0, 340.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    self.draw_node_attributes_panel(ui, "detached");
+                });
+            if !open {
+                self.show_node_attributes_panel = false;
+            }
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.draw_canvas(ui);
