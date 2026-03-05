@@ -13,6 +13,7 @@ use crate::attributes::LoadedAttributeTable;
 use crate::compute::NativeComputeHandle;
 use crate::compute::{
     ComputeMessage, ComputeParams, IncrementalComputeState, IncrementalStep, PairScore,
+    SimilarityMetric,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::compute::{NativeComputeHandle, start_native_compute};
@@ -91,6 +92,7 @@ pub struct SpectralApp {
     tolerance_input: String,
     mz_power_input: String,
     intensity_power_input: String,
+    selected_metric: SimilarityMetric,
 
     threshold: f64,
     top_k: usize,
@@ -145,6 +147,7 @@ impl SpectralApp {
             tolerance_input: "0.02".to_string(),
             mz_power_input: "0".to_string(),
             intensity_power_input: "1".to_string(),
+            selected_metric: SimilarityMetric::default(),
             threshold: 0.7,
             top_k: 10,
             hide_singletons: true,
@@ -360,6 +363,7 @@ impl SpectralApp {
             .map_err(|_| "Invalid intensity_power".to_string())?;
 
         Ok(ComputeParams {
+            metric: self.selected_metric,
             tolerance,
             mz_power,
             intensity_power,
@@ -382,7 +386,10 @@ impl SpectralApp {
 
         self.clear_compute_outputs();
         self.error_message = None;
-        self.status_message = Some("Computing CosineGreedy scores...".to_string());
+        self.status_message = Some(format!(
+            "Computing {} scores...",
+            self.selected_metric.label()
+        ));
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -391,8 +398,15 @@ impl SpectralApp {
 
         #[cfg(target_arch = "wasm32")]
         {
-            self.incremental_compute =
-                Some(IncrementalComputeState::new(self.spectra.clone(), params));
+            match IncrementalComputeState::new(self.spectra.clone(), params) {
+                Ok(state) => {
+                    self.incremental_compute = Some(state);
+                }
+                Err(err) => {
+                    self.error_message = Some(err);
+                    self.status_message = None;
+                }
+            }
         }
     }
 
@@ -1171,7 +1185,13 @@ impl SpectralApp {
         });
 
         ui.separator();
-        ui.label("Metric: CosineGreedy");
+        egui::ComboBox::from_label("Metric")
+            .selected_text(self.selected_metric.label())
+            .show_ui(ui, |ui| {
+                for metric in SimilarityMetric::ALL {
+                    ui.selectable_value(&mut self.selected_metric, metric, metric.label());
+                }
+            });
 
         ui.collapsing("Similarity Params (required)", |ui| {
             ui.horizontal(|ui| {
@@ -1192,7 +1212,10 @@ impl SpectralApp {
         ui.collapsing("Compute", |ui| {
             let can_start = !self.is_computing() && !self.spectra.is_empty();
             if ui
-                .add_enabled(can_start, egui::Button::new("Run CosineGreedy"))
+                .add_enabled(
+                    can_start,
+                    egui::Button::new(format!("Run {}", self.selected_metric.label())),
+                )
                 .clicked()
             {
                 self.start_compute();
@@ -1409,7 +1432,10 @@ impl SpectralApp {
     fn draw_canvas(&mut self, ui: &mut egui::Ui) {
         if self.network.is_none() {
             ui.centered_and_justified(|ui| {
-                ui.label("Load spectra and run CosineGreedy to render a spectral network.");
+                ui.label(format!(
+                    "Load spectra and run {} to render a spectral network.",
+                    self.selected_metric.label()
+                ));
             });
             return;
         }

@@ -4,15 +4,139 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 
-use mass_spectrometry::prelude::{GreedyCosine, ScalarSimilarity};
+use mass_spectrometry::prelude::{
+    EntropySimilarity, GenericSpectrum, GreedyCosine, HungarianCosine, ModifiedGreedyCosine,
+    ModifiedHungarianCosine, ScalarSimilarity,
+};
 
 use crate::io::SpectrumRecord;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimilarityMetric {
+    CosineHungarian,
+    CosineGreedy,
+    ModifiedCosine,
+    ModifiedGreedyCosine,
+    EntropySimilarityWeighted,
+    EntropySimilarityUnweighted,
+}
+
+impl SimilarityMetric {
+    pub const ALL: [Self; 6] = [
+        Self::CosineHungarian,
+        Self::CosineGreedy,
+        Self::ModifiedCosine,
+        Self::ModifiedGreedyCosine,
+        Self::EntropySimilarityWeighted,
+        Self::EntropySimilarityUnweighted,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CosineHungarian => "CosineHungarian",
+            Self::CosineGreedy => "CosineGreedy",
+            Self::ModifiedCosine => "ModifiedCosine",
+            Self::ModifiedGreedyCosine => "ModifiedGreedyCosine",
+            Self::EntropySimilarityWeighted => "EntropySimilarityWeighted",
+            Self::EntropySimilarityUnweighted => "EntropySimilarityUnweighted",
+        }
+    }
+}
+
+impl Default for SimilarityMetric {
+    fn default() -> Self {
+        Self::CosineGreedy
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ComputeParams {
+    pub metric: SimilarityMetric,
     pub tolerance: f64,
     pub mz_power: f64,
     pub intensity_power: f64,
+}
+
+enum MetricScorer {
+    CosineHungarian(HungarianCosine<f64, f64>),
+    CosineGreedy(GreedyCosine<f64, f64>),
+    ModifiedCosine(ModifiedHungarianCosine<f64, f64>),
+    ModifiedGreedyCosine(ModifiedGreedyCosine<f64, f64>),
+    EntropySimilarityWeighted(EntropySimilarity<f64>),
+    EntropySimilarityUnweighted(EntropySimilarity<f64>),
+}
+
+impl MetricScorer {
+    fn new(params: ComputeParams) -> Result<Self, String> {
+        match params.metric {
+            SimilarityMetric::CosineHungarian => {
+                HungarianCosine::new(params.mz_power, params.intensity_power, params.tolerance)
+                    .map(Self::CosineHungarian)
+                    .map_err(|err| {
+                        format!("failed to configure {}: {err:?}", params.metric.label())
+                    })
+            }
+            SimilarityMetric::CosineGreedy => {
+                GreedyCosine::new(params.mz_power, params.intensity_power, params.tolerance)
+                    .map(Self::CosineGreedy)
+                    .map_err(|err| {
+                        format!("failed to configure {}: {err:?}", params.metric.label())
+                    })
+            }
+            SimilarityMetric::ModifiedCosine => ModifiedHungarianCosine::new(
+                params.mz_power,
+                params.intensity_power,
+                params.tolerance,
+            )
+            .map(Self::ModifiedCosine)
+            .map_err(|err| format!("failed to configure {}: {err:?}", params.metric.label())),
+            SimilarityMetric::ModifiedGreedyCosine => {
+                ModifiedGreedyCosine::new(params.mz_power, params.intensity_power, params.tolerance)
+                    .map(Self::ModifiedGreedyCosine)
+                    .map_err(|err| {
+                        format!("failed to configure {}: {err:?}", params.metric.label())
+                    })
+            }
+            SimilarityMetric::EntropySimilarityWeighted => {
+                EntropySimilarity::weighted(params.tolerance)
+                    .map(Self::EntropySimilarityWeighted)
+                    .map_err(|err| {
+                        format!("failed to configure {}: {err:?}", params.metric.label())
+                    })
+            }
+            SimilarityMetric::EntropySimilarityUnweighted => {
+                EntropySimilarity::unweighted(params.tolerance)
+                    .map(Self::EntropySimilarityUnweighted)
+                    .map_err(|err| {
+                        format!("failed to configure {}: {err:?}", params.metric.label())
+                    })
+            }
+        }
+    }
+
+    fn similarity(
+        &self,
+        left: &GenericSpectrum<f64, f64>,
+        right: &GenericSpectrum<f64, f64>,
+        metric: SimilarityMetric,
+        left_idx: usize,
+        right_idx: usize,
+    ) -> Result<(f64, usize), String> {
+        let result = match self {
+            Self::CosineHungarian(sim) => sim.similarity(left, right),
+            Self::CosineGreedy(sim) => sim.similarity(left, right),
+            Self::ModifiedCosine(sim) => sim.similarity(left, right),
+            Self::ModifiedGreedyCosine(sim) => sim.similarity(left, right),
+            Self::EntropySimilarityWeighted(sim) => sim.similarity(left, right),
+            Self::EntropySimilarityUnweighted(sim) => sim.similarity(left, right),
+        };
+        result.map_err(|err| {
+            format!(
+                "{} failed for pair ({left_idx},{right_idx}): {err:?}",
+                metric.label()
+            )
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -84,16 +208,10 @@ pub fn start_native_compute(
             let cancel_worker = Arc::clone(&cancel_for_thread);
             use rayon::prelude::*;
 
-            let similarity = match GreedyCosine::new(
-                params.mz_power,
-                params.intensity_power,
-                params.tolerance,
-            ) {
+            let scorer = match MetricScorer::new(params) {
                 Ok(sim) => sim,
                 Err(err) => {
-                    let _ = tx.send(ComputeMessage::Failed(format!(
-                        "failed to configure CosineGreedy: {err:?}"
-                    )));
+                    let _ = tx.send(ComputeMessage::Failed(err));
                     return;
                 }
             };
@@ -119,7 +237,7 @@ pub fn start_native_compute(
 
                     let left = spectra[i].spectrum.as_ref();
                     let right = spectra[j].spectrum.as_ref();
-                    match similarity.similarity(left, right) {
+                    match scorer.similarity(left, right, params.metric, i, j) {
                         Ok((score, matches)) => {
                             done_for_iter.fetch_add(1, Ordering::Relaxed);
                             Some(PairScore {
@@ -133,8 +251,7 @@ pub fn start_native_compute(
                             if let Ok(mut slot) = error_worker.lock()
                                 && slot.is_none()
                             {
-                                *slot =
-                                    Some(format!("similarity failed for pair ({i},{j}): {err:?}"));
+                                *slot = Some(err);
                             }
                             cancel_for_iter.store(true, Ordering::Relaxed);
                             None
@@ -183,6 +300,7 @@ pub enum IncrementalStep {
 
 pub struct IncrementalComputeState {
     params: ComputeParams,
+    scorer: MetricScorer,
     spectra: Vec<SpectrumRecord>,
     i: usize,
     j: usize,
@@ -193,10 +311,12 @@ pub struct IncrementalComputeState {
 }
 
 impl IncrementalComputeState {
-    pub fn new(spectra: Vec<SpectrumRecord>, params: ComputeParams) -> Self {
+    pub fn new(spectra: Vec<SpectrumRecord>, params: ComputeParams) -> Result<Self, String> {
         let total = total_pairs(spectra.len());
-        Self {
+        let scorer = MetricScorer::new(params)?;
+        Ok(Self {
             params,
+            scorer,
             spectra,
             i: 0,
             j: 0,
@@ -204,7 +324,7 @@ impl IncrementalComputeState {
             done: 0,
             cancel: false,
             pairs: Vec::with_capacity(total),
-        }
+        })
     }
 
     pub fn total(&self) -> usize {
@@ -224,13 +344,6 @@ impl IncrementalComputeState {
             return Ok(IncrementalStep::Cancelled);
         }
 
-        let similarity = GreedyCosine::new(
-            self.params.mz_power,
-            self.params.intensity_power,
-            self.params.tolerance,
-        )
-        .map_err(|err| format!("failed to configure CosineGreedy: {err:?}"))?;
-
         let n = self.spectra.len();
         if n == 0 || self.i >= n {
             let result = ComputeResult {
@@ -246,9 +359,9 @@ impl IncrementalComputeState {
             }
             let left = self.spectra[self.i].spectrum.as_ref();
             let right = self.spectra[self.j].spectrum.as_ref();
-            let (score, matches) = similarity
-                .similarity(left, right)
-                .map_err(|err| format!("similarity failed for ({},{}): {err:?}", self.i, self.j))?;
+            let (score, matches) =
+                self.scorer
+                    .similarity(left, right, self.params.metric, self.i, self.j)?;
             self.pairs.push(PairScore {
                 left: self.i,
                 right: self.j,
@@ -282,7 +395,9 @@ mod tests {
 
     use mass_spectrometry::prelude::{GenericSpectrum, SpectrumAlloc, SpectrumMut};
 
-    use super::{ComputeParams, IncrementalComputeState, IncrementalStep, total_pairs};
+    use super::{
+        ComputeParams, IncrementalComputeState, IncrementalStep, SimilarityMetric, total_pairs,
+    };
     use crate::io::{SpectrumMeta, SpectrumRecord};
 
     fn spectrum(id: usize, precursor: f64, peaks: &[(f64, f64)]) -> SpectrumRecord {
@@ -320,11 +435,13 @@ mod tests {
         let mut state = IncrementalComputeState::new(
             spectra,
             ComputeParams {
+                metric: SimilarityMetric::CosineGreedy,
                 tolerance: 0.2,
                 mz_power: 0.0,
                 intensity_power: 1.0,
             },
-        );
+        )
+        .expect("failed to create compute state");
 
         loop {
             match state.step(2).expect("incremental step failed") {
@@ -350,11 +467,13 @@ mod tests {
         let mut state = IncrementalComputeState::new(
             spectra,
             ComputeParams {
+                metric: SimilarityMetric::CosineGreedy,
                 tolerance: 0.2,
                 mz_power: 0.0,
                 intensity_power: 1.0,
             },
-        );
+        )
+        .expect("failed to create compute state");
 
         let _ = state.step(1).expect("first step failed");
         state.cancel();
