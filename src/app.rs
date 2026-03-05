@@ -1,7 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -82,6 +84,25 @@ enum NodeAttrSortColumn {
     TableColumn(usize),
 }
 
+struct NodeColoring {
+    fills: HashMap<usize, egui::Color32>,
+    mode: NodeColorMode,
+}
+
+enum NodeColorMode {
+    Categorical {
+        legend: Vec<(String, egui::Color32)>,
+    },
+    Continuous,
+}
+
+struct DepictFetchResult {
+    request_key: String,
+    content_type: Option<String>,
+    bytes: Vec<u8>,
+    error: Option<String>,
+}
+
 pub struct SpectralApp {
     #[cfg(not(target_arch = "wasm32"))]
     mgf_path: String,
@@ -122,8 +143,10 @@ pub struct SpectralApp {
     node_attributes: Option<LoadedAttributeTable>,
     edge_attributes: Option<LoadedAttributeTable>,
     node_attr_match_field: NodeAttrMatchField,
+    depict_smiles_column: Option<usize>,
     color_nodes_by_attribute: bool,
     node_color_attr_column: usize,
+    show_categorical_legend: bool,
     show_node_attributes_panel: bool,
     node_attr_search_query: String,
     node_attr_panel_dock: NodeAttrPanelDock,
@@ -133,13 +156,20 @@ pub struct SpectralApp {
     node_attr_right_width: f32,
     pending_center_node_id: Option<usize>,
     table_node_filter: Option<HashSet<usize>>,
+    depict_request_key: Option<String>,
+    depict_loading: bool,
+    depict_image_uri: Option<String>,
+    depict_image_bytes: Option<egui::load::Bytes>,
+    depict_error_message: Option<String>,
+    depict_rx: Option<Receiver<DepictFetchResult>>,
 
     #[cfg(target_arch = "wasm32")]
     upload_promise: Option<poll_promise::Promise<Result<UploadedFile, String>>>,
 }
 
 impl SpectralApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             mgf_path: DEFAULT_MGF_PATH.to_string(),
@@ -180,8 +210,10 @@ impl SpectralApp {
             node_attributes: None,
             edge_attributes: None,
             node_attr_match_field: NodeAttrMatchField::NodeId,
+            depict_smiles_column: None,
             color_nodes_by_attribute: false,
             node_color_attr_column: 0,
+            show_categorical_legend: true,
             show_node_attributes_panel: true,
             node_attr_search_query: String::new(),
             node_attr_panel_dock: NodeAttrPanelDock::Bottom,
@@ -191,6 +223,12 @@ impl SpectralApp {
             node_attr_right_width: 560.0,
             pending_center_node_id: None,
             table_node_filter: None,
+            depict_request_key: None,
+            depict_loading: false,
+            depict_image_uri: None,
+            depict_image_bytes: None,
+            depict_error_message: None,
+            depict_rx: None,
             #[cfg(target_arch = "wasm32")]
             upload_promise: None,
         }
@@ -228,7 +266,8 @@ impl SpectralApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn reset_node_attribute_table_state(&mut self, table_columns: usize) {
+    fn reset_node_attribute_table_state(&mut self, columns: &[String]) {
+        let table_columns = columns.len();
         self.node_attr_search_query.clear();
         self.node_attr_sort_column = if table_columns > 0 {
             NodeAttrSortColumn::TableColumn(0)
@@ -236,6 +275,14 @@ impl SpectralApp {
             NodeAttrSortColumn::NodeId
         };
         self.node_attr_sort_ascending = true;
+        self.depict_smiles_column = columns.iter().enumerate().find_map(|(idx, col)| {
+            let normalized = normalized_column_name(col);
+            if normalized == "smiles" || normalized.ends_with("smiles") {
+                Some(idx)
+            } else {
+                None
+            }
+        });
         if table_columns == 0 {
             self.node_color_attr_column = 0;
             self.color_nodes_by_attribute = false;
@@ -268,8 +315,9 @@ impl SpectralApp {
                 let rows = loaded.table.rows.len();
                 let cols = loaded.table.columns.len();
                 if is_node {
+                    let column_names = loaded.table.columns.clone();
                     self.node_attributes = Some(loaded);
-                    self.reset_node_attribute_table_state(cols);
+                    self.reset_node_attribute_table_state(&column_names);
                 } else {
                     self.edge_attributes = Some(loaded);
                 }
@@ -702,11 +750,137 @@ impl SpectralApp {
         }
     }
 
-    fn node_attribute_color_map(
+    fn selected_node_smiles(&self, node: &crate::network::NetworkNode) -> Option<String> {
+        let table = self.node_attributes.as_ref()?;
+        let smiles_col_idx = self.depict_smiles_column?;
+        let key = self.node_attribute_key_for_node(node)?;
+        let row = table.find_row(&key)?;
+        let smiles = row.get(smiles_col_idx)?.trim();
+        if smiles.is_empty() {
+            None
+        } else {
+            Some(smiles.to_string())
+        }
+    }
+
+    fn clear_depiction_state(&mut self) {
+        self.depict_request_key = None;
+        self.depict_loading = false;
+        self.depict_image_uri = None;
+        self.depict_image_bytes = None;
+        self.depict_error_message = None;
+        self.depict_rx = None;
+    }
+
+    fn ensure_depiction_request(&mut self, request_key: String, uri: String) {
+        if self.depict_request_key.as_deref() == Some(request_key.as_str())
+            && (self.depict_loading || self.depict_image_bytes.is_some())
+        {
+            return;
+        }
+
+        self.depict_request_key = Some(request_key.clone());
+        self.depict_loading = true;
+        self.depict_image_uri = None;
+        self.depict_image_bytes = None;
+        self.depict_error_message = None;
+
+        let mut request = ehttp::Request::get(uri);
+        request.headers = ehttp::Headers::new(&[
+            ("Accept", "image/svg+xml, image/*;q=0.9, */*;q=0.8"),
+            ("Cache-Control", "no-cache"),
+        ]);
+
+        let (tx, rx) = mpsc::channel();
+        self.depict_rx = Some(rx);
+        ehttp::fetch(request, move |result| {
+            let fetch_result = match result {
+                Ok(response) => {
+                    if !(200..300).contains(&response.status) {
+                        DepictFetchResult {
+                            request_key,
+                            content_type: response.content_type().map(ToOwned::to_owned),
+                            bytes: response.bytes,
+                            error: Some(format!(
+                                "depict API returned HTTP {} {}",
+                                response.status, response.status_text
+                            )),
+                        }
+                    } else {
+                        DepictFetchResult {
+                            request_key,
+                            content_type: response.content_type().map(ToOwned::to_owned),
+                            bytes: response.bytes,
+                            error: None,
+                        }
+                    }
+                }
+                Err(err) => DepictFetchResult {
+                    request_key,
+                    content_type: None,
+                    bytes: Vec::new(),
+                    error: Some(format!("depict API request failed: {err}")),
+                },
+            };
+            let _ = tx.send(fetch_result);
+        });
+    }
+
+    fn poll_depiction(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.depict_rx else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok(result) => {
+                self.depict_loading = false;
+                self.depict_rx = None;
+                if self.depict_request_key.as_deref() != Some(result.request_key.as_str()) {
+                    return;
+                }
+
+                if let Some(err) = result.error {
+                    self.depict_error_message = Some(err);
+                    return;
+                }
+
+                let image_ext =
+                    detect_depict_image_extension(result.content_type.as_deref(), &result.bytes);
+                let Some(ext) = image_ext else {
+                    let preview = String::from_utf8(result.bytes)
+                        .ok()
+                        .map(|text| text.chars().take(200).collect::<String>())
+                        .unwrap_or_else(|| "<binary response>".to_string());
+                    self.depict_error_message = Some(format!(
+                        "Unsupported depiction response (content-type={:?}). Preview: {}",
+                        result.content_type, preview
+                    ));
+                    return;
+                };
+
+                let request_id = stable_hash(&result.request_key);
+                self.depict_image_uri = Some(format!("bytes://np_depict_{request_id}.{ext}"));
+                self.depict_image_bytes = Some(egui::load::Bytes::from(result.bytes));
+                self.depict_error_message = None;
+            }
+            Err(TryRecvError::Empty) => {
+                if self.depict_loading {
+                    ctx.request_repaint();
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.depict_loading = false;
+                self.depict_rx = None;
+                self.depict_error_message = Some("depict request channel disconnected".to_string());
+            }
+        }
+    }
+
+    fn node_attribute_coloring(
         &self,
         network: &SpectralNetwork,
         visible: &HashSet<usize>,
-    ) -> Option<HashMap<usize, egui::Color32>> {
+    ) -> Option<NodeColoring> {
         if !self.color_nodes_by_attribute {
             return None;
         }
@@ -749,7 +923,10 @@ impl SpectralApp {
         }
 
         if values.is_empty() {
-            return Some(colors);
+            return Some(NodeColoring {
+                fills: colors,
+                mode: NodeColorMode::Categorical { legend: Vec::new() },
+            });
         }
 
         let mut numeric_values: Vec<(usize, f64)> = Vec::with_capacity(values.len());
@@ -782,12 +959,20 @@ impl SpectralApp {
                     colors.insert(node_id, diverging_color(t));
                 }
             }
-            return Some(colors);
+            return Some(NodeColoring {
+                fills: colors,
+                mode: NodeColorMode::Continuous,
+            });
         }
 
         let mut categories: Vec<String> = values.iter().map(|(_, value)| value.clone()).collect();
         categories.sort();
         categories.dedup();
+        let legend = categories
+            .iter()
+            .enumerate()
+            .map(|(idx, category)| (category.clone(), categorical_color(idx)))
+            .collect::<Vec<_>>();
         let category_to_index: HashMap<String, usize> = categories
             .into_iter()
             .enumerate()
@@ -800,7 +985,10 @@ impl SpectralApp {
             }
         }
 
-        Some(colors)
+        Some(NodeColoring {
+            fills: colors,
+            mode: NodeColorMode::Categorical { legend },
+        })
     }
 
     fn draw_attribute_table_setup(
@@ -1246,6 +1434,30 @@ impl SpectralApp {
                 &mut self.node_attr_match_field,
             );
 
+            ui.group(|ui| {
+                ui.label("Structure depiction");
+                if let Some(table) = &self.node_attributes {
+                    let selected_text = self
+                        .depict_smiles_column
+                        .and_then(|idx| table.table.columns.get(idx))
+                        .cloned()
+                        .unwrap_or_else(|| "<none>".to_string());
+                    egui::ComboBox::from_label("SMILES column")
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.depict_smiles_column, None, "<none>");
+                            for (idx, col) in table.table.columns.iter().enumerate() {
+                                ui.selectable_value(&mut self.depict_smiles_column, Some(idx), col);
+                            }
+                        });
+                    ui.small(
+                        "Selected SMILES values are rendered in the right panel via api.naturalproducts.net.",
+                    );
+                } else {
+                    ui.small("Load a node attributes TSV to choose a SMILES column.");
+                }
+            });
+
             ui.separator();
             ui.checkbox(
                 &mut self.show_node_attributes_panel,
@@ -1295,6 +1507,12 @@ impl SpectralApp {
             }
         });
 
+        let style_preview = self.network.as_ref().and_then(|network| {
+            let visible =
+                visible_node_set_for_view(network, self.component_selection, self.hide_singletons);
+            self.node_attribute_coloring(network, &visible)
+        });
+
         ui.separator();
         ui.collapsing("Style", |ui| {
             ui.checkbox(
@@ -1325,6 +1543,38 @@ impl SpectralApp {
                         ui.small(
                             "Categorical values use a qualitative palette; numeric values use a divergent gradient.",
                         );
+
+                        if let Some(preview) = style_preview.as_ref() {
+                            match &preview.mode {
+                                NodeColorMode::Categorical { legend } => {
+                                    ui.checkbox(
+                                        &mut self.show_categorical_legend,
+                                        "Show categorical legend",
+                                    );
+                                    if self.show_categorical_legend {
+                                        if legend.is_empty() {
+                                            ui.small("No category values found in visible nodes.");
+                                        } else {
+                                            ui.separator();
+                                            ui.small("Legend");
+                                            egui::ScrollArea::vertical()
+                                                .max_height(180.0)
+                                                .show(ui, |ui| {
+                                                    for (category, color) in legend {
+                                                        ui.horizontal(|ui| {
+                                                            ui.colored_label(*color, "■");
+                                                            ui.label(category);
+                                                        });
+                                                    }
+                                                });
+                                        }
+                                    }
+                                }
+                                NodeColorMode::Continuous => {
+                                    ui.small("Selected column is numeric; continuous palette applied.");
+                                }
+                            }
+                        }
                     }
                 } else {
                     ui.small("Load a node attributes TSV to enable attribute-based colors.");
@@ -1639,13 +1889,13 @@ impl SpectralApp {
         }
 
         let network = self.network.as_ref().expect("network presence checked");
-        let node_colors = self.node_attribute_color_map(network, &visible_set);
+        let node_coloring = self.node_attribute_coloring(network, &visible_set);
         let interaction = draw_network(
             ui,
             network,
             &self.positions,
             &visible_set,
-            node_colors.as_ref(),
+            node_coloring.as_ref().map(|coloring| &coloring.fills),
             &mut self.view_state,
             self.selected_node_id,
         );
@@ -1766,11 +2016,13 @@ impl SpectralApp {
         ui.separator();
 
         let Some(network) = &self.network else {
+            self.clear_depiction_state();
             ui.label("No network loaded.");
             return;
         };
 
         let Some(node_id) = self.selected_node_id else {
+            self.clear_depiction_state();
             ui.label("Select a node in the graph.");
             return;
         };
@@ -1778,11 +2030,13 @@ impl SpectralApp {
         let visible_set =
             visible_node_set_for_view(network, self.component_selection, self.hide_singletons);
         if !visible_set.contains(&node_id) {
+            self.clear_depiction_state();
             ui.label("Selected node is not visible in current scope.");
             return;
         }
 
         let Some(node) = network.nodes.iter().find(|n| n.id == node_id) else {
+            self.clear_depiction_state();
             ui.label("Selected node is not visible in current scope.");
             return;
         };
@@ -1820,6 +2074,57 @@ impl SpectralApp {
             "Featurelist feature ID: {}",
             node.featurelist_feature_id.as_deref().unwrap_or("n/a")
         ));
+
+        ui.separator();
+        ui.label("Structure");
+        if self.node_attributes.is_none() {
+            self.clear_depiction_state();
+            ui.small("No node attributes table loaded.");
+            return;
+        }
+        let Some(smiles_col_idx) = self.depict_smiles_column else {
+            self.clear_depiction_state();
+            ui.small("Select a SMILES column in the left panel.");
+            return;
+        };
+        let Some(col_name) = self
+            .node_attributes
+            .as_ref()
+            .and_then(|table| table.table.columns.get(smiles_col_idx))
+            .cloned()
+        else {
+            self.clear_depiction_state();
+            ui.small("Selected SMILES column is out of range.");
+            return;
+        };
+        let Some(smiles) = self.selected_node_smiles(node) else {
+            self.clear_depiction_state();
+            ui.small(format!(
+                "No SMILES found for this node using column '{col_name}'."
+            ));
+            return;
+        };
+
+        ui.small(format!("SMILES column: {col_name}"));
+        ui.small(format!("SMILES: {smiles}"));
+        let img_width = ui.available_width().clamp(180.0, 480.0);
+        let img_height = (img_width * 0.7).clamp(120.0, 360.0);
+        let depict_uri = naturalproducts_depict_uri(&smiles, img_width as u32, img_height as u32);
+        self.ensure_depiction_request(depict_uri.clone(), depict_uri.clone());
+        if self.depict_loading {
+            ui.add(egui::Spinner::new());
+            ui.small("Loading depiction...");
+        } else if let (Some(uri), Some(bytes)) = (&self.depict_image_uri, &self.depict_image_bytes)
+        {
+            ui.add(
+                egui::Image::from_bytes(uri.clone(), bytes.clone())
+                    .max_width(img_width)
+                    .maintain_aspect_ratio(true),
+            );
+        } else if let Some(err) = &self.depict_error_message {
+            ui.colored_label(egui::Color32::from_rgb(190, 50, 50), err);
+        }
+        ui.hyperlink_to("Open structure in browser", depict_uri);
     }
 }
 
@@ -1862,6 +2167,51 @@ fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
         lerp(a.b(), b.b()),
         lerp(a.a(), b.a()),
     )
+}
+
+fn naturalproducts_depict_uri(smiles: &str, width: u32, height: u32) -> String {
+    let encoded_smiles = urlencoding::encode(smiles);
+    format!(
+        "https://api.naturalproducts.net/latest/depict/2D_enhanced?smiles={encoded_smiles}&width={width}&height={height}&style=bow"
+    )
+}
+
+fn detect_depict_image_extension(content_type: Option<&str>, bytes: &[u8]) -> Option<&'static str> {
+    let ctype = content_type.unwrap_or_default().to_ascii_lowercase();
+    if ctype.contains("svg") {
+        return Some("svg");
+    }
+    if ctype.contains("png") {
+        return Some("png");
+    }
+    if ctype.contains("jpeg") || ctype.contains("jpg") {
+        return Some("jpg");
+    }
+    if ctype.contains("webp") {
+        return Some("webp");
+    }
+
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("png");
+    }
+    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        return Some("jpg");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    let probe = &bytes[..bytes.len().min(512)];
+    let probe_text = String::from_utf8_lossy(probe).to_ascii_lowercase();
+    if probe_text.contains("<svg") {
+        return Some("svg");
+    }
+    None
+}
+
+fn stable_hash(input: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    input.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn compare_node_attr_values(left: &str, right: &str) -> Ordering {
@@ -1921,6 +2271,7 @@ impl eframe::App for SpectralApp {
         self.poll_upload_dialog();
 
         self.poll_compute(ctx);
+        self.poll_depiction(ctx);
 
         egui::SidePanel::left("controls_panel")
             .resizable(true)
