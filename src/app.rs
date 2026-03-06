@@ -100,6 +100,21 @@ enum NodeAttrSortColumn {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeakToleranceUnit {
+    Da,
+    Ppm,
+}
+
+impl PeakToleranceUnit {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Da => "Da",
+            Self::Ppm => "ppm",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpectrumZoomContext {
     Single(usize),
     Mirror { node_a: usize, node_b: usize },
@@ -222,6 +237,10 @@ pub struct SpectralApp {
     spectrum_drag_start: Option<egui::Pos2>,
     spectrum_drag_current: Option<egui::Pos2>,
     spectrum_similarity_cache: Option<(usize, usize, Option<f64>)>,
+    peak_mz_filters: Vec<f64>,
+    peak_filter_tolerance: f64,
+    peak_filter_tolerance_unit: PeakToleranceUnit,
+    peak_filtered_node_ids: Option<HashSet<usize>>,
 
     #[cfg(target_arch = "wasm32")]
     upload_promise: Option<poll_promise::Promise<Result<UploadedFile, String>>>,
@@ -306,6 +325,10 @@ impl SpectralApp {
             spectrum_drag_start: None,
             spectrum_drag_current: None,
             spectrum_similarity_cache: None,
+            peak_mz_filters: Vec::new(),
+            peak_filter_tolerance: 0.02,
+            peak_filter_tolerance_unit: PeakToleranceUnit::Da,
+            peak_filtered_node_ids: None,
             #[cfg(target_arch = "wasm32")]
             upload_promise: None,
         }
@@ -330,6 +353,7 @@ impl SpectralApp {
         self.table_node_filter = None;
         self.clear_spectrum_view_state();
         self.spectrum_similarity_cache = None;
+        self.peak_filtered_node_ids = None;
     }
 
     fn clear_spectrum_view_state(&mut self) {
@@ -399,6 +423,129 @@ impl SpectralApp {
         if self.selected_node_id == self.secondary_selected_node_id {
             self.secondary_selected_node_id = None;
         }
+    }
+
+    fn clamp_selection_to_visible_set(&mut self, visible: &HashSet<usize>) {
+        self.selected_node_id = self.selected_node_id.filter(|id| visible.contains(id));
+        self.secondary_selected_node_id = self
+            .secondary_selected_node_id
+            .filter(|id| visible.contains(id));
+        self.normalize_selected_pair();
+    }
+
+    fn effective_visible_node_set(
+        &self,
+        network: &SpectralNetwork,
+        selection: ComponentSelection,
+        hide_singletons: bool,
+    ) -> HashSet<usize> {
+        let mut visible = visible_node_set_for_view(network, selection, hide_singletons);
+        if let Some(filtered) = &self.peak_filtered_node_ids {
+            visible.retain(|id| filtered.contains(id));
+        }
+        visible
+    }
+
+    fn effective_visible_node_ids(
+        &self,
+        network: &SpectralNetwork,
+        selection: ComponentSelection,
+        hide_singletons: bool,
+    ) -> Vec<usize> {
+        let mut visible: Vec<usize> = self
+            .effective_visible_node_set(network, selection, hide_singletons)
+            .into_iter()
+            .collect();
+        visible.sort_unstable();
+        visible
+    }
+
+    fn add_peak_filter_mz(&mut self, mz: f64) {
+        let rounded = (mz * 1_000_000.0).round() / 1_000_000.0;
+        if self
+            .peak_mz_filters
+            .iter()
+            .any(|existing| (*existing - rounded).abs() <= 1e-6)
+        {
+            return;
+        }
+        self.peak_mz_filters.push(rounded);
+        self.peak_mz_filters
+            .sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+        self.status_message = Some(format!("Added m/z {:.6} to peak filter list", rounded));
+    }
+
+    fn spectrum_record_matches_peak_filter(&self, record: &SpectrumRecord) -> bool {
+        if self.peak_mz_filters.is_empty() {
+            return true;
+        }
+        let tolerance = self.peak_filter_tolerance.max(0.0);
+        self.peak_mz_filters.iter().all(|target_mz| {
+            let tol_da = match self.peak_filter_tolerance_unit {
+                PeakToleranceUnit::Da => tolerance,
+                PeakToleranceUnit::Ppm => target_mz.abs() * tolerance * 1e-6,
+            };
+            record
+                .peaks
+                .iter()
+                .any(|(mz, _)| (*mz - *target_mz).abs() <= tol_da)
+        })
+    }
+
+    fn apply_peak_filter_network(&mut self) {
+        let Some(network) = &self.network else {
+            self.error_message = Some("Build a network before applying peak filter".to_string());
+            return;
+        };
+        if self.peak_mz_filters.is_empty() {
+            self.peak_filtered_node_ids = None;
+            self.status_message =
+                Some("Peak filter list is empty; cleared active filter".to_string());
+            return;
+        }
+
+        let network_node_ids: HashSet<usize> = network.nodes.iter().map(|node| node.id).collect();
+        let mut matched = HashSet::new();
+        for record in &self.spectra {
+            if !network_node_ids.contains(&record.meta.id) {
+                continue;
+            }
+            if self.spectrum_record_matches_peak_filter(record) {
+                matched.insert(record.meta.id);
+            }
+        }
+        self.peak_filtered_node_ids = Some(matched);
+        let visible = self.effective_visible_node_set(
+            network,
+            self.component_selection,
+            self.hide_singletons,
+        );
+        self.clamp_selection_to_visible_set(&visible);
+        self.layout_running = false;
+        self.request_fit_view = true;
+        self.status_message = Some(format!(
+            "Peak filter active: {} peak(s), tolerance {} {}, matched {} node(s)",
+            self.peak_mz_filters.len(),
+            self.peak_filter_tolerance,
+            self.peak_filter_tolerance_unit.label(),
+            self.peak_filtered_node_ids.as_ref().map_or(0, HashSet::len)
+        ));
+        self.error_message = None;
+    }
+
+    fn clear_active_peak_filter(&mut self) {
+        self.peak_filtered_node_ids = None;
+        if let Some(network) = &self.network {
+            let visible = self.effective_visible_node_set(
+                network,
+                self.component_selection,
+                self.hide_singletons,
+            );
+            self.clamp_selection_to_visible_set(&visible);
+        }
+        self.layout_running = false;
+        self.request_fit_view = true;
+        self.status_message = Some("Peak filter cleared".to_string());
     }
 
     fn set_loaded_spectra(&mut self, loaded: LoadedSpectra) {
@@ -658,21 +805,14 @@ impl SpectralApp {
         {
             self.component_selection = ComponentSelection::All;
         }
-        let visible =
-            visible_node_ids_for_view(&network, self.component_selection, self.hide_singletons);
-        self.selected_node_id = keep_selected_if_visible(
-            self.selected_node_id,
+        let visible_set = self.effective_visible_node_set(
             &network,
             self.component_selection,
             self.hide_singletons,
         );
-        self.secondary_selected_node_id = keep_selected_if_visible(
-            self.secondary_selected_node_id,
-            &network,
-            self.component_selection,
-            self.hide_singletons,
-        );
-        self.normalize_selected_pair();
+        self.clamp_selection_to_visible_set(&visible_set);
+        let mut visible: Vec<usize> = visible_set.into_iter().collect();
+        visible.sort_unstable();
         let layout = force_directed_layout(
             &network,
             &visible,
@@ -766,8 +906,11 @@ impl SpectralApp {
         let Some(network) = &self.network else {
             return None;
         };
-        let visible =
-            visible_node_ids_for_view(network, self.component_selection, self.hide_singletons);
+        let visible = self.effective_visible_node_ids(
+            network,
+            self.component_selection,
+            self.hide_singletons,
+        );
         if visible.is_empty() {
             self.layout_mean_displacement = 0.0;
             self.layout_low_motion_streak = 0;
@@ -942,8 +1085,11 @@ impl SpectralApp {
         network: &SpectralNetwork,
     ) -> Option<crate::network::NetworkNode> {
         let node_id = self.selected_node_id?;
-        let visible_set =
-            visible_node_set_for_view(network, self.component_selection, self.hide_singletons);
+        let visible_set = self.effective_visible_node_set(
+            network,
+            self.component_selection,
+            self.hide_singletons,
+        );
         if !visible_set.contains(&node_id) {
             return None;
         }
@@ -955,8 +1101,11 @@ impl SpectralApp {
         network: &SpectralNetwork,
         node_id: usize,
     ) -> Option<crate::network::NetworkNode> {
-        let visible_set =
-            visible_node_set_for_view(network, self.component_selection, self.hide_singletons);
+        let visible_set = self.effective_visible_node_set(
+            network,
+            self.component_selection,
+            self.hide_singletons,
+        );
         if !visible_set.contains(&node_id) {
             return None;
         }
@@ -1347,6 +1496,14 @@ impl SpectralApp {
                 self.selected_spectrum_peak = None;
             }
         }
+        if response.clicked_by(egui::PointerButton::Secondary)
+            && let Some(pointer) = response
+                .interact_pointer_pos()
+                .filter(|p| plot_rect.contains(*p))
+            && let Some((mz, _, _, _)) = nearest_peak(pointer, &drawn_peaks, 10.0)
+        {
+            self.add_peak_filter_mz(mz);
+        }
 
         let font = egui::FontId::proportional(11.0);
         painter.text(
@@ -1641,6 +1798,31 @@ impl SpectralApp {
                 self.selected_spectrum_peak = None;
             }
         }
+        if response.clicked_by(egui::PointerButton::Secondary)
+            && let Some(pointer) = response
+                .interact_pointer_pos()
+                .filter(|p| plot_rect.contains(*p))
+        {
+            let top = nearest_peak(pointer, &drawn_top, 10.0)
+                .map(|(mz, _, tip, base)| (mz, point_to_segment_distance_sq(pointer, tip, base)));
+            let bottom = nearest_peak(pointer, &drawn_bottom, 10.0)
+                .map(|(mz, _, tip, base)| (mz, point_to_segment_distance_sq(pointer, tip, base)));
+            let picked = match (top, bottom) {
+                (Some(t), Some(b)) => {
+                    if t.1 <= b.1 {
+                        Some(t.0)
+                    } else {
+                        Some(b.0)
+                    }
+                }
+                (Some(t), None) => Some(t.0),
+                (None, Some(b)) => Some(b.0),
+                (None, None) => None,
+            };
+            if let Some(mz) = picked {
+                self.add_peak_filter_mz(mz);
+            }
+        }
 
         let hovered_peak = response
             .hover_pos()
@@ -1764,6 +1946,94 @@ impl SpectralApp {
             bottom_peaks.len()
         ));
         ui.small("Drag rectangle to zoom both spectra. Double-click to reset.");
+    }
+
+    fn draw_peak_filter_panel(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.label("Peak Filter");
+        ui.small("Right-click a spectrum peak to add its m/z to this filter list.");
+
+        if self.peak_mz_filters.is_empty() {
+            ui.small("No peaks selected yet.");
+        } else {
+            let mut remove_idx: Option<usize> = None;
+            egui::ScrollArea::vertical()
+                .max_height(120.0)
+                .show(ui, |ui| {
+                    for (idx, mz) in self.peak_mz_filters.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.monospace(format!("{:>2}. m/z {:.6}", idx + 1, mz));
+                            if ui.small_button("✕").clicked() {
+                                remove_idx = Some(idx);
+                            }
+                        });
+                    }
+                });
+            if let Some(idx) = remove_idx {
+                self.peak_mz_filters.remove(idx);
+            }
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Tolerance");
+            ui.add(
+                egui::DragValue::new(&mut self.peak_filter_tolerance)
+                    .range(0.0..=1_000_000.0)
+                    .speed(0.001),
+            );
+            egui::ComboBox::from_id_salt("peak_filter_tolerance_unit")
+                .selected_text(self.peak_filter_tolerance_unit.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.peak_filter_tolerance_unit,
+                        PeakToleranceUnit::Da,
+                        "Da",
+                    );
+                    ui.selectable_value(
+                        &mut self.peak_filter_tolerance_unit,
+                        PeakToleranceUnit::Ppm,
+                        "ppm",
+                    );
+                });
+        });
+        ui.small("Default tolerance is 0.02 Da.");
+
+        ui.horizontal(|ui| {
+            let can_apply = self.network.is_some() && !self.peak_mz_filters.is_empty();
+            if ui
+                .add_enabled(can_apply, egui::Button::new("Filter network"))
+                .clicked()
+            {
+                self.apply_peak_filter_network();
+            }
+            if ui
+                .add_enabled(
+                    self.peak_filtered_node_ids.is_some(),
+                    egui::Button::new("Clear active filter"),
+                )
+                .clicked()
+            {
+                self.clear_active_peak_filter();
+            }
+            if ui
+                .add_enabled(
+                    !self.peak_mz_filters.is_empty(),
+                    egui::Button::new("Clear peak list"),
+                )
+                .clicked()
+            {
+                self.peak_mz_filters.clear();
+                self.clear_active_peak_filter();
+            }
+        });
+
+        if let Some(active) = &self.peak_filtered_node_ids {
+            ui.small(format!(
+                "Active filter: {} node(s) match {} peak(s).",
+                active.len(),
+                self.peak_mz_filters.len()
+            ));
+        }
     }
 
     fn selected_structures_from_node_selection(&self) -> Vec<SelectedStructureEntry> {
@@ -2136,8 +2406,11 @@ impl SpectralApp {
             });
         }
 
-        let visible_ids =
-            visible_node_ids_for_view(network, self.component_selection, self.hide_singletons);
+        let visible_ids = self.effective_visible_node_ids(
+            network,
+            self.component_selection,
+            self.hide_singletons,
+        );
         let node_by_id: HashMap<usize, &crate::network::NetworkNode> =
             network.nodes.iter().map(|n| (n.id, n)).collect();
         let feature_to_node_id: HashMap<String, usize> = network
@@ -2603,8 +2876,11 @@ impl SpectralApp {
         });
 
         let style_preview = self.network.as_ref().and_then(|network| {
-            let visible =
-                visible_node_set_for_view(network, self.component_selection, self.hide_singletons);
+            let visible = self.effective_visible_node_set(
+                network,
+                self.component_selection,
+                self.hide_singletons,
+            );
             self.node_attribute_coloring(network, &visible)
         });
 
@@ -2841,8 +3117,11 @@ impl SpectralApp {
             ctx.request_repaint();
         }
         if let Some(network) = &self.network {
-            let visible_now =
-                visible_node_set_for_view(network, self.component_selection, self.hide_singletons);
+            let visible_now = self.effective_visible_node_set(
+                network,
+                self.component_selection,
+                self.hide_singletons,
+            );
             ui.small(format!(
                 "Active threshold: {:.3} | active edges: {}",
                 self.threshold,
@@ -2876,19 +3155,12 @@ impl SpectralApp {
 
             if selection != self.component_selection {
                 self.component_selection = selection;
-                self.selected_node_id = keep_selected_if_visible(
-                    self.selected_node_id,
+                let visible = self.effective_visible_node_set(
                     network,
                     self.component_selection,
                     self.hide_singletons,
                 );
-                self.secondary_selected_node_id = keep_selected_if_visible(
-                    self.secondary_selected_node_id,
-                    network,
-                    self.component_selection,
-                    self.hide_singletons,
-                );
-                self.normalize_selected_pair();
+                self.clamp_selection_to_visible_set(&visible);
                 self.layout_running = false;
                 self.request_fit_view = true;
             }
@@ -2953,11 +3225,11 @@ impl SpectralApp {
 
         let visible_set = {
             let network = self.network.as_ref().expect("network presence checked");
-            visible_node_set_for_view(network, self.component_selection, self.hide_singletons)
+            self.effective_visible_node_set(network, self.component_selection, self.hide_singletons)
         };
         let visible = {
             let network = self.network.as_ref().expect("network presence checked");
-            visible_node_ids_for_view(network, self.component_selection, self.hide_singletons)
+            self.effective_visible_node_ids(network, self.component_selection, self.hide_singletons)
         };
         let canvas_size = ui.available_size_before_wrap();
 
@@ -3277,6 +3549,8 @@ impl SpectralApp {
             self.clear_spectrum_view_state();
             ui.label("Select a node in the graph.");
         }
+
+        self.draw_peak_filter_panel(ui);
 
         ui.separator();
         ui.label("Structure");
@@ -3731,6 +4005,7 @@ fn selection_label(network: &SpectralNetwork, selection: ComponentSelection) -> 
     }
 }
 
+#[cfg(test)]
 fn keep_selected_if_visible(
     selected_node_id: Option<usize>,
     network: &SpectralNetwork,
@@ -3797,6 +4072,7 @@ fn largest_component_for_view(network: &SpectralNetwork, hide_singletons: bool) 
         .map(|(component_id, _)| component_id)
 }
 
+#[cfg(test)]
 fn visible_node_ids_for_view(
     network: &SpectralNetwork,
     selection: ComponentSelection,
