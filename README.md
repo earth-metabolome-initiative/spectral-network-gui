@@ -10,7 +10,7 @@ cargo run -p spectral-network-gui
 
 On native, the default input path is:
 
-- `spectral-cosine-similarity/fixtures/mapp_batch_00231.mgf`
+- `./fixtures/mapp_batch_00231.mgf`
 
 ## Web build/check
 
