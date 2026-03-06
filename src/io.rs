@@ -1,6 +1,4 @@
-#[cfg(target_arch = "wasm32")]
-use std::io::BufRead;
-use std::io::Cursor;
+use std::io::{BufRead, Cursor};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -65,40 +63,17 @@ pub fn load_mgf_path(
 ) -> Result<LoadedSpectra, String> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use spectral_cosine_similarity::mgf_parser::parse_mgf;
+        use std::fs::File;
+        use std::io::BufReader;
 
-        let parsed = parse_mgf(path, min_peaks, max_peaks);
-        let spectra = to_records(
-            parsed
-                .spectra
-                .into_iter()
-                .map(|s| ParsedSpectrum {
-                    raw_name: s.raw_name,
-                    feature_id: s.feature_id,
-                    scans: s.scans,
-                    filename: s.filename,
-                    source_scan_usi: s.source_scan_usi,
-                    featurelist_feature_id: s.featurelist_feature_id,
-                    precursor_mz: s.precursor_mz,
-                    peaks: s.peaks,
-                })
-                .collect(),
-        )?;
+        let file =
+            File::open(path).map_err(|err| format!("cannot open {}: {err}", path.display()))?;
+        let (parsed, stats) = parse_mgf_reader_local(BufReader::new(file), min_peaks, max_peaks)?;
+        let spectra = to_records(parsed)?;
         Ok(LoadedSpectra {
             source_label: path.display().to_string(),
             spectra,
-            stats: ParseStats {
-                ions_blocks: parsed.stats.ions_blocks,
-                accepted: parsed.stats.accepted,
-                dropped_missing_name: parsed.stats.dropped_missing_name,
-                dropped_missing_precursor_mz: parsed.stats.dropped_missing_precursor_mz,
-                dropped_too_few_peaks: parsed.stats.dropped_too_few_peaks,
-                dropped_too_many_peaks: parsed.stats.dropped_too_many_peaks,
-                dropped_nonpositive_intensity_peaks: parsed
-                    .stats
-                    .dropped_nonpositive_intensity_peaks,
-                dropped_duplicate_mz: parsed.stats.dropped_duplicate_mz,
-            },
+            stats,
         })
     }
 
@@ -117,40 +92,12 @@ pub fn load_mgf_bytes(
 ) -> Result<LoadedSpectra, String> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use spectral_cosine_similarity::mgf_parser::parse_mgf_reader;
-
-        let parsed = parse_mgf_reader(Cursor::new(bytes), min_peaks, max_peaks);
-        let spectra = to_records(
-            parsed
-                .spectra
-                .into_iter()
-                .map(|s| ParsedSpectrum {
-                    raw_name: s.raw_name,
-                    feature_id: s.feature_id,
-                    scans: s.scans,
-                    filename: s.filename,
-                    source_scan_usi: s.source_scan_usi,
-                    featurelist_feature_id: s.featurelist_feature_id,
-                    precursor_mz: s.precursor_mz,
-                    peaks: s.peaks,
-                })
-                .collect(),
-        )?;
+        let (parsed, stats) = parse_mgf_reader_local(Cursor::new(bytes), min_peaks, max_peaks)?;
+        let spectra = to_records(parsed)?;
         Ok(LoadedSpectra {
             source_label: source_label.to_string(),
             spectra,
-            stats: ParseStats {
-                ions_blocks: parsed.stats.ions_blocks,
-                accepted: parsed.stats.accepted,
-                dropped_missing_name: parsed.stats.dropped_missing_name,
-                dropped_missing_precursor_mz: parsed.stats.dropped_missing_precursor_mz,
-                dropped_too_few_peaks: parsed.stats.dropped_too_few_peaks,
-                dropped_too_many_peaks: parsed.stats.dropped_too_many_peaks,
-                dropped_nonpositive_intensity_peaks: parsed
-                    .stats
-                    .dropped_nonpositive_intensity_peaks,
-                dropped_duplicate_mz: parsed.stats.dropped_duplicate_mz,
-            },
+            stats,
         })
     }
 
@@ -185,7 +132,6 @@ pub fn load_mgf_file_for_wasm(
     }))
 }
 
-#[cfg(target_arch = "wasm32")]
 fn parse_mgf_reader_local<R: BufRead>(
     reader: R,
     min_peaks: usize,
@@ -306,7 +252,6 @@ fn parse_mgf_reader_local<R: BufRead>(
     Ok((spectra, stats))
 }
 
-#[cfg(target_arch = "wasm32")]
 fn preferred_name(
     name: &Option<String>,
     title: &Option<String>,

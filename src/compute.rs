@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 
 use mass_spectrometry::prelude::{
-    EntropySimilarity, GenericSpectrum, GreedyCosine, HungarianCosine, ModifiedGreedyCosine,
+    GenericSpectrum, GreedyCosine, HungarianCosine, LinearEntropy, ModifiedGreedyCosine,
     ModifiedHungarianCosine, ScalarSimilarity,
 };
 
@@ -62,8 +62,8 @@ enum MetricScorer {
     CosineGreedy(GreedyCosine<f64, f64>),
     ModifiedCosine(ModifiedHungarianCosine<f64, f64>),
     ModifiedGreedyCosine(ModifiedGreedyCosine<f64, f64>),
-    EntropySimilarityWeighted(EntropySimilarity<f64>),
-    EntropySimilarityUnweighted(EntropySimilarity<f64>),
+    EntropySimilarityWeighted(LinearEntropy<f64, f64>),
+    EntropySimilarityUnweighted(LinearEntropy<f64, f64>),
 }
 
 impl MetricScorer {
@@ -98,14 +98,14 @@ impl MetricScorer {
                     })
             }
             SimilarityMetric::EntropySimilarityWeighted => {
-                EntropySimilarity::weighted(params.tolerance)
+                LinearEntropy::weighted(params.tolerance)
                     .map(Self::EntropySimilarityWeighted)
                     .map_err(|err| {
                         format!("failed to configure {}: {err:?}", params.metric.label())
                     })
             }
             SimilarityMetric::EntropySimilarityUnweighted => {
-                EntropySimilarity::unweighted(params.tolerance)
+                LinearEntropy::unweighted(params.tolerance)
                     .map(Self::EntropySimilarityUnweighted)
                     .map_err(|err| {
                         format!("failed to configure {}: {err:?}", params.metric.label())

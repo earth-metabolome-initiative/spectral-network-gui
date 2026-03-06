@@ -34,7 +34,7 @@ const MAX_PEAKS: usize = 1000;
 const LAYOUT_STOP_EPSILON: f32 = 0.0015;
 const LAYOUT_STOP_STREAK: usize = 15;
 #[cfg(not(target_arch = "wasm32"))]
-const DEFAULT_MGF_PATH: &str = "spectral-cosine-similarity/fixtures/mapp_batch_00231.mgf";
+const DEFAULT_MGF_PATH: &str = "fixtures/mapp_batch_00231.mgf";
 
 #[cfg(target_arch = "wasm32")]
 struct UploadedFile {
