@@ -237,6 +237,7 @@ pub struct SpectralApp {
     spectrum_drag_start: Option<egui::Pos2>,
     spectrum_drag_current: Option<egui::Pos2>,
     spectrum_similarity_cache: Option<(usize, usize, Option<f64>)>,
+    show_single_spectrum_mgf: bool,
     peak_mz_filters: Vec<f64>,
     peak_filter_tolerance: f64,
     peak_filter_tolerance_unit: PeakToleranceUnit,
@@ -325,6 +326,7 @@ impl SpectralApp {
             spectrum_drag_start: None,
             spectrum_drag_current: None,
             spectrum_similarity_cache: None,
+            show_single_spectrum_mgf: false,
             peak_mz_filters: Vec::new(),
             peak_filter_tolerance: 0.02,
             peak_filter_tolerance_unit: PeakToleranceUnit::Da,
@@ -1148,6 +1150,96 @@ impl SpectralApp {
         });
         self.spectrum_similarity_cache = Some((left, right, score));
         score
+    }
+
+    fn mgf_payload_for_node(&self, node: &crate::network::NetworkNode) -> Option<(String, String)> {
+        let record = self.spectra.iter().find(|spec| spec.meta.id == node.id)?;
+        let meta = &record.meta;
+        let mut mgf = String::with_capacity(1024 + record.peaks.len() * 24);
+        mgf.push_str("BEGIN IONS\n");
+        if !meta.raw_name.trim().is_empty() {
+            mgf.push_str(&format!("NAME={}\n", meta.raw_name.trim()));
+        }
+        if !meta.label.trim().is_empty() && meta.label.trim() != meta.raw_name.trim() {
+            mgf.push_str(&format!("TITLE={}\n", meta.label.trim()));
+        }
+        if let Some(feature_id) = meta.feature_id.as_deref().filter(|v| !v.trim().is_empty()) {
+            mgf.push_str(&format!("FEATURE_ID={}\n", feature_id.trim()));
+        }
+        if let Some(featurelist_feature_id) = meta
+            .featurelist_feature_id
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+        {
+            mgf.push_str(&format!(
+                "FEATURELIST_FEATURE_ID={}\n",
+                featurelist_feature_id.trim()
+            ));
+        }
+        if let Some(scans) = meta.scans.as_deref().filter(|v| !v.trim().is_empty()) {
+            mgf.push_str(&format!("SCANS={}\n", scans.trim()));
+        }
+        if let Some(filename) = meta.filename.as_deref().filter(|v| !v.trim().is_empty()) {
+            mgf.push_str(&format!("FILENAME={}\n", filename.trim()));
+        }
+        if let Some(source_scan_usi) = meta
+            .source_scan_usi
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+        {
+            mgf.push_str(&format!("SOURCE_SCAN_USI={}\n", source_scan_usi.trim()));
+        }
+        mgf.push_str(&format!("PEPMASS={:.6}\n", meta.precursor_mz));
+        for (mz, intensity) in record.peaks.iter() {
+            mgf.push_str(&format!("{:.6} {:.6}\n", mz, intensity));
+        }
+        mgf.push_str("END IONS\n");
+
+        let name_source = meta
+            .feature_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| meta.raw_name.trim());
+        let sanitized = sanitize_filename_fragment(name_source);
+        let default_filename = format!("{sanitized}.mgf");
+        Some((default_filename, mgf))
+    }
+
+    fn save_mgf_content(&mut self, default_filename: &str, content: &str) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("MGF", &["mgf"])
+                .set_file_name(default_filename)
+                .save_file()
+            {
+                match std::fs::write(&path, content) {
+                    Ok(()) => {
+                        self.status_message = Some(format!("Saved MGF to {}", path.display()));
+                        self.error_message = None;
+                    }
+                    Err(err) => {
+                        self.error_message =
+                            Some(format!("Failed to save MGF {}: {err}", path.display()));
+                    }
+                }
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            match download_text_file(default_filename, content.as_bytes()) {
+                Ok(()) => {
+                    self.status_message =
+                        Some(format!("Triggered MGF download: {default_filename}"));
+                    self.error_message = None;
+                }
+                Err(err) => {
+                    self.error_message = Some(format!("Failed to download MGF: {err}"));
+                }
+            }
+        }
     }
 
     fn ensure_depiction_request(&mut self, request_key: String, uri: String) {
@@ -3541,6 +3633,40 @@ impl SpectralApp {
                 } else {
                     ui.small("No spectrum data found for this node.");
                 }
+                ui.checkbox(&mut self.show_single_spectrum_mgf, "Toggle MGF");
+                if self.show_single_spectrum_mgf {
+                    if let Some((default_filename, mgf_text)) = self.mgf_payload_for_node(node) {
+                        ui.horizontal(|ui| {
+                            if ui.button("⎘ Copy MGF").clicked() {
+                                ui.ctx().copy_text(mgf_text.clone());
+                                self.status_message = Some("Copied MGF to clipboard".to_string());
+                                self.error_message = None;
+                            }
+                            if ui.button("⇩ Save .mgf").clicked() {
+                                self.save_mgf_content(&default_filename, &mgf_text);
+                            }
+                        });
+                        ui.small(format!("Default filename: {default_filename}"));
+                        let mgf_box_max_height =
+                            (ui.ctx().screen_rect().height() * 0.35).clamp(140.0, 460.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt(format!("single_node_mgf_scroll_{}", node.id))
+                            .max_height(mgf_box_max_height)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let mut mgf_display = mgf_text;
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut mgf_display)
+                                        .desired_rows(1)
+                                        .font(egui::TextStyle::Monospace)
+                                        .interactive(false)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+                    } else {
+                        ui.small("No spectrum record found to generate MGF block.");
+                    }
+                }
             }
         } else if self.selected_node_id.is_some() {
             self.clear_spectrum_view_state();
@@ -3826,6 +3952,63 @@ fn normalized_column_name(name: &str) -> String {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .map(|ch| ch.to_ascii_lowercase())
         .collect()
+}
+
+fn sanitize_filename_fragment(raw: &str) -> String {
+    let mut cleaned = String::with_capacity(raw.len().max(8));
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            cleaned.push(ch);
+        } else {
+            cleaned.push('_');
+        }
+    }
+    let trimmed = cleaned.trim_matches('_');
+    if trimmed.is_empty() {
+        "spectrum".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn download_text_file(filename: &str, bytes: &[u8]) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+
+    let array = js_sys::Uint8Array::from(bytes);
+    let parts = js_sys::Array::new();
+    parts.push(&array.buffer());
+    let blob = web_sys::Blob::new_with_u8_array_sequence(&parts)
+        .map_err(|err| format!("failed to build Blob: {err:?}"))?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|err| format!("failed to create object URL: {err:?}"))?;
+
+    let window = web_sys::window().ok_or_else(|| "window unavailable".to_string())?;
+    let document = window
+        .document()
+        .ok_or_else(|| "document unavailable".to_string())?;
+    let body = document
+        .body()
+        .ok_or_else(|| "document.body unavailable".to_string())?;
+    let anchor = document
+        .create_element("a")
+        .map_err(|err| format!("failed to create anchor element: {err:?}"))?
+        .dyn_into::<web_sys::HtmlAnchorElement>()
+        .map_err(|_| "failed to cast anchor element".to_string())?;
+    anchor.set_href(&url);
+    anchor.set_download(filename);
+    anchor
+        .style()
+        .set_property("display", "none")
+        .map_err(|err| format!("failed to style anchor: {err:?}"))?;
+    body.append_child(&anchor)
+        .map_err(|err| format!("failed to append anchor: {err:?}"))?;
+    anchor.click();
+    body.remove_child(&anchor)
+        .map_err(|err| format!("failed to remove anchor: {err:?}"))?;
+    web_sys::Url::revoke_object_url(&url)
+        .map_err(|err| format!("failed to revoke object URL: {err:?}"))?;
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
