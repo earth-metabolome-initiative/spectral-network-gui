@@ -1242,6 +1242,40 @@ impl SpectralApp {
         }
     }
 
+    fn microbemasst_url_for_node(&self, node_id: usize) -> Option<String> {
+        let record = self.spectra.iter().find(|spec| spec.meta.id == node_id)?;
+        let peaks = record
+            .peaks
+            .iter()
+            .map(|(mz, intensity)| format!("{mz}\t{intensity}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let precursor_mz = record.meta.precursor_mz.to_string();
+        let payload = format!(
+            r#"{{"usi1": "","peaks": "{}","precursor_mz": "{}"}}"#,
+            json_escape(&peaks),
+            json_escape(&precursor_mz)
+        );
+        let encoded = urlencoding::encode(&payload);
+        Some(format!("http://masst.gnps2.org//microbemasst#{encoded}"))
+    }
+
+    fn fasstsearch_url_for_node(&self, node_id: usize) -> Option<String> {
+        let record = self.spectra.iter().find(|spec| spec.meta.id == node_id)?;
+        let peaks = record
+            .peaks
+            .iter()
+            .map(|(mz, intensity)| format!("{mz}\t{intensity}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let payload = format!(r#"{{"peaks": "{}"}}"#, json_escape(&peaks));
+        let encoded = urlencoding::encode(&payload);
+        let precursor_mz = record.meta.precursor_mz.to_string();
+        Some(format!(
+            "http://fasst.gnps2.org/fastsearch/?usi1=None&precursor_mz={precursor_mz}&charge=1&library_select=gnpsdata_index&analog_select=No&delta_mass_below=130&delta_mass_above=200&pm_tolerance=0.05&fragment_tolerance=0.05&cosine_threshold=0.7&use_peaks=1#{encoded}"
+        ))
+    }
+
     fn ensure_depiction_request(&mut self, request_key: String, uri: String) {
         if self
             .depict_cache
@@ -3633,6 +3667,18 @@ impl SpectralApp {
                 } else {
                     ui.small("No spectrum data found for this node.");
                 }
+                let microbemasst_url = self.microbemasst_url_for_node(node.id);
+                let fasstsearch_url = self.fasstsearch_url_for_node(node.id);
+                if microbemasst_url.is_some() || fasstsearch_url.is_some() {
+                    ui.horizontal_wrapped(|ui| {
+                        if let Some(url) = microbemasst_url {
+                            ui.hyperlink_to("Search microbeMASST", url);
+                        }
+                        if let Some(url) = fasstsearch_url {
+                            ui.hyperlink_to("Search fastsearch", url);
+                        }
+                    });
+                }
                 ui.checkbox(&mut self.show_single_spectrum_mgf, "Toggle MGF");
                 if self.show_single_spectrum_mgf {
                     if let Some((default_filename, mgf_text)) = self.mgf_payload_for_node(node) {
@@ -3969,6 +4015,24 @@ fn sanitize_filename_fragment(raw: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn json_escape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 16);
+    for ch in raw.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(target_arch = "wasm32")]
