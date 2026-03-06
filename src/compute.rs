@@ -6,7 +6,8 @@ use std::sync::mpsc::{self, Receiver};
 
 use mass_spectrometry::prelude::{
     GenericSpectrum, GreedyCosine, HungarianCosine, LinearEntropy, ModifiedGreedyCosine,
-    ModifiedHungarianCosine, ScalarSimilarity,
+    ModifiedHungarianCosine, ModifiedLinearEntropy, MsEntropyCleanSpectrum, ScalarSimilarity,
+    SiriusMergeClosePeaks, SpectralProcessor,
 };
 
 use crate::io::SpectrumRecord;
@@ -17,18 +18,22 @@ pub enum SimilarityMetric {
     CosineGreedy,
     ModifiedCosine,
     ModifiedGreedyCosine,
-    EntropySimilarityWeighted,
-    EntropySimilarityUnweighted,
+    LinearEntropyWeighted,
+    LinearEntropyUnweighted,
+    ModifiedLinearEntropyWeighted,
+    ModifiedLinearEntropyUnweighted,
 }
 
 impl SimilarityMetric {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::CosineHungarian,
         Self::CosineGreedy,
         Self::ModifiedCosine,
         Self::ModifiedGreedyCosine,
-        Self::EntropySimilarityWeighted,
-        Self::EntropySimilarityUnweighted,
+        Self::LinearEntropyWeighted,
+        Self::LinearEntropyUnweighted,
+        Self::ModifiedLinearEntropyWeighted,
+        Self::ModifiedLinearEntropyUnweighted,
     ];
 
     pub fn label(self) -> &'static str {
@@ -37,9 +42,21 @@ impl SimilarityMetric {
             Self::CosineGreedy => "CosineGreedy",
             Self::ModifiedCosine => "ModifiedCosine",
             Self::ModifiedGreedyCosine => "ModifiedGreedyCosine",
-            Self::EntropySimilarityWeighted => "EntropySimilarityWeighted",
-            Self::EntropySimilarityUnweighted => "EntropySimilarityUnweighted",
+            Self::LinearEntropyWeighted => "LinearEntropyWeighted",
+            Self::LinearEntropyUnweighted => "LinearEntropyUnweighted",
+            Self::ModifiedLinearEntropyWeighted => "ModifiedLinearEntropyWeighted",
+            Self::ModifiedLinearEntropyUnweighted => "ModifiedLinearEntropyUnweighted",
         }
+    }
+
+    fn needs_linear_entropy_preprocessing(self) -> bool {
+        matches!(
+            self,
+            Self::LinearEntropyWeighted
+                | Self::LinearEntropyUnweighted
+                | Self::ModifiedLinearEntropyWeighted
+                | Self::ModifiedLinearEntropyUnweighted
+        )
     }
 }
 
@@ -62,8 +79,10 @@ enum MetricScorer {
     CosineGreedy(GreedyCosine<f64, f64>),
     ModifiedCosine(ModifiedHungarianCosine<f64, f64>),
     ModifiedGreedyCosine(ModifiedGreedyCosine<f64, f64>),
-    EntropySimilarityWeighted(LinearEntropy<f64, f64>),
-    EntropySimilarityUnweighted(LinearEntropy<f64, f64>),
+    LinearEntropyWeighted(LinearEntropy<f64, f64>),
+    LinearEntropyUnweighted(LinearEntropy<f64, f64>),
+    ModifiedLinearEntropyWeighted(ModifiedLinearEntropy<f64, f64>),
+    ModifiedLinearEntropyUnweighted(ModifiedLinearEntropy<f64, f64>),
 }
 
 impl MetricScorer {
@@ -97,20 +116,38 @@ impl MetricScorer {
                         format!("failed to configure {}: {err:?}", params.metric.label())
                     })
             }
-            SimilarityMetric::EntropySimilarityWeighted => {
-                LinearEntropy::weighted(params.tolerance)
-                    .map(Self::EntropySimilarityWeighted)
-                    .map_err(|err| {
-                        format!("failed to configure {}: {err:?}", params.metric.label())
-                    })
-            }
-            SimilarityMetric::EntropySimilarityUnweighted => {
-                LinearEntropy::unweighted(params.tolerance)
-                    .map(Self::EntropySimilarityUnweighted)
-                    .map_err(|err| {
-                        format!("failed to configure {}: {err:?}", params.metric.label())
-                    })
-            }
+            SimilarityMetric::LinearEntropyWeighted => LinearEntropy::new(
+                params.mz_power,
+                params.intensity_power,
+                params.tolerance,
+                true,
+            )
+            .map(Self::LinearEntropyWeighted)
+            .map_err(|err| format!("failed to configure {}: {err:?}", params.metric.label())),
+            SimilarityMetric::LinearEntropyUnweighted => LinearEntropy::new(
+                params.mz_power,
+                params.intensity_power,
+                params.tolerance,
+                false,
+            )
+            .map(Self::LinearEntropyUnweighted)
+            .map_err(|err| format!("failed to configure {}: {err:?}", params.metric.label())),
+            SimilarityMetric::ModifiedLinearEntropyWeighted => ModifiedLinearEntropy::new(
+                params.mz_power,
+                params.intensity_power,
+                params.tolerance,
+                true,
+            )
+            .map(Self::ModifiedLinearEntropyWeighted)
+            .map_err(|err| format!("failed to configure {}: {err:?}", params.metric.label())),
+            SimilarityMetric::ModifiedLinearEntropyUnweighted => ModifiedLinearEntropy::new(
+                params.mz_power,
+                params.intensity_power,
+                params.tolerance,
+                false,
+            )
+            .map(Self::ModifiedLinearEntropyUnweighted)
+            .map_err(|err| format!("failed to configure {}: {err:?}", params.metric.label())),
         }
     }
 
@@ -127,8 +164,10 @@ impl MetricScorer {
             Self::CosineGreedy(sim) => sim.similarity(left, right),
             Self::ModifiedCosine(sim) => sim.similarity(left, right),
             Self::ModifiedGreedyCosine(sim) => sim.similarity(left, right),
-            Self::EntropySimilarityWeighted(sim) => sim.similarity(left, right),
-            Self::EntropySimilarityUnweighted(sim) => sim.similarity(left, right),
+            Self::LinearEntropyWeighted(sim) => sim.similarity(left, right),
+            Self::LinearEntropyUnweighted(sim) => sim.similarity(left, right),
+            Self::ModifiedLinearEntropyWeighted(sim) => sim.similarity(left, right),
+            Self::ModifiedLinearEntropyUnweighted(sim) => sim.similarity(left, right),
         };
         result.map_err(|err| {
             format!(
@@ -204,6 +243,14 @@ pub fn start_native_compute(
     std::thread::spawn(move || {
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let spectra = match preprocess_spectra_for_metric(spectra, params) {
+                Ok(spectra) => spectra,
+                Err(err) => {
+                    let _ = tx.send(ComputeMessage::Failed(err));
+                    return;
+                }
+            };
+
             let done_worker = Arc::clone(&done_for_thread);
             let cancel_worker = Arc::clone(&cancel_for_thread);
             use rayon::prelude::*;
@@ -312,6 +359,7 @@ pub struct IncrementalComputeState {
 
 impl IncrementalComputeState {
     pub fn new(spectra: Vec<SpectrumRecord>, params: ComputeParams) -> Result<Self, String> {
+        let spectra = preprocess_spectra_for_metric(spectra, params)?;
         let total = total_pairs(spectra.len());
         let scorer = MetricScorer::new(params)?;
         Ok(Self {
@@ -387,6 +435,31 @@ impl IncrementalComputeState {
             Ok(IncrementalStep::Progress)
         }
     }
+}
+
+fn preprocess_spectra_for_metric(
+    spectra: Vec<SpectrumRecord>,
+    params: ComputeParams,
+) -> Result<Vec<SpectrumRecord>, String> {
+    if !params.metric.needs_linear_entropy_preprocessing() {
+        return Ok(spectra);
+    }
+
+    let cleaner = MsEntropyCleanSpectrum::<f64>::builder()
+        .build()
+        .map_err(|err| format!("failed to configure ms_entropy cleaner: {err:?}"))?;
+    let merger = SiriusMergeClosePeaks::new(params.tolerance)
+        .map_err(|err| format!("failed to configure close-peak merger: {err:?}"))?;
+
+    Ok(spectra
+        .into_iter()
+        .map(|mut record| {
+            let cleaned = cleaner.process(record.spectrum.as_ref());
+            let merged = merger.process(&cleaned);
+            record.spectrum = Arc::new(merged);
+            record
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -481,6 +554,44 @@ mod tests {
         match state.step(100).expect("cancel step failed") {
             IncrementalStep::Cancelled => {}
             _ => panic!("expected cancelled state"),
+        }
+    }
+
+    #[test]
+    fn linear_entropy_preprocessing_handles_close_peaks() {
+        let spectra = vec![
+            spectrum(
+                0,
+                100.0,
+                &[(10.0, 1.0), (10.01, 0.5), (20.0, 0.4), (30.0, 0.3)],
+            ),
+            spectrum(
+                1,
+                101.0,
+                &[(10.0, 1.0), (10.01, 0.5), (20.0, 0.6), (31.0, 0.2)],
+            ),
+        ];
+
+        let mut state = IncrementalComputeState::new(
+            spectra,
+            ComputeParams {
+                metric: SimilarityMetric::LinearEntropyWeighted,
+                tolerance: 0.01,
+                mz_power: 0.0,
+                intensity_power: 1.0,
+            },
+        )
+        .expect("failed to create compute state");
+
+        loop {
+            match state.step(8).expect("incremental step failed") {
+                IncrementalStep::Progress => {}
+                IncrementalStep::Finished(result) => {
+                    assert_eq!(result.pairs.len(), total_pairs(2));
+                    break;
+                }
+                IncrementalStep::Cancelled => panic!("unexpected cancel"),
+            }
         }
     }
 }
