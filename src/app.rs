@@ -2075,91 +2075,96 @@ impl SpectralApp {
     }
 
     fn draw_peak_filter_panel(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        ui.label("Peak Filter");
-        ui.small("Right-click a spectrum peak to add its m/z to this filter list.");
+        ui.push_id("peak_filter_panel", |ui| {
+            ui.separator();
+            ui.label("Peak Filter");
+            ui.small("Right-click a spectrum peak to add its m/z to this filter list.");
 
-        if self.peak_mz_filters.is_empty() {
-            ui.small("No peaks selected yet.");
-        } else {
-            let mut remove_idx: Option<usize> = None;
-            egui::ScrollArea::vertical()
-                .max_height(120.0)
-                .show(ui, |ui| {
-                    for (idx, mz) in self.peak_mz_filters.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.monospace(format!("{:>2}. m/z {:.6}", idx + 1, mz));
-                            if ui.small_button("✕").clicked() {
-                                remove_idx = Some(idx);
-                            }
-                        });
-                    }
-                });
-            if let Some(idx) = remove_idx {
-                self.peak_mz_filters.remove(idx);
+            if self.peak_mz_filters.is_empty() {
+                ui.small("No peaks selected yet.");
+            } else {
+                let mut remove_idx: Option<usize> = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("peak_filter_mz_scroll")
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        for (idx, mz) in self.peak_mz_filters.iter().enumerate() {
+                            ui.push_id(idx, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.monospace(format!("{:>2}. m/z {:.6}", idx + 1, mz));
+                                    if ui.small_button("✕").clicked() {
+                                        remove_idx = Some(idx);
+                                    }
+                                });
+                            });
+                        }
+                    });
+                if let Some(idx) = remove_idx {
+                    self.peak_mz_filters.remove(idx);
+                }
             }
-        }
 
-        ui.horizontal(|ui| {
-            ui.label("Tolerance");
-            ui.add(
-                egui::DragValue::new(&mut self.peak_filter_tolerance)
-                    .range(0.0..=1_000_000.0)
-                    .speed(0.001),
-            );
-            egui::ComboBox::from_id_salt("peak_filter_tolerance_unit")
-                .selected_text(self.peak_filter_tolerance_unit.label())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.peak_filter_tolerance_unit,
-                        PeakToleranceUnit::Da,
-                        "Da",
-                    );
-                    ui.selectable_value(
-                        &mut self.peak_filter_tolerance_unit,
-                        PeakToleranceUnit::Ppm,
-                        "ppm",
-                    );
-                });
+            ui.horizontal(|ui| {
+                ui.label("Tolerance");
+                ui.add(
+                    egui::DragValue::new(&mut self.peak_filter_tolerance)
+                        .range(0.0..=1_000_000.0)
+                        .speed(0.001),
+                );
+                egui::ComboBox::from_id_salt("peak_filter_tolerance_unit")
+                    .selected_text(self.peak_filter_tolerance_unit.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.peak_filter_tolerance_unit,
+                            PeakToleranceUnit::Da,
+                            "Da",
+                        );
+                        ui.selectable_value(
+                            &mut self.peak_filter_tolerance_unit,
+                            PeakToleranceUnit::Ppm,
+                            "ppm",
+                        );
+                    });
+            });
+            ui.small("Default tolerance is 0.02 Da.");
+
+            ui.horizontal(|ui| {
+                let can_apply = self.network.is_some() && !self.peak_mz_filters.is_empty();
+                if ui
+                    .add_enabled(can_apply, egui::Button::new("Filter network"))
+                    .clicked()
+                {
+                    self.apply_peak_filter_network();
+                }
+                if ui
+                    .add_enabled(
+                        self.peak_filtered_node_ids.is_some(),
+                        egui::Button::new("Clear active filter"),
+                    )
+                    .clicked()
+                {
+                    self.clear_active_peak_filter();
+                }
+                if ui
+                    .add_enabled(
+                        !self.peak_mz_filters.is_empty(),
+                        egui::Button::new("Clear peak list"),
+                    )
+                    .clicked()
+                {
+                    self.peak_mz_filters.clear();
+                    self.clear_active_peak_filter();
+                }
+            });
+
+            if let Some(active) = &self.peak_filtered_node_ids {
+                ui.small(format!(
+                    "Active filter: {} node(s) match {} peak(s).",
+                    active.len(),
+                    self.peak_mz_filters.len()
+                ));
+            }
         });
-        ui.small("Default tolerance is 0.02 Da.");
-
-        ui.horizontal(|ui| {
-            let can_apply = self.network.is_some() && !self.peak_mz_filters.is_empty();
-            if ui
-                .add_enabled(can_apply, egui::Button::new("Filter network"))
-                .clicked()
-            {
-                self.apply_peak_filter_network();
-            }
-            if ui
-                .add_enabled(
-                    self.peak_filtered_node_ids.is_some(),
-                    egui::Button::new("Clear active filter"),
-                )
-                .clicked()
-            {
-                self.clear_active_peak_filter();
-            }
-            if ui
-                .add_enabled(
-                    !self.peak_mz_filters.is_empty(),
-                    egui::Button::new("Clear peak list"),
-                )
-                .clicked()
-            {
-                self.peak_mz_filters.clear();
-                self.clear_active_peak_filter();
-            }
-        });
-
-        if let Some(active) = &self.peak_filtered_node_ids {
-            ui.small(format!(
-                "Active filter: {} node(s) match {} peak(s).",
-                active.len(),
-                self.peak_mz_filters.len()
-            ));
-        }
     }
 
     fn selected_structures_from_node_selection(&self) -> Vec<SelectedStructureEntry> {
@@ -2222,83 +2227,93 @@ impl SpectralApp {
             .collect()
     }
 
-    fn draw_selected_structures_gallery(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Max structures");
-            ui.add(
-                egui::DragValue::new(&mut self.selection_structures_limit)
-                    .range(1..=500)
-                    .speed(1.0),
-            );
-            ui.label("Image height");
-            ui.add(
-                egui::DragValue::new(&mut self.selection_structures_image_height)
-                    .range(140.0..=700.0)
-                    .speed(1.0),
-            );
-        });
-        if self.table_node_filter.is_none() {
-            ui.small("Use rectangle selection on the graph to choose nodes.");
-            return;
-        }
-        if self.depict_smiles_column.is_none() {
-            ui.small("Select a SMILES column in the left panel.");
-            return;
-        }
-
-        let selected_structures = self.selected_structures_from_node_selection();
-        if selected_structures.is_empty() {
-            ui.small("No SMILES available for the selected nodes.");
-            return;
-        }
-
-        let max_items = self.selection_structures_limit.max(1);
-        let structures: Vec<&SelectedStructureEntry> =
-            selected_structures.iter().take(max_items).collect();
-        if selected_structures.len() > structures.len() {
-            ui.small(format!(
-                "Showing {} / {} structures (increase Max structures to show more).",
-                structures.len(),
-                selected_structures.len()
-            ));
-        } else {
-            ui.small(format!("Showing {} structures.", structures.len()));
-        }
-
-        let gallery_height = ui.available_height().max(260.0);
-        egui::ScrollArea::vertical()
-            .max_height(gallery_height)
-            .show(ui, |ui| {
-                for entry in structures {
-                    ui.group(|ui| {
-                        let card_width = ui.available_width().max(260.0);
-                        let card_height =
-                            self.selection_structures_image_height.clamp(140.0, 700.0);
-                        let depict_uri = naturalproducts_depict_uri(
-                            &entry.smiles,
-                            card_width as u32,
-                            card_height as u32,
-                        );
-                        self.ensure_depiction_request(depict_uri.clone(), depict_uri.clone());
-                        self.draw_depiction_widget(
-                            ui,
-                            &depict_uri,
-                            egui::vec2(card_width, card_height),
-                        );
-                        if ui.link(&entry.display_label).clicked() {
-                            self.set_single_selected_node(entry.node_id, true);
-                        }
-                        if entry.annotations.is_empty() {
-                            ui.small("No additional structure metadata selected.");
-                        } else {
-                            for (column, value) in &entry.annotations {
-                                ui.add(egui::Label::new(format!("{column}: {value}")).wrap());
-                            }
-                        }
-                    });
-                    ui.add_space(6.0);
-                }
+    fn draw_selected_structures_gallery(&mut self, ui: &mut egui::Ui, id_suffix: &str) {
+        ui.push_id(("selected_structures_gallery", id_suffix), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Max structures");
+                ui.add(
+                    egui::DragValue::new(&mut self.selection_structures_limit)
+                        .range(1..=500)
+                        .speed(1.0),
+                );
+                ui.label("Image height");
+                ui.add(
+                    egui::DragValue::new(&mut self.selection_structures_image_height)
+                        .range(140.0..=700.0)
+                        .speed(1.0),
+                );
             });
+            if self.table_node_filter.is_none() {
+                ui.small("Use rectangle selection on the graph to choose nodes.");
+                return;
+            }
+            if self.depict_smiles_column.is_none() {
+                ui.small("Select a SMILES column in the left panel.");
+                return;
+            }
+
+            let selected_structures = self.selected_structures_from_node_selection();
+            if selected_structures.is_empty() {
+                ui.small("No SMILES available for the selected nodes.");
+                return;
+            }
+
+            let max_items = self.selection_structures_limit.max(1);
+            let structures: Vec<&SelectedStructureEntry> =
+                selected_structures.iter().take(max_items).collect();
+            if selected_structures.len() > structures.len() {
+                ui.small(format!(
+                    "Showing {} / {} structures (increase Max structures to show more).",
+                    structures.len(),
+                    selected_structures.len()
+                ));
+            } else {
+                ui.small(format!("Showing {} structures.", structures.len()));
+            }
+
+            let gallery_height = ui.available_height().max(260.0);
+            egui::ScrollArea::vertical()
+                .id_salt(("selected_structures_gallery_scroll", id_suffix))
+                .max_height(gallery_height)
+                .show(ui, |ui| {
+                    for entry in structures {
+                        ui.push_id(entry.node_id, |ui| {
+                            ui.group(|ui| {
+                                let card_width = ui.available_width().max(260.0);
+                                let card_height =
+                                    self.selection_structures_image_height.clamp(140.0, 700.0);
+                                let depict_uri = naturalproducts_depict_uri(
+                                    &entry.smiles,
+                                    card_width as u32,
+                                    card_height as u32,
+                                );
+                                self.ensure_depiction_request(
+                                    depict_uri.clone(),
+                                    depict_uri.clone(),
+                                );
+                                self.draw_depiction_widget(
+                                    ui,
+                                    &depict_uri,
+                                    egui::vec2(card_width, card_height),
+                                );
+                                if ui.link(&entry.display_label).clicked() {
+                                    self.set_single_selected_node(entry.node_id, true);
+                                }
+                                if entry.annotations.is_empty() {
+                                    ui.small("No additional structure metadata selected.");
+                                } else {
+                                    for (column, value) in &entry.annotations {
+                                        ui.add(
+                                            egui::Label::new(format!("{column}: {value}")).wrap(),
+                                        );
+                                    }
+                                }
+                            });
+                            ui.add_space(6.0);
+                        });
+                    }
+                });
+        });
     }
 
     fn node_attribute_coloring(
@@ -2648,17 +2663,19 @@ impl SpectralApp {
 
         if let Some(row) = selected_row_idx.and_then(|row_idx| table.row(row_idx)) {
             ui.collapsing("Selected node attributes", |ui| {
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    egui::Grid::new("selected_node_attr_grid")
-                        .striped(true)
-                        .show(ui, |ui| {
-                            for (col, value) in table.table.columns.iter().zip(row.iter()) {
-                                ui.label(col);
-                                ui.label(value);
-                                ui.end_row();
-                            }
-                        });
-                });
+                egui::ScrollArea::horizontal()
+                    .id_salt(format!("selected_node_attr_scroll_{panel_id_suffix}"))
+                    .show(ui, |ui| {
+                        egui::Grid::new(format!("selected_node_attr_grid_{panel_id_suffix}"))
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for (col, value) in table.table.columns.iter().zip(row.iter()) {
+                                    ui.label(col);
+                                    ui.label(value);
+                                    ui.end_row();
+                                }
+                            });
+                    });
             });
         }
 
@@ -2921,23 +2938,27 @@ impl SpectralApp {
                     ui.separator();
                     ui.label("Text columns shown under each depicted structure");
                     egui::ScrollArea::vertical()
+                        .id_salt("structure_caption_columns_scroll")
                         .max_height(140.0)
                         .show(ui, |ui| {
                             for (idx, col) in table.table.columns.iter().enumerate() {
                                 if Some(idx) == self.depict_smiles_column {
                                     continue;
                                 }
-                                let mut selected = self.structure_caption_columns.contains(&idx);
-                                if ui.checkbox(&mut selected, col).changed() {
-                                    if selected {
-                                        if !self.structure_caption_columns.contains(&idx) {
-                                            self.structure_caption_columns.push(idx);
+                                ui.push_id(idx, |ui| {
+                                    let mut selected =
+                                        self.structure_caption_columns.contains(&idx);
+                                    if ui.checkbox(&mut selected, col).changed() {
+                                        if selected {
+                                            if !self.structure_caption_columns.contains(&idx) {
+                                                self.structure_caption_columns.push(idx);
+                                            }
+                                        } else {
+                                            self.structure_caption_columns
+                                                .retain(|existing| *existing != idx);
                                         }
-                                    } else {
-                                        self.structure_caption_columns
-                                            .retain(|existing| *existing != idx);
                                     }
-                                }
+                                });
                             }
                         });
                     self.structure_caption_columns.sort_unstable();
@@ -3055,12 +3076,17 @@ impl SpectralApp {
                                             ui.separator();
                                             ui.small("Legend");
                                             egui::ScrollArea::vertical()
+                                                .id_salt("categorical_legend_scroll")
                                                 .max_height(180.0)
                                                 .show(ui, |ui| {
-                                                    for (category, color) in legend {
-                                                        ui.horizontal(|ui| {
-                                                            ui.colored_label(*color, "■");
-                                                            ui.label(category);
+                                                    for (idx, (category, color)) in
+                                                        legend.iter().enumerate()
+                                                    {
+                                                        ui.push_id(idx, |ui| {
+                                                            ui.horizontal(|ui| {
+                                                                ui.colored_label(*color, "■");
+                                                                ui.label(category);
+                                                            });
                                                         });
                                                     }
                                                 });
@@ -3797,7 +3823,7 @@ impl SpectralApp {
                     ui.small(format!("Rectangle-selected nodes: {filter_len}"));
                 }
                 ui.add_space(4.0);
-                self.draw_selected_structures_gallery(ui);
+                self.draw_selected_structures_gallery(ui, "selected_node_panel");
             }
         }
     }
@@ -4226,7 +4252,7 @@ impl eframe::App for SpectralApp {
                 .default_size(egui::vec2(920.0, 560.0))
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    self.draw_selected_structures_gallery(ui);
+                    self.draw_selected_structures_gallery(ui, "detached_window");
                 });
             if !open {
                 self.show_selection_structures_detached = false;
