@@ -1,8 +1,15 @@
+use std::collections::BTreeMap;
 use std::io::{BufRead, Cursor};
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc;
 
 use mass_spectrometry::prelude::{GenericSpectrum, SpectrumAlloc, SpectrumMut};
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ParseStats {
@@ -24,6 +31,7 @@ struct ParsedSpectrum {
     filename: Option<String>,
     source_scan_usi: Option<String>,
     featurelist_feature_id: Option<String>,
+    headers: BTreeMap<String, String>,
     precursor_mz: f64,
     peaks: Vec<(f64, f64)>,
 }
@@ -38,6 +46,7 @@ pub struct SpectrumMeta {
     pub filename: Option<String>,
     pub source_scan_usi: Option<String>,
     pub featurelist_feature_id: Option<String>,
+    pub headers: BTreeMap<String, String>,
     pub precursor_mz: f64,
     pub num_peaks: usize,
 }
@@ -54,6 +63,44 @@ pub struct LoadedSpectra {
     pub source_label: String,
     pub spectra: Vec<SpectrumRecord>,
     pub stats: ParseStats,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub enum NativeLoadMessage {
+    Finished(LoadedSpectra),
+    Failed(String),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub struct NativeLoadHandle {
+    total_bytes: u64,
+    processed_bytes: Arc<AtomicU64>,
+    accepted: Arc<AtomicUsize>,
+    ions_blocks: Arc<AtomicUsize>,
+    rx: mpsc::Receiver<NativeLoadMessage>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl NativeLoadHandle {
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    pub fn processed_bytes(&self) -> u64 {
+        self.processed_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::Relaxed)
+    }
+
+    pub fn ions_blocks(&self) -> usize {
+        self.ions_blocks.load(Ordering::Relaxed)
+    }
+
+    pub fn try_recv(&self) -> Option<NativeLoadMessage> {
+        self.rx.try_recv().ok()
+    }
 }
 
 pub fn load_mgf_path(
@@ -82,6 +129,76 @@ pub fn load_mgf_path(
         let _ = (path, min_peaks, max_peaks);
         Err("Path-based loading is unavailable on wasm; use upload instead".to_string())
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn start_native_mgf_load(
+    path: &Path,
+    min_peaks: usize,
+    max_peaks: usize,
+) -> Result<NativeLoadHandle, String> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let source_label = path.display().to_string();
+    let total_bytes = std::fs::metadata(path)
+        .map_err(|err| format!("cannot stat {}: {err}", path.display()))?
+        .len();
+    let file = File::open(path).map_err(|err| format!("cannot open {}: {err}", path.display()))?;
+    let processed_bytes = Arc::new(AtomicU64::new(0));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let ions_blocks = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = mpsc::channel();
+
+    let progress_bytes = Arc::clone(&processed_bytes);
+    let progress_accepted = Arc::clone(&accepted);
+    let progress_ions = Arc::clone(&ions_blocks);
+
+    std::thread::spawn(move || {
+        let reader = BufReader::new(file);
+        let (parsed, stats) = match parse_mgf_reader_local_with_progress(
+            reader,
+            min_peaks,
+            max_peaks,
+            |processed, stats| {
+                progress_bytes.store(processed.min(total_bytes), Ordering::Relaxed);
+                progress_accepted.store(stats.accepted, Ordering::Relaxed);
+                progress_ions.store(stats.ions_blocks, Ordering::Relaxed);
+            },
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = tx.send(NativeLoadMessage::Failed(err));
+                return;
+            }
+        };
+
+        let spectra = match to_records(parsed) {
+            Ok(spectra) => spectra,
+            Err(err) => {
+                let _ = tx.send(NativeLoadMessage::Failed(err));
+                return;
+            }
+        };
+
+        progress_bytes.store(total_bytes, Ordering::Relaxed);
+        progress_accepted.store(stats.accepted, Ordering::Relaxed);
+        progress_ions.store(stats.ions_blocks, Ordering::Relaxed);
+
+        let _ = tx.send(NativeLoadMessage::Finished(LoadedSpectra {
+            source_label,
+            spectra,
+            stats,
+        }));
+    });
+
+    Ok(NativeLoadHandle {
+        total_bytes,
+        processed_bytes,
+        accepted,
+        ions_blocks,
+        rx,
+    })
 }
 
 pub fn load_mgf_bytes(
@@ -137,6 +254,15 @@ fn parse_mgf_reader_local<R: BufRead>(
     min_peaks: usize,
     max_peaks: usize,
 ) -> Result<(Vec<ParsedSpectrum>, ParseStats), String> {
+    parse_mgf_reader_local_with_progress(reader, min_peaks, max_peaks, |_, _| {})
+}
+
+fn parse_mgf_reader_local_with_progress<R: BufRead, F: FnMut(u64, ParseStats)>(
+    mut reader: R,
+    min_peaks: usize,
+    max_peaks: usize,
+    mut on_progress: F,
+) -> Result<(Vec<ParsedSpectrum>, ParseStats), String> {
     let mut spectra = Vec::new();
     let mut stats = ParseStats::default();
     let mut name: Option<String> = None;
@@ -147,12 +273,22 @@ fn parse_mgf_reader_local<R: BufRead>(
     let mut source_scan_usi: Option<String> = None;
     let mut scans: Option<String> = None;
     let mut filename: Option<String> = None;
+    let mut headers = BTreeMap::new();
     let mut precursor_mz: Option<f64> = None;
     let mut peaks: Vec<(f64, f64)> = Vec::new();
     let mut in_ions = false;
+    let mut line = String::new();
+    let mut processed_bytes = 0_u64;
 
-    for line in reader.lines() {
-        let line = line.map_err(|err| format!("failed to read line: {err}"))?;
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|err| format!("failed to read line: {err}"))?;
+        if bytes_read == 0 {
+            break;
+        }
+        processed_bytes = processed_bytes.saturating_add(bytes_read as u64);
         let line = line.trim();
 
         if line == "BEGIN IONS" {
@@ -165,6 +301,7 @@ fn parse_mgf_reader_local<R: BufRead>(
             source_scan_usi = None;
             scans = None;
             filename = None;
+            headers.clear();
             precursor_mz = None;
             peaks.clear();
             in_ions = true;
@@ -192,7 +329,7 @@ fn parse_mgf_reader_local<R: BufRead>(
                     stats.dropped_too_many_peaks += 1;
                 }
                 (Some(raw_name), Some(pmz)) => {
-                    peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    peaks.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
                     if peaks.windows(2).any(|pair| pair[0].0 == pair[1].0) {
                         stats.dropped_duplicate_mz += 1;
                     } else {
@@ -203,6 +340,7 @@ fn parse_mgf_reader_local<R: BufRead>(
                             filename: filename.clone(),
                             source_scan_usi: source_scan_usi.clone(),
                             featurelist_feature_id: featurelist_feature_id.clone(),
+                            headers: headers.clone(),
                             precursor_mz: pmz,
                             peaks: std::mem::take(&mut peaks),
                         });
@@ -211,10 +349,12 @@ fn parse_mgf_reader_local<R: BufRead>(
                 }
             }
             in_ions = false;
+            on_progress(processed_bytes, stats);
         } else if in_ions {
             if let Some((key, val)) = line.split_once('=') {
                 let key = key.trim().to_uppercase();
                 let val = val.trim();
+                headers.insert(key.clone(), val.to_string());
                 match key.as_str() {
                     "NAME" => name = Some(val.to_string()),
                     "TITLE" => title = Some(val.to_string()),
@@ -234,10 +374,9 @@ fn parse_mgf_reader_local<R: BufRead>(
                     _ => {}
                 }
             } else if line.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2
-                    && let (Ok(mz), Ok(intensity)) =
-                        (parts[0].parse::<f64>(), parts[1].parse::<f64>())
+                let mut parts = line.split_whitespace();
+                if let (Some(mz), Some(intensity)) = (parts.next(), parts.next())
+                    && let (Ok(mz), Ok(intensity)) = (mz.parse::<f64>(), intensity.parse::<f64>())
                 {
                     if intensity > 0.0 {
                         peaks.push((mz, intensity));
@@ -249,6 +388,7 @@ fn parse_mgf_reader_local<R: BufRead>(
         }
     }
 
+    on_progress(processed_bytes, stats);
     Ok((spectra, stats))
 }
 
@@ -307,39 +447,111 @@ fn sanitize_name(raw_name: &str) -> String {
     }
 }
 
-fn to_records(parsed: Vec<ParsedSpectrum>) -> Result<Vec<SpectrumRecord>, String> {
-    let mut out = Vec::with_capacity(parsed.len());
-    for (idx, spec) in parsed.into_iter().enumerate() {
-        let mut spectrum =
-            GenericSpectrum::<f64, f64>::with_capacity(spec.precursor_mz, spec.peaks.len())
-                .map_err(|err| format!("failed to create spectrum capacity: {err:?}"))?;
-        for (mz, intensity) in &spec.peaks {
-            spectrum
-                .add_peak(*mz, *intensity)
-                .map_err(|err| format!("failed to add peak: {err:?}"))?;
-        }
-
-        let mut label = sanitize_name(&spec.raw_name);
-        if label.is_empty() {
-            label = format!("spectrum_{idx}");
-        }
-
-        out.push(SpectrumRecord {
-            meta: SpectrumMeta {
-                id: idx,
-                label,
-                raw_name: spec.raw_name,
-                feature_id: spec.feature_id,
-                scans: spec.scans,
-                filename: spec.filename,
-                source_scan_usi: spec.source_scan_usi,
-                featurelist_feature_id: spec.featurelist_feature_id,
-                precursor_mz: spec.precursor_mz,
-                num_peaks: spec.peaks.len(),
-            },
-            peaks: Arc::new(spec.peaks),
-            spectrum: Arc::new(spectrum),
-        });
+fn parsed_spectrum_to_record(idx: usize, spec: ParsedSpectrum) -> Result<SpectrumRecord, String> {
+    let mut spectrum =
+        GenericSpectrum::<f64, f64>::with_capacity(spec.precursor_mz, spec.peaks.len())
+            .map_err(|err| format!("failed to create spectrum capacity: {err:?}"))?;
+    for (mz, intensity) in &spec.peaks {
+        spectrum
+            .add_peak(*mz, *intensity)
+            .map_err(|err| format!("failed to add peak: {err:?}"))?;
     }
-    Ok(out)
+
+    let mut label = sanitize_name(&spec.raw_name);
+    if label.is_empty() {
+        label = format!("spectrum_{idx}");
+    }
+
+    Ok(SpectrumRecord {
+        meta: SpectrumMeta {
+            id: idx,
+            label,
+            raw_name: spec.raw_name,
+            feature_id: spec.feature_id,
+            scans: spec.scans,
+            filename: spec.filename,
+            source_scan_usi: spec.source_scan_usi,
+            featurelist_feature_id: spec.featurelist_feature_id,
+            headers: spec.headers,
+            precursor_mz: spec.precursor_mz,
+            num_peaks: spec.peaks.len(),
+        },
+        peaks: Arc::new(spec.peaks),
+        spectrum: Arc::new(spectrum),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn to_records(parsed: Vec<ParsedSpectrum>) -> Result<Vec<SpectrumRecord>, String> {
+    parsed
+        .into_par_iter()
+        .enumerate()
+        .map(|(idx, spec)| parsed_spectrum_to_record(idx, spec))
+        .collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn to_records(parsed: Vec<ParsedSpectrum>) -> Result<Vec<SpectrumRecord>, String> {
+    parsed
+        .into_iter()
+        .enumerate()
+        .map(|(idx, spec)| parsed_spectrum_to_record(idx, spec))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_mgf_bytes;
+
+    #[test]
+    fn preserves_arbitrary_headers_with_normalized_keys() {
+        let input = br#"
+BEGIN IONS
+name=Example
+Adduct=[M+H]+
+custom_field=abc
+PEPMASS=123.45
+10 100
+20 50
+END IONS
+"#;
+
+        let loaded = load_mgf_bytes("test.mgf", input, 2, 100).expect("mgf should parse");
+        let meta = &loaded.spectra[0].meta;
+        assert_eq!(meta.headers.get("NAME"), Some(&"Example".to_string()));
+        assert_eq!(meta.headers.get("ADDUCT"), Some(&"[M+H]+".to_string()));
+        assert_eq!(meta.headers.get("CUSTOM_FIELD"), Some(&"abc".to_string()));
+        assert_eq!(meta.headers.get("PEPMASS"), Some(&"123.45".to_string()));
+    }
+
+    #[test]
+    fn keeps_fixed_fields_alongside_headers() {
+        let input = br#"
+BEGIN IONS
+TITLE=Title A
+FEATURE_ID=feat-1
+FEATURELIST_FEATURE_ID=featlist-2
+SCANS=42
+FILENAME=file.mgf
+SOURCE_SCAN_USI=mzspec:abc
+PRECURSOR_MZ=321.0
+10 100
+20 50
+END IONS
+"#;
+
+        let loaded = load_mgf_bytes("test.mgf", input, 2, 100).expect("mgf should parse");
+        let meta = &loaded.spectra[0].meta;
+        assert_eq!(meta.raw_name, "Title A");
+        assert_eq!(meta.feature_id.as_deref(), Some("feat-1"));
+        assert_eq!(meta.featurelist_feature_id.as_deref(), Some("featlist-2"));
+        assert_eq!(meta.scans.as_deref(), Some("42"));
+        assert_eq!(meta.filename.as_deref(), Some("file.mgf"));
+        assert_eq!(meta.source_scan_usi.as_deref(), Some("mzspec:abc"));
+        assert_eq!(
+            meta.headers.get("FEATURELIST_FEATURE_ID"),
+            Some(&"featlist-2".to_string())
+        );
+        assert_eq!(meta.headers.get("PRECURSOR_MZ"), Some(&"321.0".to_string()));
+    }
 }

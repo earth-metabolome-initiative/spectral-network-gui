@@ -351,6 +351,7 @@ fn seeded_position(id: usize) -> [f32; 2] {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
 
     use crate::compute::PairScore;
@@ -369,6 +370,7 @@ mod tests {
             filename: None,
             source_scan_usi: None,
             featurelist_feature_id: None,
+            headers: BTreeMap::new(),
             precursor_mz: 100.0 + id as f64,
             num_peaks: 10,
         }

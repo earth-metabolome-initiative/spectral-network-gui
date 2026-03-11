@@ -4,6 +4,7 @@ pub mod compute;
 pub mod export;
 pub mod io;
 pub mod layout;
+pub mod metadata;
 pub mod network;
 pub mod render;
 
