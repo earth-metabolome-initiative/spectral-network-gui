@@ -135,8 +135,11 @@ impl TaxonomyLineage {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LotusBiosource {
+    pub compound_name: Option<String>,
     pub organism_name: String,
     pub organism_wikidata: Option<String>,
+    pub compound_wikidata: Option<String>,
+    pub reference_doi: Option<String>,
     pub lineage: TaxonomyLineage,
 }
 
@@ -224,6 +227,15 @@ impl LotusMetadataIndex {
         }
 
         best
+    }
+
+    pub fn occurrences_for_short_inchikey(
+        &self,
+        short_inchikey: &str,
+    ) -> Option<&[LotusBiosource]> {
+        self.by_short_inchikey
+            .get(short_inchikey)
+            .map(Vec::as_slice)
     }
 
     pub fn row_count(&self) -> usize {
@@ -342,6 +354,18 @@ fn parse_lotus_reader<R: Read>(
     let short_inchikey_idx = header_index(&headers, "structure_inchikey")?;
     let organism_name_idx = header_index(&headers, "organism_name")?;
     let organism_wikidata_idx = header_index(&headers, "organism_wikidata")?;
+    let compound_name_idx = optional_header_index_any(
+        &headers,
+        &[
+            "structure_nameTraditional",
+            "structure_name",
+            "compound_name",
+            "traditional_name",
+        ],
+    );
+    let compound_wikidata_idx =
+        optional_header_index_any(&headers, &["structure_wikidata", "compound_wikidata"]);
+    let reference_doi_idx = optional_header_index_any(&headers, &["reference_doi", "doi"]);
     let taxonomy_indices = TAXONOMY_COLUMN_NAMES
         .iter()
         .map(|name| header_index(&headers, name))
@@ -374,6 +398,21 @@ fn parse_lotus_reader<R: Read>(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
+        let compound_name = compound_name_idx
+            .and_then(|idx| record.get(idx))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let compound_wikidata = compound_wikidata_idx
+            .and_then(|idx| record.get(idx))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(normalized_qid);
+        let reference_doi = reference_doi_idx
+            .and_then(|idx| record.get(idx))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
 
         let mut rank_values: [Option<String>; 10] = Default::default();
         for (slot, idx) in rank_values.iter_mut().zip(taxonomy_indices.iter().copied()) {
@@ -385,8 +424,11 @@ fn parse_lotus_reader<R: Read>(
         }
         let lineage = TaxonomyLineage::from_rank_values(rank_values);
         let biosource = LotusBiosource {
+            compound_name,
             organism_name: organism_name.clone(),
             organism_wikidata: organism_wikidata.clone(),
+            compound_wikidata,
+            reference_doi,
             lineage: lineage.clone(),
         };
         by_short_inchikey
@@ -423,6 +465,15 @@ fn parse_lotus_reader<R: Read>(
         source_label: source_label.to_string(),
         index: Arc::new(index),
         stats,
+    })
+}
+
+fn optional_header_index_any(headers: &csv::StringRecord, targets: &[&str]) -> Option<usize> {
+    headers.iter().position(|header| {
+        let normalized = normalize_key(header);
+        targets
+            .iter()
+            .any(|target| normalized == normalize_key(target))
     })
 }
 
@@ -514,10 +565,10 @@ mod tests {
 
     fn sample_lotus() -> LoadedLotusMetadata {
         let csv = concat!(
-            "structure_inchikey,organism_wikidata,organism_name,organism_taxonomy_01domain,organism_taxonomy_02kingdom,organism_taxonomy_03phylum,organism_taxonomy_04class,organism_taxonomy_05order,organism_taxonomy_06family,organism_taxonomy_07tribe,organism_taxonomy_08genus,organism_taxonomy_09species,organism_taxonomy_10varietas\n",
-            "\"ABCDEFGHIJKLMN-AAAA\",http://www.wikidata.org/entity/Q1,\"Withania somnifera\",Eukaryota,Archaeplastida,Streptophyta,Magnoliopsida,Solanales,Solanaceae,NA,Withania,Withania somnifera,NA\n",
-            "\"ABCDEFGHIJKLMN-BBBB\",http://www.wikidata.org/entity/Q2,\"Withania coagulans\",Eukaryota,Archaeplastida,Streptophyta,Magnoliopsida,Solanales,Solanaceae,NA,Withania,Withania coagulans,NA\n",
-            "\"ZZZZZZZZZZZZZZ-CCCC\",http://www.wikidata.org/entity/Q3,\"Panax ginseng\",Eukaryota,Archaeplastida,Streptophyta,Magnoliopsida,Apiales,Araliaceae,NA,Panax,Panax ginseng,NA\n"
+            "structure_inchikey,structure_nameTraditional,structure_wikidata,reference_doi,organism_wikidata,organism_name,organism_taxonomy_01domain,organism_taxonomy_02kingdom,organism_taxonomy_03phylum,organism_taxonomy_04class,organism_taxonomy_05order,organism_taxonomy_06family,organism_taxonomy_07tribe,organism_taxonomy_08genus,organism_taxonomy_09species,organism_taxonomy_10varietas\n",
+            "\"ABCDEFGHIJKLMN-AAAA\",Withanolide A,http://www.wikidata.org/entity/Q100,10.1000/alpha,http://www.wikidata.org/entity/Q1,\"Withania somnifera\",Eukaryota,Archaeplastida,Streptophyta,Magnoliopsida,Solanales,Solanaceae,NA,Withania,Withania somnifera,NA\n",
+            "\"ABCDEFGHIJKLMN-BBBB\",Withanolide A,http://www.wikidata.org/entity/Q100,10.1000/beta,http://www.wikidata.org/entity/Q2,\"Withania coagulans\",Eukaryota,Archaeplastida,Streptophyta,Magnoliopsida,Solanales,Solanaceae,NA,Withania,Withania coagulans,NA\n",
+            "\"ZZZZZZZZZZZZZZ-CCCC\",Ginsenoside Rg1,http://www.wikidata.org/entity/Q200,10.1000/gamma,http://www.wikidata.org/entity/Q3,\"Panax ginseng\",Eukaryota,Archaeplastida,Streptophyta,Magnoliopsida,Apiales,Araliaceae,NA,Panax,Panax ginseng,NA\n"
         );
         load_lotus_bytes("lotus.csv", csv.as_bytes()).expect("lotus should parse")
     }
@@ -601,6 +652,25 @@ mod tests {
         assert_eq!(
             matched.matched_organism_name.as_deref(),
             Some("Withania somnifera")
+        );
+    }
+
+    #[test]
+    fn occurrences_keep_compound_qid_and_reference_doi() {
+        let loaded = sample_lotus();
+        let occurrences = loaded
+            .index
+            .occurrences_for_short_inchikey("ABCDEFGHIJKLMN")
+            .expect("occurrences");
+        assert_eq!(occurrences.len(), 2);
+        assert_eq!(
+            occurrences[0].compound_name.as_deref(),
+            Some("Withanolide A")
+        );
+        assert_eq!(occurrences[0].compound_wikidata.as_deref(), Some("Q100"));
+        assert_eq!(
+            occurrences[0].reference_doi.as_deref(),
+            Some("10.1000/alpha")
         );
     }
 

@@ -35,15 +35,20 @@ use crate::io::{LoadedSpectra, ParseStats, SpectrumMeta, SpectrumRecord};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::io::{NativeLoadHandle, NativeLoadMessage};
 use crate::layout::force_directed_layout;
-use crate::metadata::LoadedLotusMetadata;
 #[cfg(target_arch = "wasm32")]
 use crate::metadata::load_lotus_bytes;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::metadata::start_native_lotus_load;
+use crate::metadata::{LoadedLotusMetadata, TaxonomicRank, short_inchikey};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::metadata::{NativeLotusLoadHandle, NativeLotusLoadMessage};
 use crate::network::{ComponentSelection, SpectralNetwork, build_network};
 use crate::render::{GraphViewState, draw_network};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::search_exports::{
+    MergedSearchExportTable, SearchExportJobInput, SearchExportTable, default_search_export_alias,
+    merge_search_exports, parse_search_export_tsv,
+};
 
 const MIN_PEAKS: usize = 5;
 const MAX_PEAKS: usize = 1000;
@@ -66,6 +71,8 @@ struct UploadedFile {
 enum NodeAttrMatchField {
     NodeId,
     FeatureId,
+    FeaturelistFeatureId,
+    Scans,
     RawName,
     Label,
 }
@@ -75,6 +82,8 @@ impl NodeAttrMatchField {
         match self {
             Self::NodeId => "node_id",
             Self::FeatureId => "feature_id",
+            Self::FeaturelistFeatureId => "featurelist_feature_id",
+            Self::Scans => "scans",
             Self::RawName => "raw_name",
             Self::Label => "label",
         }
@@ -166,11 +175,122 @@ struct DepictImageState {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
 struct SelectedStructureEntry {
     node_id: usize,
+    feature_id: Option<String>,
     display_label: String,
     smiles: String,
     annotations: Vec<(String, String)>,
+    short_inchikey: Option<String>,
+    library_hits: Vec<StructureLibraryHit>,
+    matched_taxonomic_organism_name: Option<String>,
+    matched_taxonomic_organism_qid: Option<String>,
+    taxonomic_reranked: bool,
+    taxonomic_shared_rank: Option<TaxonomicRank>,
+    taxonomic_links: StructureTaxonomicLinks,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StructureLink {
+    label: String,
+    url: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StructureTaxonomicLinks {
+    compound: Option<StructureLink>,
+    organism: Option<StructureLink>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LotusOccurrenceSummary {
+    compound_name: Option<String>,
+    compound_qid: Option<String>,
+    taxon_name: String,
+    taxon_qid: Option<String>,
+    reference_doi: Option<String>,
+    additional_occurrences: usize,
+}
+
+#[derive(Clone, Debug)]
+struct StructureDisplayGroup<'a> {
+    representative: &'a SelectedStructureEntry,
+    entries: Vec<&'a SelectedStructureEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StructureLibraryHit {
+    alias: String,
+    prefix: String,
+    rank: Option<usize>,
+    present: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct LoadedSearchExportJob {
+    alias: String,
+    max_rank: usize,
+    table: SearchExportTable,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct ActiveMergedSearchExportInfo {
+    source_label: String,
+    row_count: usize,
+    library_aliases: Vec<String>,
+    library_prefixes: Vec<String>,
+    library_rank_maxima: Vec<usize>,
+    inferred_query_key: Option<SearchQueryKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructureSourceFilter {
+    Any,
+    OnlyFirst,
+    OnlySecond,
+    BothFirstSecond,
+}
+
+impl StructureSourceFilter {
+    fn label(self, aliases: Option<(&str, &str)>) -> String {
+        match (self, aliases) {
+            (Self::Any, _) => "any source".to_string(),
+            (Self::OnlyFirst, Some((first, _))) => format!("only {first}"),
+            (Self::OnlySecond, Some((_, second))) => format!("only {second}"),
+            (Self::BothFirstSecond, Some((first, second))) => format!("both {first} + {second}"),
+            (Self::OnlyFirst, None) => "only first".to_string(),
+            (Self::OnlySecond, None) => "only second".to_string(),
+            (Self::BothFirstSecond, None) => "both first + second".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructureTaxonomyFilter {
+    All,
+    RerankedOnly,
+    SharedRank(TaxonomicRank),
+}
+
+impl StructureTaxonomyFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all structures",
+            Self::RerankedOnly => "reranked only",
+            Self::SharedRank(rank) => rank.label(),
+        }
+    }
+
+    fn matches(self, entry: &SelectedStructureEntry) -> bool {
+        match self {
+            Self::All => true,
+            Self::RerankedOnly => entry.taxonomic_reranked,
+            Self::SharedRank(rank) => entry
+                .taxonomic_shared_rank
+                .is_some_and(|entry_rank| entry_rank.score() >= rank.score()),
+        }
+    }
 }
 
 struct MirrorSpectrumData<'a> {
@@ -189,6 +309,10 @@ pub struct SpectralApp {
     library_mgf_path: String,
     #[cfg(not(target_arch = "wasm32"))]
     lotus_csv_path: String,
+    #[cfg(not(target_arch = "wasm32"))]
+    loaded_search_export_jobs: Vec<LoadedSearchExportJob>,
+    #[cfg(not(target_arch = "wasm32"))]
+    active_merged_search_export: Option<ActiveMergedSearchExportInfo>,
     #[cfg(not(target_arch = "wasm32"))]
     query_load: Option<NativeLoadHandle>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -274,6 +398,11 @@ pub struct SpectralApp {
     show_selection_structures_detached: bool,
     selection_structures_limit: usize,
     selection_structures_image_height: f32,
+    selection_structures_taxonomy_filter: StructureTaxonomyFilter,
+    selection_structures_collapse_identical_hits: bool,
+    selection_structures_show_lotus_metadata: bool,
+    selection_structures_source_filter: StructureSourceFilter,
+    selection_structures_library_rank_limits: Vec<usize>,
     structure_caption_columns: Vec<usize>,
     selected_spectrum_peak: Option<(usize, f64, f64)>,
     spectrum_zoom_context: Option<SpectrumZoomContext>,
@@ -308,6 +437,10 @@ impl SpectralApp {
             #[cfg(not(target_arch = "wasm32"))]
             lotus_csv_path: DEFAULT_LOTUS_PATH.to_string(),
             #[cfg(not(target_arch = "wasm32"))]
+            loaded_search_export_jobs: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            active_merged_search_export: None,
+            #[cfg(not(target_arch = "wasm32"))]
             query_load: None,
             #[cfg(not(target_arch = "wasm32"))]
             library_load: None,
@@ -330,7 +463,7 @@ impl SpectralApp {
             pending_hide_singletons: true,
             search_metric: SimilarityMetric::default(),
             search_parent_mass_tolerance: 0.05,
-            search_min_matched_peaks: 3,
+            search_min_matched_peaks: 6,
             search_min_similarity_threshold: 0.7,
             search_top_n: 10,
             search_query_key: SearchQueryKey::FeatureId,
@@ -338,7 +471,7 @@ impl SpectralApp {
             search_taxonomic_query: String::new(),
             show_left_panel: true,
             show_right_panel: true,
-            threshold: 0.7,
+            threshold: 0.2,
             top_k: 10,
             hide_singletons: true,
             node_force: 1.0,
@@ -392,6 +525,11 @@ impl SpectralApp {
             show_selection_structures_detached: false,
             selection_structures_limit: 48,
             selection_structures_image_height: 260.0,
+            selection_structures_taxonomy_filter: StructureTaxonomyFilter::All,
+            selection_structures_collapse_identical_hits: false,
+            selection_structures_show_lotus_metadata: false,
+            selection_structures_source_filter: StructureSourceFilter::Any,
+            selection_structures_library_rank_limits: Vec::new(),
             structure_caption_columns: Vec::new(),
             selected_spectrum_peak: None,
             spectrum_zoom_context: None,
@@ -771,6 +909,28 @@ impl SpectralApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    fn set_node_attributes_table(
+        &mut self,
+        mut loaded: LoadedAttributeTable,
+        preferred_key_column: Option<&str>,
+        preferred_match_field: Option<NodeAttrMatchField>,
+    ) {
+        if let Some(column_name) = preferred_key_column
+            && let Some(idx) = loaded.table.columns.iter().position(|column| {
+                normalized_column_name(column) == normalized_column_name(column_name)
+            })
+        {
+            loaded.set_key_column(idx);
+        }
+        let column_names = loaded.table.columns.clone();
+        self.node_attributes = Some(loaded);
+        self.reset_node_attribute_table_state(&column_names);
+        if let Some(field) = preferred_match_field {
+            self.node_attr_match_field = field;
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn load_attributes_from_tsv(&mut self, source_label: String, text: &str, is_node: bool) {
         match AttributeTable::parse_tsv(text) {
             Ok(table) => {
@@ -778,9 +938,9 @@ impl SpectralApp {
                 let rows = loaded.table.rows.len();
                 let cols = loaded.table.columns.len();
                 if is_node {
-                    let column_names = loaded.table.columns.clone();
-                    self.node_attributes = Some(loaded);
-                    self.reset_node_attribute_table_state(&column_names);
+                    self.active_merged_search_export = None;
+                    self.selection_structures_library_rank_limits.clear();
+                    self.set_node_attributes_table(loaded, None, None);
                 } else {
                     self.edge_attributes = Some(loaded);
                 }
@@ -800,6 +960,118 @@ impl SpectralApp {
                 ));
             }
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_search_export_from_tsv(&mut self, source_label: String, text: &str) {
+        match parse_search_export_tsv(&source_label, text) {
+            Ok(table) => {
+                let max_rank = table
+                    .rows
+                    .iter()
+                    .map(|row| row.hit_rank)
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+                let alias = default_search_export_alias(&source_label);
+                let row_count = table.rows.len();
+                let inferred = table
+                    .inferred_query_key
+                    .map(SearchQueryKey::label)
+                    .unwrap_or("unknown");
+                self.loaded_search_export_jobs.push(LoadedSearchExportJob {
+                    alias: alias.clone(),
+                    max_rank,
+                    table,
+                });
+                self.status_message = Some(format!(
+                    "Loaded search export TSV: {row_count} rows from {source_label} (alias={alias}, query key={inferred})"
+                ));
+                self.error_message = None;
+            }
+            Err(err) => {
+                self.error_message = Some(err);
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pick_and_load_search_export(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("TSV", &["tsv", "txt"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                self.load_search_export_from_tsv(path.display().to_string(), &content);
+            }
+            Err(err) => {
+                self.error_message = Some(format!(
+                    "Failed to read search export TSV {}: {err}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn apply_merged_search_exports_to_node_attributes(&mut self) {
+        let job_inputs = self
+            .loaded_search_export_jobs
+            .iter()
+            .map(|job| SearchExportJobInput {
+                alias: job.alias.as_str(),
+                max_rank: job.max_rank,
+                table: &job.table,
+            })
+            .collect::<Vec<_>>();
+        let merged = match merge_search_exports(&job_inputs) {
+            Ok(merged) => merged,
+            Err(err) => {
+                self.error_message = Some(err);
+                return;
+            }
+        };
+        self.activate_merged_search_export_table(merged);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn activate_merged_search_export_table(&mut self, merged: MergedSearchExportTable) {
+        let preferred = merged
+            .inferred_query_key
+            .and_then(preferred_node_attribute_mapping_for_search_query_key);
+        let source_label = format!(
+            "merged_search_exports__{}",
+            merged.library_aliases.join("__")
+        );
+        let row_count = merged.table.rows.len();
+        let library_rank_maxima =
+            merged_table_library_rank_maxima(&merged.table, &merged.library_prefixes);
+        let loaded = LoadedAttributeTable::new(source_label.clone(), merged.table);
+        self.set_node_attributes_table(
+            loaded,
+            preferred.map(|(column, _)| column),
+            preferred.map(|(_, field)| field),
+        );
+        self.selection_structures_source_filter = StructureSourceFilter::Any;
+        self.selection_structures_library_rank_limits = library_rank_maxima.clone();
+        self.active_merged_search_export = Some(ActiveMergedSearchExportInfo {
+            source_label: source_label.clone(),
+            row_count,
+            library_aliases: merged.library_aliases.clone(),
+            library_prefixes: merged.library_prefixes.clone(),
+            library_rank_maxima,
+            inferred_query_key: merged.inferred_query_key,
+        });
+        self.show_node_attributes_panel = true;
+        self.status_message = Some(format!(
+            "Applied merged search exports: {row_count} consistent row(s) across {}",
+            merged.library_aliases.join(", ")
+        ));
+        self.error_message = None;
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1663,21 +1935,10 @@ impl SpectralApp {
         match self.node_attr_match_field {
             NodeAttrMatchField::NodeId => Some(node.id.to_string()),
             NodeAttrMatchField::FeatureId => node.feature_id.clone(),
+            NodeAttrMatchField::FeaturelistFeatureId => node.featurelist_feature_id.clone(),
+            NodeAttrMatchField::Scans => node.scans.clone(),
             NodeAttrMatchField::RawName => Some(node.raw_name.clone()),
             NodeAttrMatchField::Label => Some(node.label.clone()),
-        }
-    }
-
-    fn selected_node_smiles(&self, node: &crate::network::NetworkNode) -> Option<String> {
-        let table = self.node_attributes.as_ref()?;
-        let smiles_col_idx = self.depict_smiles_column?;
-        let key = self.node_attribute_key_for_node(node)?;
-        let row = table.find_row(&key)?;
-        let smiles = row.get(smiles_col_idx)?.trim();
-        if smiles.is_empty() {
-            None
-        } else {
-            Some(smiles.to_string())
         }
     }
 
@@ -2770,12 +3031,6 @@ impl SpectralApp {
         let Some(network) = self.network.as_ref() else {
             return Vec::new();
         };
-        let Some(table) = self.node_attributes.as_ref() else {
-            return Vec::new();
-        };
-        let Some(smiles_col_idx) = self.depict_smiles_column else {
-            return Vec::new();
-        };
         let Some(filter) = self.table_node_filter.as_ref() else {
             return Vec::new();
         };
@@ -2790,40 +3045,131 @@ impl SpectralApp {
             .into_iter()
             .filter_map(|node_id| {
                 let node = node_by_id.get(&node_id)?;
-                let key = self.node_attribute_key_for_node(node)?;
-                let row = table.find_row(&key)?;
-                let smiles = row.get(smiles_col_idx)?.trim();
-                if smiles.is_empty() {
-                    return None;
-                }
-                let display_label = node
-                    .feature_id
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| node.label.clone());
-                let annotations = self
-                    .structure_caption_columns
-                    .iter()
-                    .filter_map(|idx| {
-                        let col_name = table.table.columns.get(*idx)?;
-                        let value = row.get(*idx)?.trim();
-                        if value.is_empty() {
-                            None
-                        } else {
-                            Some((col_name.clone(), value.to_string()))
-                        }
+                self.selected_structure_entry_for_node(node)
+                    .map(|mut entry| {
+                        entry.node_id = node_id;
+                        entry
                     })
-                    .collect();
-                Some(SelectedStructureEntry {
-                    node_id,
-                    display_label,
-                    smiles: smiles.to_string(),
-                    annotations,
-                })
             })
             .collect()
+    }
+
+    fn selected_structure_entry_for_node(
+        &self,
+        node: &crate::network::NetworkNode,
+    ) -> Option<SelectedStructureEntry> {
+        let table = self.node_attributes.as_ref()?;
+        let smiles_col_idx = self.depict_smiles_column?;
+        let key = self.node_attribute_key_for_node(node)?;
+        let row = table.find_row(&key)?;
+        let smiles = row.get(smiles_col_idx)?.trim();
+        if smiles.is_empty() {
+            return None;
+        }
+        let display_label = node
+            .feature_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| node.label.clone());
+        let annotations = self
+            .structure_caption_columns
+            .iter()
+            .filter_map(|idx| {
+                let col_name = table.table.columns.get(*idx)?;
+                let value = row.get(*idx)?.trim();
+                if value.is_empty() {
+                    None
+                } else {
+                    Some((col_name.clone(), value.to_string()))
+                }
+            })
+            .collect();
+        let library_hits = selected_structure_library_hits(
+            &table.table.columns,
+            row,
+            self.active_merged_search_export.as_ref(),
+        );
+        let taxonomic_metadata = selected_structure_taxonomic_metadata(&table.table.columns, row);
+        let matched_taxonomic_organism_name =
+            selected_structure_matched_taxonomic_organism_name(&table.table.columns, row);
+        let matched_taxonomic_organism_qid =
+            selected_structure_matched_taxonomic_organism_qid(&table.table.columns, row);
+        Some(SelectedStructureEntry {
+            node_id: node.id,
+            feature_id: node
+                .feature_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            display_label,
+            smiles: smiles.to_string(),
+            annotations,
+            short_inchikey: selected_structure_short_inchikey(&table.table.columns, row),
+            library_hits,
+            matched_taxonomic_organism_name,
+            matched_taxonomic_organism_qid,
+            taxonomic_reranked: taxonomic_metadata.reranked,
+            taxonomic_shared_rank: taxonomic_metadata.shared_rank,
+            taxonomic_links: taxonomic_metadata.links,
+        })
+    }
+
+    fn structure_display_groups<'a>(
+        &self,
+        entries: &'a [&'a SelectedStructureEntry],
+    ) -> Vec<StructureDisplayGroup<'a>> {
+        build_structure_display_groups(entries, self.selection_structures_collapse_identical_hits)
+    }
+
+    fn merged_source_alias_pair(&self) -> Option<(&str, &str)> {
+        let active = self.active_merged_search_export.as_ref()?;
+        if active.library_aliases.len() < 2 {
+            return None;
+        }
+        Some((&active.library_aliases[0], &active.library_aliases[1]))
+    }
+
+    fn lotus_occurrence_summary_for_entry(
+        &self,
+        entry: &SelectedStructureEntry,
+    ) -> Option<LotusOccurrenceSummary> {
+        let short = entry.short_inchikey.as_deref()?;
+        let loaded = self.lotus_metadata.as_ref()?;
+        let occurrences = loaded.index.occurrences_for_short_inchikey(short)?;
+        let representative = occurrences
+            .iter()
+            .filter(|occurrence| occurrence_matches_reranked_taxon(entry, occurrence))
+            .max_by_key(|occurrence| {
+                (
+                    occurrence.reference_doi.is_some(),
+                    occurrence.compound_wikidata.is_some(),
+                    occurrence.compound_name.is_some(),
+                )
+            })
+            .or_else(|| {
+                occurrences.iter().max_by_key(|occurrence| {
+                    (
+                        occurrence.reference_doi.is_some(),
+                        occurrence.compound_wikidata.is_some(),
+                        occurrence.compound_name.is_some(),
+                    )
+                })
+            })
+            .or_else(|| occurrences.first())?;
+        Some(LotusOccurrenceSummary {
+            compound_name: representative.compound_name.clone(),
+            compound_qid: representative.compound_wikidata.clone(),
+            taxon_name: representative.organism_name.clone(),
+            taxon_qid: representative
+                .organism_wikidata
+                .as_deref()
+                .and_then(normalize_qid),
+            reference_doi: representative.reference_doi.clone(),
+            additional_occurrences: occurrences.len().saturating_sub(1),
+        })
     }
 
     fn draw_selected_structures_gallery(&mut self, ui: &mut egui::Ui, id_suffix: &str) {
@@ -2841,7 +3187,96 @@ impl SpectralApp {
                         .range(140.0..=700.0)
                         .speed(1.0),
                 );
+                ui.label("Taxa filter");
+                egui::ComboBox::from_id_salt(("selection_structures_taxonomy_filter", id_suffix))
+                    .selected_text(self.selection_structures_taxonomy_filter.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.selection_structures_taxonomy_filter,
+                            StructureTaxonomyFilter::All,
+                            StructureTaxonomyFilter::All.label(),
+                        );
+                        ui.selectable_value(
+                            &mut self.selection_structures_taxonomy_filter,
+                            StructureTaxonomyFilter::RerankedOnly,
+                            StructureTaxonomyFilter::RerankedOnly.label(),
+                        );
+                        for rank in TaxonomicRank::ALL {
+                            ui.selectable_value(
+                                &mut self.selection_structures_taxonomy_filter,
+                                StructureTaxonomyFilter::SharedRank(rank),
+                                rank.label(),
+                            );
+                        }
+                    });
+                ui.checkbox(
+                    &mut self.selection_structures_show_lotus_metadata,
+                    "Display LOTUS metadata",
+                );
+                ui.checkbox(
+                    &mut self.selection_structures_collapse_identical_hits,
+                    "Collapse identical hits",
+                );
+                let merged_source_alias_pair = self
+                    .merged_source_alias_pair()
+                    .map(|(first, second)| (first.to_string(), second.to_string()));
+                if merged_source_alias_pair.is_some() {
+                    egui::ComboBox::from_id_salt(("selection_structures_source_filter", id_suffix))
+                        .selected_text(
+                            self.selection_structures_source_filter
+                                .label(
+                                    merged_source_alias_pair
+                                        .as_ref()
+                                        .map(|(first, second)| {
+                                            (first.as_str(), second.as_str())
+                                        }),
+                                ),
+                        )
+                        .show_ui(ui, |ui| {
+                            for filter in [
+                                StructureSourceFilter::Any,
+                                StructureSourceFilter::OnlyFirst,
+                                StructureSourceFilter::OnlySecond,
+                                StructureSourceFilter::BothFirstSecond,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.selection_structures_source_filter,
+                                    filter,
+                                    filter.label(
+                                        merged_source_alias_pair
+                                            .as_ref()
+                                            .map(|(first, second)| {
+                                                (first.as_str(), second.as_str())
+                                            }),
+                                    ),
+                                );
+                            }
+                        });
+                }
             });
+            if let Some(rank_controls) = self.active_merged_search_export.as_ref().map(|active| {
+                active
+                    .library_aliases
+                    .iter()
+                    .cloned()
+                    .zip(active.library_rank_maxima.iter().copied())
+                    .collect::<Vec<_>>()
+            }) {
+                if self.selection_structures_library_rank_limits.len() != rank_controls.len() {
+                    self.selection_structures_library_rank_limits =
+                        rank_controls.iter().map(|(_, max_rank)| *max_rank).collect();
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.small("Per-library max displayed rank:");
+                    for (idx, (alias, max_rank)) in rank_controls.iter().enumerate() {
+                        if let Some(limit) = self.selection_structures_library_rank_limits.get_mut(idx)
+                        {
+                            ui.label(alias);
+                            ui.add(egui::Slider::new(limit, 1..=*max_rank).text("topN"));
+                        }
+                    }
+                });
+            }
             if self.table_node_filter.is_none() {
                 ui.small("Use rectangle selection on the graph to choose nodes.");
                 return;
@@ -2850,6 +3285,9 @@ impl SpectralApp {
                 ui.small("Select a SMILES column in the left panel.");
                 return;
             }
+            if self.selection_structures_show_lotus_metadata && self.lotus_metadata.is_none() {
+                ui.small("Load LOTUS metadata to display LOTUS occurrence summaries.");
+            }
 
             let selected_structures = self.selected_structures_from_node_selection();
             if selected_structures.is_empty() {
@@ -2857,17 +3295,53 @@ impl SpectralApp {
                 return;
             }
 
-            let max_items = self.selection_structures_limit.max(1);
-            let structures: Vec<&SelectedStructureEntry> =
-                selected_structures.iter().take(max_items).collect();
-            if selected_structures.len() > structures.len() {
+            let taxonomy_filtered_structures: Vec<&SelectedStructureEntry> = selected_structures
+                .iter()
+                .filter(|entry| self.selection_structures_taxonomy_filter.matches(entry))
+                .collect();
+            if taxonomy_filtered_structures.is_empty() {
                 ui.small(format!(
-                    "Showing {} / {} structures (increase Max structures to show more).",
-                    structures.len(),
-                    selected_structures.len()
+                    "No structures matched the '{}' taxonomic filter.",
+                    self.selection_structures_taxonomy_filter.label()
+                ));
+                return;
+            }
+
+            let grouped_structures = self.structure_display_groups(&taxonomy_filtered_structures);
+            let filtered_groups: Vec<(&StructureDisplayGroup<'_>, Vec<StructureLibraryHit>)> =
+                grouped_structures
+                    .iter()
+                    .filter_map(|group| {
+                        let library_hits = merged_structure_library_hits(&group.entries);
+                        structure_matches_source_filter(
+                            &library_hits,
+                            &self.selection_structures_library_rank_limits,
+                            self.selection_structures_source_filter,
+                            self.active_merged_search_export.as_ref(),
+                        )
+                        .then_some((group, library_hits))
+                    })
+                    .collect();
+            if filtered_groups.is_empty() {
+                ui.small(format!(
+                    "No structures matched the '{}' taxonomic filter and '{}' source filter.",
+                    self.selection_structures_taxonomy_filter.label(),
+                    self.selection_structures_source_filter
+                        .label(self.merged_source_alias_pair())
+                ));
+                return;
+            }
+
+            let max_items = self.selection_structures_limit.max(1);
+            let groups = filtered_groups.iter().take(max_items).collect::<Vec<_>>();
+            if filtered_groups.len() > groups.len() {
+                ui.small(format!(
+                    "Showing {} / {} structure groups (increase Max structures to show more).",
+                    groups.len(),
+                    filtered_groups.len()
                 ));
             } else {
-                ui.small(format!("Showing {} structures.", structures.len()));
+                ui.small(format!("Showing {} structure groups.", groups.len()));
             }
 
             let gallery_height = ui.available_height().max(260.0);
@@ -2875,7 +3349,8 @@ impl SpectralApp {
                 .id_salt(("selected_structures_gallery_scroll", id_suffix))
                 .max_height(gallery_height)
                 .show(ui, |ui| {
-                    for entry in structures {
+                    for (group, library_hits) in groups {
+                        let entry = group.representative;
                         ui.push_id(entry.node_id, |ui| {
                             ui.group(|ui| {
                                 let card_width = ui.available_width().max(260.0);
@@ -2898,6 +3373,35 @@ impl SpectralApp {
                                 if ui.link(&entry.display_label).clicked() {
                                     self.set_single_selected_node(entry.node_id, true);
                                 }
+                                draw_structure_library_hits(ui, &library_hits);
+                                if self.selection_structures_collapse_identical_hits {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.small("Feature IDs:");
+                                        let mut shown_any = false;
+                                        for grouped_entry in &group.entries {
+                                            let label = grouped_entry
+                                                .feature_id
+                                                .as_deref()
+                                                .unwrap_or(&grouped_entry.display_label);
+                                            if ui.link(label).clicked() {
+                                                self.set_single_selected_node(
+                                                    grouped_entry.node_id,
+                                                    true,
+                                                );
+                                            }
+                                            shown_any = true;
+                                        }
+                                        if !shown_any {
+                                            ui.small("n/a");
+                                        }
+                                    });
+                                    if group.entries.len() > 1 {
+                                        ui.small(format!(
+                                            "{} identical hits collapsed.",
+                                            group.entries.len()
+                                        ));
+                                    }
+                                }
                                 if entry.annotations.is_empty() {
                                     ui.small("No additional structure metadata selected.");
                                 } else {
@@ -2905,6 +3409,69 @@ impl SpectralApp {
                                         ui.add(
                                             egui::Label::new(format!("{column}: {value}")).wrap(),
                                         );
+                                    }
+                                }
+                                if entry.taxonomic_reranked
+                                    && !self.selection_structures_show_lotus_metadata
+                                {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.small("Taxonomic links:");
+                                        if let Some(link) = &entry.taxonomic_links.compound {
+                                            ui.small("compound");
+                                            ui.hyperlink_to(&link.label, &link.url);
+                                        }
+                                        if let Some(link) = &entry.taxonomic_links.organism {
+                                            ui.small("organism");
+                                            ui.hyperlink_to(&link.label, &link.url);
+                                        }
+                                    });
+                                    if let Some(rank) = entry.taxonomic_shared_rank {
+                                        ui.small(format!(
+                                            "Taxonomic reranking matched at {} level.",
+                                            rank.label()
+                                        ));
+                                    }
+                                }
+                                if self.selection_structures_show_lotus_metadata {
+                                    if let Some(summary) =
+                                        self.lotus_occurrence_summary_for_entry(entry)
+                                    {
+                                        ui.horizontal_wrapped(|ui| {
+                                            let compound_label = summary
+                                                .compound_name
+                                                .as_deref()
+                                                .or(summary.compound_qid.as_deref())
+                                                .unwrap_or("Compound");
+                                            if let Some(qid) = summary.compound_qid.as_deref() {
+                                                ui.hyperlink_to(compound_label, wikidata_entity_url(qid));
+                                            } else {
+                                                ui.small(compound_label);
+                                            }
+                                            ui.small("is found in");
+                                            if let Some(qid) = summary.taxon_qid.as_deref() {
+                                                ui.hyperlink_to(&summary.taxon_name, wikidata_entity_url(qid));
+                                            } else {
+                                                ui.small(&summary.taxon_name);
+                                            }
+                                            if let Some(doi) = summary.reference_doi.as_deref() {
+                                                ui.small("according to");
+                                                ui.hyperlink_to(
+                                                    doi,
+                                                    format!(
+                                                        "https://doi.org/{}",
+                                                        url_encode_component(doi)
+                                                    ),
+                                                );
+                                            }
+                                        });
+                                        if summary.additional_occurrences > 0 {
+                                            ui.small(format!(
+                                                "{} other occurrence(s) are described in LOTUS.",
+                                                summary.additional_occurrences
+                                            ));
+                                        }
+                                    } else {
+                                        ui.small("No LOTUS occurrence metadata found for this structure.");
                                     }
                                 }
                             });
@@ -3078,6 +3645,16 @@ impl SpectralApp {
                                 node_attr_match_field,
                                 NodeAttrMatchField::FeatureId,
                                 NodeAttrMatchField::FeatureId.label(),
+                            );
+                            ui.selectable_value(
+                                node_attr_match_field,
+                                NodeAttrMatchField::FeaturelistFeatureId,
+                                NodeAttrMatchField::FeaturelistFeatureId.label(),
+                            );
+                            ui.selectable_value(
+                                node_attr_match_field,
+                                NodeAttrMatchField::Scans,
+                                NodeAttrMatchField::Scans.label(),
                             );
                             ui.selectable_value(
                                 node_attr_match_field,
@@ -3690,6 +4267,86 @@ impl SpectralApp {
                     }
                     if ui.button("Load edge attributes TSV").clicked() {
                         self.pick_and_load_attributes(false);
+                    }
+                });
+
+                ui.separator();
+                ui.group(|ui| {
+                    ui.label("Merged Search TSV");
+                    ui.horizontal(|ui| {
+                        if ui.button("Load search export TSV").clicked() {
+                            self.pick_and_load_search_export();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.loaded_search_export_jobs.len() >= 2,
+                                egui::Button::new("Apply merged table"),
+                            )
+                            .clicked()
+                        {
+                            self.apply_merged_search_exports_to_node_attributes();
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.loaded_search_export_jobs.is_empty(),
+                                egui::Button::new("Clear loaded exports"),
+                            )
+                            .clicked()
+                        {
+                            self.loaded_search_export_jobs.clear();
+                            self.active_merged_search_export = None;
+                            self.selection_structures_library_rank_limits.clear();
+                        }
+                    });
+
+                    if self.loaded_search_export_jobs.is_empty() {
+                        ui.small("No search export TSVs loaded.");
+                    } else {
+                        let mut remove_idx: Option<usize> = None;
+                        for (idx, job) in self.loaded_search_export_jobs.iter_mut().enumerate() {
+                            ui.push_id(("search_export_job", idx), |ui| {
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.label("Alias");
+                                    ui.text_edit_singleline(&mut job.alias);
+                                    ui.label("Max rank");
+                                    ui.add(
+                                        egui::DragValue::new(&mut job.max_rank)
+                                            .range(1..=500)
+                                            .speed(1.0),
+                                    );
+                                    if ui.button("Remove").clicked() {
+                                        remove_idx = Some(idx);
+                                    }
+                                });
+                                ui.small(format!(
+                                    "{} | rows={} | inferred query key={}",
+                                    job.table.source_label,
+                                    job.table.rows.len(),
+                                    job.table
+                                        .inferred_query_key
+                                        .map(SearchQueryKey::label)
+                                        .unwrap_or("unknown")
+                                ));
+                            });
+                        }
+                        if let Some(idx) = remove_idx {
+                            self.loaded_search_export_jobs.remove(idx);
+                        }
+                    }
+
+                    if let Some(active) = &self.active_merged_search_export {
+                        ui.separator();
+                        ui.small(format!(
+                            "Active merged table: {} rows across {} | source={} | query key={}",
+                            active.row_count,
+                            active.library_aliases.join(", "),
+                            active.source_label,
+                            active
+                                .inferred_query_key
+                                .map(SearchQueryKey::label)
+                                .unwrap_or("unknown")
+                        ));
                     }
                 });
             }
@@ -4601,7 +5258,7 @@ impl SpectralApp {
                     ui.small("Select a visible node to depict its structure.");
                     return;
                 };
-                let Some(smiles) = self.selected_node_smiles(node) else {
+                let Some(entry) = self.selected_structure_entry_for_node(node) else {
                     ui.small(format!(
                         "No SMILES found for this node using column '{col_name}'."
                     ));
@@ -4609,13 +5266,36 @@ impl SpectralApp {
                 };
 
                 ui.small(format!("SMILES column: {col_name}"));
-                ui.small(format!("SMILES: {smiles}"));
+                ui.small(format!("SMILES: {}", entry.smiles));
                 let img_width = ui.available_width().clamp(180.0, 480.0);
                 let img_height = (img_width * 0.7).clamp(120.0, 360.0);
                 let depict_uri =
-                    naturalproducts_depict_uri(&smiles, img_width as u32, img_height as u32);
+                    naturalproducts_depict_uri(&entry.smiles, img_width as u32, img_height as u32);
                 self.ensure_depiction_request(depict_uri.clone(), depict_uri.clone());
                 self.draw_depiction_widget(ui, &depict_uri, egui::vec2(img_width, img_height));
+                draw_structure_library_hits(ui, &entry.library_hits);
+                for (column, value) in &entry.annotations {
+                    ui.add(egui::Label::new(format!("{column}: {value}")).wrap());
+                }
+                if entry.taxonomic_reranked {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.small("Taxonomic links:");
+                        if let Some(link) = &entry.taxonomic_links.compound {
+                            ui.small("compound");
+                            ui.hyperlink_to(&link.label, &link.url);
+                        }
+                        if let Some(link) = &entry.taxonomic_links.organism {
+                            ui.small("organism");
+                            ui.hyperlink_to(&link.label, &link.url);
+                        }
+                    });
+                    if let Some(rank) = entry.taxonomic_shared_rank {
+                        ui.small(format!(
+                            "Taxonomic reranking matched at {} level.",
+                            rank.label()
+                        ));
+                    }
+                }
                 ui.hyperlink_to("Open structure in browser", depict_uri);
             }
             StructurePanelMode::SelectedSet => {
@@ -4679,7 +5359,7 @@ fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 fn naturalproducts_depict_uri(smiles: &str, width: u32, height: u32) -> String {
     let encoded_smiles = urlencoding::encode(smiles);
     format!(
-        "https://api.naturalproducts.net/latest/depict/2D_enhanced?smiles={encoded_smiles}&width={width}&height={height}&style=bow&zoom=2.2&abbreviate=off"
+        "https://api.naturalproducts.net/latest/depict/2D_enhanced?smiles={encoded_smiles}&width={width}&height={height}&style=cow&zoom=2.2&abbreviate=off"
     )
 }
 
@@ -4933,6 +5613,474 @@ fn download_text_file(filename: &str, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SelectedStructureTaxonomicMetadata {
+    reranked: bool,
+    shared_rank: Option<TaxonomicRank>,
+    links: StructureTaxonomicLinks,
+}
+
+fn selected_structure_taxonomic_metadata(
+    columns: &[String],
+    row: &[String],
+) -> SelectedStructureTaxonomicMetadata {
+    let mut shared_rank: Option<TaxonomicRank> = None;
+    let mut taxonomic_score: f64 = 0.0;
+    for (idx, column) in columns.iter().enumerate() {
+        let normalized = normalized_column_name(column);
+        let Some(value) = row
+            .get(idx)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        if normalized == "hittaxonomicsharedrank" || normalized.ends_with("taxonomicsharedrank") {
+            if let Some(candidate_rank) = parse_taxonomic_rank(value) {
+                shared_rank = match shared_rank {
+                    Some(current) if current.score() >= candidate_rank.score() => Some(current),
+                    _ => Some(candidate_rank),
+                };
+            }
+        }
+
+        if (normalized == "hittaxonomicscore" || normalized.ends_with("taxonomicscore"))
+            && let Ok(candidate_score) = value.parse::<f64>()
+        {
+            taxonomic_score = taxonomic_score.max(candidate_score);
+        }
+    }
+    let reranked = shared_rank.is_some() || taxonomic_score > 0.0;
+    if !reranked {
+        return SelectedStructureTaxonomicMetadata::default();
+    }
+
+    let compound = compound_link_from_row(columns, row);
+    let organism = organism_link_from_row(columns, row);
+
+    SelectedStructureTaxonomicMetadata {
+        reranked,
+        shared_rank,
+        links: StructureTaxonomicLinks { compound, organism },
+    }
+}
+
+fn selected_structure_short_inchikey(columns: &[String], row: &[String]) -> Option<String> {
+    let mut best: Option<(usize, String)> = None;
+    for (idx, column) in columns.iter().enumerate() {
+        let normalized = normalized_column_name(column);
+        let priority = if normalized == "structureshortinchikey" {
+            0
+        } else if normalized == "ik2d" {
+            1
+        } else if normalized == "structureinchikey" || normalized == "gnpsinchikey" {
+            2
+        } else if normalized.ends_with("taxonomicshortinchikey")
+            || normalized.contains("shortinchikey")
+        {
+            3
+        } else if normalized.contains("inchikey") {
+            4
+        } else {
+            continue;
+        };
+        let Some(value) = row.get(idx) else {
+            continue;
+        };
+        let Some(short) = short_inchikey(value) else {
+            continue;
+        };
+        match &best {
+            Some((best_priority, _)) if *best_priority <= priority => {}
+            _ => best = Some((priority, short)),
+        }
+    }
+    best.map(|(_, short)| short)
+}
+
+fn selected_structure_matched_taxonomic_organism_name(
+    columns: &[String],
+    row: &[String],
+) -> Option<String> {
+    find_row_value(columns, row, |normalized| {
+        normalized == "hittaxonomicorganismname" || normalized.ends_with("taxonomicorganismname")
+    })
+    .map(str::to_string)
+}
+
+fn selected_structure_matched_taxonomic_organism_qid(
+    columns: &[String],
+    row: &[String],
+) -> Option<String> {
+    find_row_value(columns, row, |normalized| {
+        normalized == "hittaxonomicorganismwikidata"
+            || normalized.ends_with("taxonomicorganismwikidata")
+    })
+    .and_then(normalize_qid)
+}
+
+fn occurrence_matches_reranked_taxon(
+    entry: &SelectedStructureEntry,
+    occurrence: &crate::metadata::LotusBiosource,
+) -> bool {
+    if let Some(expected_qid) = entry.matched_taxonomic_organism_qid.as_deref() {
+        if occurrence
+            .organism_wikidata
+            .as_deref()
+            .and_then(normalize_qid)
+            .as_deref()
+            == Some(expected_qid)
+        {
+            return true;
+        }
+    }
+    if let Some(expected_name) = entry.matched_taxonomic_organism_name.as_deref() {
+        if occurrence.organism_name == expected_name {
+            return true;
+        }
+    }
+    false
+}
+
+fn selected_structure_library_hits(
+    columns: &[String],
+    row: &[String],
+    active_merged: Option<&ActiveMergedSearchExportInfo>,
+) -> Vec<StructureLibraryHit> {
+    let Some(active_merged) = active_merged else {
+        return Vec::new();
+    };
+    active_merged
+        .library_aliases
+        .iter()
+        .zip(active_merged.library_prefixes.iter())
+        .map(|(alias, prefix)| {
+            let present = find_row_value(columns, row, |normalized| {
+                normalized == format!("{prefix}present")
+            })
+            .is_some_and(|value| value == "1");
+            let rank = find_row_value(columns, row, |normalized| {
+                normalized == format!("{prefix}rank")
+            })
+            .and_then(|value| value.parse::<usize>().ok());
+            StructureLibraryHit {
+                alias: alias.clone(),
+                prefix: prefix.clone(),
+                rank,
+                present,
+            }
+        })
+        .collect()
+}
+
+fn merged_structure_library_hits(entries: &[&SelectedStructureEntry]) -> Vec<StructureLibraryHit> {
+    let Some(first_entry) = entries.first() else {
+        return Vec::new();
+    };
+
+    let mut merged_hits = first_entry.library_hits.clone();
+    let mut hit_index_by_prefix: HashMap<String, usize> = merged_hits
+        .iter()
+        .enumerate()
+        .map(|(idx, hit)| (hit.prefix.clone(), idx))
+        .collect();
+
+    for hit in &mut merged_hits {
+        if !hit.present {
+            hit.rank = None;
+        }
+    }
+
+    for entry in entries.iter().skip(1) {
+        for hit in &entry.library_hits {
+            if let Some(existing_idx) = hit_index_by_prefix.get(&hit.prefix).copied() {
+                let existing = &mut merged_hits[existing_idx];
+                existing.present |= hit.present;
+                existing.rank = match (existing.rank, hit.rank) {
+                    (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                    (None, Some(candidate)) => Some(candidate),
+                    (current, None) => current,
+                };
+            } else {
+                let mut cloned = hit.clone();
+                if !cloned.present {
+                    cloned.rank = None;
+                }
+                hit_index_by_prefix.insert(cloned.prefix.clone(), merged_hits.len());
+                merged_hits.push(cloned);
+            }
+        }
+    }
+
+    merged_hits
+}
+
+fn structure_matches_source_filter(
+    library_hits: &[StructureLibraryHit],
+    library_rank_limits: &[usize],
+    filter: StructureSourceFilter,
+    active_merged: Option<&ActiveMergedSearchExportInfo>,
+) -> bool {
+    let Some(active_merged) = active_merged else {
+        return true;
+    };
+    let visible_hits = library_hits
+        .iter()
+        .enumerate()
+        .map(|(idx, hit)| {
+            structure_library_hit_passes_rank_limit(hit, library_rank_limits.get(idx).copied())
+        })
+        .collect::<Vec<_>>();
+    if filter == StructureSourceFilter::Any {
+        return visible_hits.iter().any(|present| *present);
+    }
+    if active_merged.library_aliases.len() < 2 {
+        return visible_hits.iter().any(|present| *present);
+    }
+    let first = visible_hits.first().copied().unwrap_or(false);
+    let second = visible_hits.get(1).copied().unwrap_or(false);
+    match filter {
+        StructureSourceFilter::Any => true,
+        StructureSourceFilter::OnlyFirst => first && !second,
+        StructureSourceFilter::OnlySecond => !first && second,
+        StructureSourceFilter::BothFirstSecond => first && second,
+    }
+}
+
+fn draw_structure_library_hits(ui: &mut egui::Ui, library_hits: &[StructureLibraryHit]) {
+    if library_hits.is_empty() {
+        return;
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.small("Library ranks:");
+        for hit in library_hits {
+            let value = match hit.rank {
+                Some(rank) => format!("#{rank}"),
+                None if hit.present => "hit".to_string(),
+                None => "no hit".to_string(),
+            };
+            ui.small(format!("{}: {value}", hit.alias));
+        }
+    });
+}
+
+fn structure_library_hit_passes_rank_limit(
+    hit: &StructureLibraryHit,
+    rank_limit: Option<usize>,
+) -> bool {
+    if !hit.present {
+        return false;
+    }
+    match (hit.rank, rank_limit) {
+        (Some(rank), Some(limit)) => rank <= limit,
+        _ => true,
+    }
+}
+
+fn merged_table_library_rank_maxima(table: &AttributeTable, prefixes: &[String]) -> Vec<usize> {
+    prefixes
+        .iter()
+        .map(|prefix| {
+            let column_name = format!("{prefix}__rank");
+            let Some(column_idx) = table
+                .columns
+                .iter()
+                .position(|column| column == &column_name)
+            else {
+                return 1;
+            };
+            table
+                .rows
+                .iter()
+                .filter_map(|row| row.get(column_idx))
+                .filter_map(|value| value.trim().parse::<usize>().ok())
+                .max()
+                .unwrap_or(1)
+                .max(1)
+        })
+        .collect()
+}
+
+fn build_structure_display_groups<'a>(
+    entries: &'a [&'a SelectedStructureEntry],
+    collapse_identical_hits: bool,
+) -> Vec<StructureDisplayGroup<'a>> {
+    if !collapse_identical_hits {
+        return entries
+            .iter()
+            .copied()
+            .map(|entry| StructureDisplayGroup {
+                representative: entry,
+                entries: vec![entry],
+            })
+            .collect();
+    }
+
+    let mut groups: Vec<StructureDisplayGroup<'a>> = Vec::new();
+    let mut by_key: HashMap<String, usize> = HashMap::new();
+    for entry in entries.iter().copied() {
+        let key = entry
+            .short_inchikey
+            .clone()
+            .unwrap_or_else(|| entry.smiles.clone());
+        if let Some(existing_idx) = by_key.get(&key).copied() {
+            groups[existing_idx].entries.push(entry);
+        } else {
+            by_key.insert(key, groups.len());
+            groups.push(StructureDisplayGroup {
+                representative: entry,
+                entries: vec![entry],
+            });
+        }
+    }
+    groups
+}
+
+fn find_row_value<'a, F>(columns: &'a [String], row: &'a [String], predicate: F) -> Option<&'a str>
+where
+    F: Fn(&str) -> bool,
+{
+    columns.iter().enumerate().find_map(|(idx, column)| {
+        let normalized = normalized_column_name(column);
+        if !predicate(&normalized) {
+            return None;
+        }
+        row.get(idx)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn parse_taxonomic_rank(value: &str) -> Option<TaxonomicRank> {
+    match normalized_column_name(value).as_str() {
+        "domain" => Some(TaxonomicRank::Domain),
+        "kingdom" => Some(TaxonomicRank::Kingdom),
+        "phylum" => Some(TaxonomicRank::Phylum),
+        "class" => Some(TaxonomicRank::Class),
+        "order" => Some(TaxonomicRank::Order),
+        "family" => Some(TaxonomicRank::Family),
+        "tribe" => Some(TaxonomicRank::Tribe),
+        "genus" => Some(TaxonomicRank::Genus),
+        "species" => Some(TaxonomicRank::Species),
+        "varietas" => Some(TaxonomicRank::Varietas),
+        _ => None,
+    }
+}
+
+fn compound_link_from_row(columns: &[String], row: &[String]) -> Option<StructureLink> {
+    let qid = find_row_value(columns, row, |normalized| {
+        normalized.contains("wikidata")
+            && !normalized.contains("organism")
+            && (normalized.contains("compound")
+                || normalized.contains("structure")
+                || normalized.contains("molecule"))
+    })
+    .and_then(normalize_qid);
+    if let Some(qid) = qid {
+        return Some(StructureLink {
+            label: qid.clone(),
+            url: wikidata_entity_url(&qid),
+        });
+    }
+
+    let lotus_id = find_row_value(columns, row, |normalized| {
+        normalized.contains("lotusid") && !normalized.contains("organism")
+    });
+    if let Some(lotus_id) = lotus_id {
+        return Some(StructureLink {
+            label: lotus_id.to_string(),
+            url: format!(
+                "https://lotus.naturalproducts.net/compound/lotus_id/{}",
+                url_encode_component(lotus_id)
+            ),
+        });
+    }
+
+    find_row_value(columns, row, |normalized| {
+        normalized == "hittaxonomicshortinchikey"
+            || normalized.ends_with("taxonomicshortinchikey")
+            || normalized == "structureshortinchikey"
+            || normalized == "structureinchikey"
+            || normalized == "gnpsinchikey"
+    })
+    .map(|inchikey| StructureLink {
+        label: inchikey.to_string(),
+        url: format!(
+            "https://lotus.naturalproducts.net/compound/inchikey/{}",
+            url_encode_component(inchikey)
+        ),
+    })
+}
+
+fn organism_link_from_row(columns: &[String], row: &[String]) -> Option<StructureLink> {
+    find_row_value(columns, row, |normalized| {
+        normalized == "hittaxonomicorganismwikidata"
+            || (normalized.contains("organism") && normalized.contains("wikidata"))
+            || normalized == "organismqid"
+    })
+    .and_then(normalize_qid)
+    .map(|qid| StructureLink {
+        label: qid.clone(),
+        url: wikidata_entity_url(&qid),
+    })
+}
+
+fn normalize_qid(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = trimmed.rsplit('/').next().unwrap_or(trimmed).trim();
+    let upper = candidate.to_ascii_uppercase();
+    let suffix = upper.strip_prefix('Q')?;
+    if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("Q{suffix}"))
+}
+
+fn wikidata_entity_url(qid: &str) -> String {
+    format!(
+        "https://www.wikidata.org/wiki/{}",
+        url_encode_component(qid)
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn preferred_node_attribute_mapping_for_search_query_key(
+    key: SearchQueryKey,
+) -> Option<(&'static str, NodeAttrMatchField)> {
+    match key {
+        SearchQueryKey::FeatureId => Some(("query_feature_id", NodeAttrMatchField::FeatureId)),
+        SearchQueryKey::FeaturelistFeatureId => Some((
+            "query_featurelist_feature_id",
+            NodeAttrMatchField::FeaturelistFeatureId,
+        )),
+        SearchQueryKey::Scans => Some(("query_scans", NodeAttrMatchField::Scans)),
+        SearchQueryKey::RawName => Some(("query_export_key", NodeAttrMatchField::RawName)),
+        SearchQueryKey::Label => Some(("query_label", NodeAttrMatchField::Label)),
+        SearchQueryKey::NodeId => Some(("query_node_id", NodeAttrMatchField::NodeId)),
+    }
+}
+
+fn url_encode_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        let ch = byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
+            encoded.push(ch);
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn default_structure_caption_columns(columns: &[String], smiles_col: Option<usize>) -> Vec<usize> {
     let mut picks = Vec::new();
@@ -4942,6 +6090,9 @@ fn default_structure_caption_columns(columns: &[String], smiles_col: Option<usiz
             continue;
         }
         let normalized = normalized_column_name(name);
+        if normalized == "queryrawname" {
+            continue;
+        }
         let preferred = normalized.contains("name")
             || normalized.contains("canopus")
             || normalized.contains("npc")
@@ -5208,9 +6359,15 @@ mod tests {
     use crate::network::{ComponentSelection, build_network};
 
     use super::{
-        default_search_export_filename, keep_selected_if_visible,
-        spectral_search_precondition_error, visible_node_ids_for_view,
+        ActiveMergedSearchExportInfo, SelectedStructureEntry, SelectedStructureTaxonomicMetadata,
+        StructureLibraryHit, StructureSourceFilter, StructureTaxonomicLinks,
+        StructureTaxonomyFilter, build_structure_display_groups, default_search_export_filename,
+        default_structure_caption_columns, keep_selected_if_visible, merged_structure_library_hits,
+        occurrence_matches_reranked_taxon, parse_taxonomic_rank, selected_structure_short_inchikey,
+        selected_structure_taxonomic_metadata, spectral_search_precondition_error,
+        structure_matches_source_filter, visible_node_ids_for_view,
     };
+    use crate::metadata::{LotusBiosource, TaxonomicRank, TaxonomyLineage};
 
     fn meta(id: usize) -> SpectrumMeta {
         SpectrumMeta {
@@ -5225,6 +6382,41 @@ mod tests {
             headers: BTreeMap::new(),
             precursor_mz: 100.0 + id as f64,
             num_peaks: 10,
+        }
+    }
+
+    fn library_hit(
+        alias: &str,
+        prefix: &str,
+        rank: Option<usize>,
+        present: bool,
+    ) -> StructureLibraryHit {
+        StructureLibraryHit {
+            alias: alias.to_string(),
+            prefix: prefix.to_string(),
+            rank,
+            present,
+        }
+    }
+
+    fn selected_structure_entry(
+        node_id: usize,
+        feature_id: Option<&str>,
+        smiles: &str,
+    ) -> SelectedStructureEntry {
+        SelectedStructureEntry {
+            node_id,
+            feature_id: feature_id.map(str::to_string),
+            display_label: feature_id.unwrap_or("entry").to_string(),
+            smiles: smiles.to_string(),
+            annotations: Vec::new(),
+            short_inchikey: None,
+            library_hits: Vec::new(),
+            matched_taxonomic_organism_name: None,
+            matched_taxonomic_organism_qid: None,
+            taxonomic_reranked: false,
+            taxonomic_shared_rank: None,
+            taxonomic_links: StructureTaxonomicLinks::default(),
         }
     }
 
@@ -5334,5 +6526,336 @@ mod tests {
             filename,
             "queries.mgf__vs__lib_test.mgf__spectral_search.tsv"
         );
+    }
+
+    #[test]
+    fn parses_taxonomic_rank_labels_case_insensitively() {
+        assert_eq!(parse_taxonomic_rank("family"), Some(TaxonomicRank::Family));
+        assert_eq!(
+            parse_taxonomic_rank("Species"),
+            Some(TaxonomicRank::Species)
+        );
+        assert_eq!(parse_taxonomic_rank("nope"), None);
+    }
+
+    #[test]
+    fn extracts_taxonomic_links_from_search_export_columns() {
+        let columns = vec![
+            "hit_taxonomic_score".to_string(),
+            "hit_taxonomic_shared_rank".to_string(),
+            "hit_taxonomic_organism_wikidata".to_string(),
+            "hit_taxonomic_short_inchikey".to_string(),
+        ];
+        let row = vec![
+            "6.0".to_string(),
+            "family".to_string(),
+            "http://www.wikidata.org/entity/Q756".to_string(),
+            "ABCDEFGHIJKLMN".to_string(),
+        ];
+
+        let metadata = selected_structure_taxonomic_metadata(&columns, &row);
+        assert_eq!(
+            metadata,
+            SelectedStructureTaxonomicMetadata {
+                reranked: true,
+                shared_rank: Some(TaxonomicRank::Family),
+                links: StructureTaxonomicLinks {
+                    compound: Some(super::StructureLink {
+                        label: "ABCDEFGHIJKLMN".to_string(),
+                        url: "https://lotus.naturalproducts.net/compound/inchikey/ABCDEFGHIJKLMN"
+                            .to_string(),
+                    }),
+                    organism: Some(super::StructureLink {
+                        label: "Q756".to_string(),
+                        url: "https://www.wikidata.org/wiki/Q756".to_string(),
+                    }),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn extracts_taxonomic_metadata_from_merged_search_export_columns() {
+        let columns = vec![
+            "lotus__taxonomic_score".to_string(),
+            "lotus__taxonomic_shared_rank".to_string(),
+            "lotus__taxonomic_organism_wikidata".to_string(),
+            "structure_short_inchikey".to_string(),
+        ];
+        let row = vec![
+            "6.0".to_string(),
+            "family".to_string(),
+            "http://www.wikidata.org/entity/Q756".to_string(),
+            "ABCDEFGHIJKLMN".to_string(),
+        ];
+
+        let metadata = selected_structure_taxonomic_metadata(&columns, &row);
+        assert_eq!(metadata.shared_rank, Some(TaxonomicRank::Family));
+        assert!(metadata.reranked);
+        assert_eq!(
+            metadata
+                .links
+                .compound
+                .as_ref()
+                .map(|link| link.label.as_str()),
+            Some("ABCDEFGHIJKLMN")
+        );
+        assert_eq!(
+            metadata
+                .links
+                .organism
+                .as_ref()
+                .map(|link| link.label.as_str()),
+            Some("Q756")
+        );
+    }
+
+    #[test]
+    fn taxonomy_filter_matches_expected_entries() {
+        let entry = SelectedStructureEntry {
+            taxonomic_reranked: true,
+            taxonomic_shared_rank: Some(TaxonomicRank::Family),
+            ..selected_structure_entry(1, None, "CCO")
+        };
+
+        assert!(StructureTaxonomyFilter::All.matches(&entry));
+        assert!(StructureTaxonomyFilter::RerankedOnly.matches(&entry));
+        assert!(StructureTaxonomyFilter::SharedRank(TaxonomicRank::Family).matches(&entry));
+        assert!(StructureTaxonomyFilter::SharedRank(TaxonomicRank::Order).matches(&entry));
+        assert!(!StructureTaxonomyFilter::SharedRank(TaxonomicRank::Genus).matches(&entry));
+    }
+
+    #[test]
+    fn taxonomy_filter_includes_more_specific_ranks() {
+        let entry = SelectedStructureEntry {
+            taxonomic_reranked: true,
+            taxonomic_shared_rank: Some(TaxonomicRank::Species),
+            ..selected_structure_entry(1, None, "CCO")
+        };
+
+        assert!(StructureTaxonomyFilter::SharedRank(TaxonomicRank::Family).matches(&entry));
+        assert!(StructureTaxonomyFilter::SharedRank(TaxonomicRank::Genus).matches(&entry));
+        assert!(StructureTaxonomyFilter::SharedRank(TaxonomicRank::Species).matches(&entry));
+        assert!(!StructureTaxonomyFilter::SharedRank(TaxonomicRank::Varietas).matches(&entry));
+    }
+
+    #[test]
+    fn extracts_short_inchikey_from_structure_rows() {
+        let columns = vec![
+            "feature_id".to_string(),
+            "gnps_InChIKey".to_string(),
+            "SMILES".to_string(),
+        ];
+        let row = vec![
+            "f1".to_string(),
+            "ABCDEFGHIJKLMN-ABCDEFGHIJ-A".to_string(),
+            "CCO".to_string(),
+        ];
+        assert_eq!(
+            selected_structure_short_inchikey(&columns, &row).as_deref(),
+            Some("ABCDEFGHIJKLMN")
+        );
+    }
+
+    #[test]
+    fn extracts_short_inchikey_from_merged_structure_column() {
+        let columns = vec![
+            "query_feature_id".to_string(),
+            "structure_short_inchikey".to_string(),
+            "SMILES".to_string(),
+        ];
+        let row = vec![
+            "f1".to_string(),
+            "GUAFOGOEJLSQBT".to_string(),
+            "CCO".to_string(),
+        ];
+        assert_eq!(
+            selected_structure_short_inchikey(&columns, &row).as_deref(),
+            Some("GUAFOGOEJLSQBT")
+        );
+    }
+
+    #[test]
+    fn occurrence_matching_prefers_reranked_taxon() {
+        let entry = SelectedStructureEntry {
+            short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
+            matched_taxonomic_organism_name: Some("Withania somnifera".to_string()),
+            matched_taxonomic_organism_qid: Some("Q852660".to_string()),
+            taxonomic_reranked: true,
+            taxonomic_shared_rank: Some(TaxonomicRank::Species),
+            ..selected_structure_entry(1, None, "CCO")
+        };
+        let matching_occurrence = LotusBiosource {
+            compound_name: Some("Withanolide A".to_string()),
+            organism_name: "Withania somnifera".to_string(),
+            organism_wikidata: Some("http://www.wikidata.org/entity/Q852660".to_string()),
+            compound_wikidata: Some("Q27137465".to_string()),
+            reference_doi: Some("10.1021/NP200635R".to_string()),
+            lineage: TaxonomyLineage::default(),
+        };
+        let other_occurrence = LotusBiosource {
+            compound_name: Some("Withanolide A".to_string()),
+            organism_name: "Physalis longifolia".to_string(),
+            organism_wikidata: Some("http://www.wikidata.org/entity/Q123".to_string()),
+            compound_wikidata: Some("Q27137465".to_string()),
+            reference_doi: Some("10.0000/other".to_string()),
+            lineage: TaxonomyLineage::default(),
+        };
+
+        assert!(occurrence_matches_reranked_taxon(
+            &entry,
+            &matching_occurrence
+        ));
+        assert!(!occurrence_matches_reranked_taxon(
+            &entry,
+            &other_occurrence
+        ));
+    }
+
+    #[test]
+    fn collapse_identical_hits_groups_by_structure_identity() {
+        let first = SelectedStructureEntry {
+            short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
+            ..selected_structure_entry(1, Some("f1"), "CCO")
+        };
+        let second = SelectedStructureEntry {
+            short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
+            ..selected_structure_entry(2, Some("f2"), "CCO")
+        };
+        let third = SelectedStructureEntry {
+            short_inchikey: Some("ZZZZZZZZZZZZZZ".to_string()),
+            ..selected_structure_entry(3, Some("f3"), "CCC")
+        };
+        let entries = vec![&first, &second, &third];
+
+        let groups = build_structure_display_groups(&entries, true);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].entries.len(), 2);
+        assert_eq!(groups[0].representative.node_id, 1);
+        assert_eq!(groups[1].entries.len(), 1);
+        assert_eq!(groups[1].representative.node_id, 3);
+    }
+
+    #[test]
+    fn collapsed_structure_library_hits_keep_best_rank_per_library() {
+        let first = SelectedStructureEntry {
+            short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
+            library_hits: vec![
+                library_hit("libA", "liba", Some(4), true),
+                library_hit("libB", "libb", None, false),
+            ],
+            ..selected_structure_entry(1, Some("f1"), "CCO")
+        };
+        let second = SelectedStructureEntry {
+            short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
+            library_hits: vec![
+                library_hit("libA", "liba", Some(2), true),
+                library_hit("libB", "libb", Some(7), true),
+            ],
+            ..selected_structure_entry(2, Some("f2"), "CCO")
+        };
+
+        let merged = merged_structure_library_hits(&[&first, &second]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], library_hit("libA", "liba", Some(2), true));
+        assert_eq!(merged[1], library_hit("libB", "libb", Some(7), true));
+    }
+
+    #[test]
+    fn source_filter_uses_aggregated_card_level_hits() {
+        let active = ActiveMergedSearchExportInfo {
+            source_label: "merged".to_string(),
+            row_count: 2,
+            library_aliases: vec!["libA".to_string(), "libB".to_string()],
+            library_prefixes: vec!["liba".to_string(), "libb".to_string()],
+            library_rank_maxima: vec![10, 10],
+            inferred_query_key: None,
+        };
+        let first = SelectedStructureEntry {
+            short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
+            library_hits: vec![
+                library_hit("libA", "liba", Some(4), true),
+                library_hit("libB", "libb", None, false),
+            ],
+            ..selected_structure_entry(1, Some("f1"), "CCO")
+        };
+        let second = SelectedStructureEntry {
+            short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
+            library_hits: vec![
+                library_hit("libA", "liba", None, false),
+                library_hit("libB", "libb", Some(3), true),
+            ],
+            ..selected_structure_entry(2, Some("f2"), "CCO")
+        };
+
+        let merged_hits = merged_structure_library_hits(&[&first, &second]);
+        assert!(structure_matches_source_filter(
+            &merged_hits,
+            &[10, 10],
+            StructureSourceFilter::BothFirstSecond,
+            Some(&active)
+        ));
+        assert!(!structure_matches_source_filter(
+            &merged_hits,
+            &[10, 10],
+            StructureSourceFilter::OnlyFirst,
+            Some(&active)
+        ));
+        assert!(!structure_matches_source_filter(
+            &merged_hits,
+            &[10, 10],
+            StructureSourceFilter::OnlySecond,
+            Some(&active)
+        ));
+    }
+
+    #[test]
+    fn source_filter_respects_library_rank_limits() {
+        let active = ActiveMergedSearchExportInfo {
+            source_label: "merged".to_string(),
+            row_count: 1,
+            library_aliases: vec!["libA".to_string(), "libB".to_string()],
+            library_prefixes: vec!["liba".to_string(), "libb".to_string()],
+            library_rank_maxima: vec![10, 10],
+            inferred_query_key: None,
+        };
+        let library_hits = vec![
+            library_hit("libA", "liba", Some(5), true),
+            library_hit("libB", "libb", Some(2), true),
+        ];
+
+        assert!(structure_matches_source_filter(
+            &library_hits,
+            &[5, 2],
+            StructureSourceFilter::BothFirstSecond,
+            Some(&active)
+        ));
+        assert!(structure_matches_source_filter(
+            &library_hits,
+            &[4, 2],
+            StructureSourceFilter::OnlySecond,
+            Some(&active)
+        ));
+        assert!(!structure_matches_source_filter(
+            &library_hits,
+            &[4, 2],
+            StructureSourceFilter::BothFirstSecond,
+            Some(&active)
+        ));
+    }
+
+    #[test]
+    fn default_structure_captions_skip_query_raw_name() {
+        let columns = vec![
+            "query_feature_id".to_string(),
+            "query_raw_name".to_string(),
+            "hit_raw_name".to_string(),
+            "hit_taxonomic_organism_name".to_string(),
+            "SMILES".to_string(),
+        ];
+
+        let picks = default_structure_caption_columns(&columns, Some(4));
+        assert!(!picks.contains(&1));
+        assert!(picks.contains(&2));
     }
 }
