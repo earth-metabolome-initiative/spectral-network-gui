@@ -1,0 +1,19 @@
+[[jobs]]
+name = "demo-network"
+input_mgf = "fixtures/mapp_batch_00231.mgf"
+output_json = "out/network.json"
+output_csv_dir = "out/network_csv"
+
+[jobs.parse]
+min_peaks = 5
+max_peaks = 1000
+
+[jobs.build.compute]
+metric = "CosineGreedy"
+tolerance = 0.02
+mz_power = 0.0
+intensity_power = 1.0
+
+[jobs.build]
+threshold = 0.7
+top_k = 10

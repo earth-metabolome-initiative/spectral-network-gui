@@ -365,6 +365,7 @@ mod tests {
             },
             peaks: Arc::new(Vec::new()),
             spectrum: Arc::new(spectrum),
+            payload: (),
         }
     }
 

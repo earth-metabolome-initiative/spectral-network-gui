@@ -4,76 +4,17 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 
-use mass_spectrometry::prelude::{
-    GenericSpectrum, GreedyCosine, HungarianCosine, LinearEntropy, ModifiedGreedyCosine,
-    ModifiedHungarianCosine, ModifiedLinearEntropy, MsEntropyCleanSpectrum, ScalarSimilarity,
-    SiriusMergeClosePeaks, SpectralProcessor,
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
+pub use spectral_matcher::{ComputeParams, SimilarityMetric};
+use spectral_matcher::{
+    CandidateHit as BaseCandidateHit, IncrementalSearchState as BaseIncrementalSearchState,
+    IncrementalSearchStep as BaseIncrementalSearchStep, LibrarySearchParams, MetricScorer,
+    SearchMessage as BaseSearchMessage, SearchResult as BaseSearchResult, SpectrumRecord,
+    preprocess_spectra_for_metric,
 };
 
-use crate::io::SpectrumRecord;
 use crate::metadata::{LotusMetadataIndex, ResolvedLotusQuery, short_inchikey_from_record};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SimilarityMetric {
-    CosineHungarian,
-    CosineGreedy,
-    ModifiedCosine,
-    ModifiedGreedyCosine,
-    LinearEntropyWeighted,
-    LinearEntropyUnweighted,
-    ModifiedLinearEntropyWeighted,
-    ModifiedLinearEntropyUnweighted,
-}
-
-impl SimilarityMetric {
-    pub const ALL: [Self; 8] = [
-        Self::CosineHungarian,
-        Self::CosineGreedy,
-        Self::ModifiedCosine,
-        Self::ModifiedGreedyCosine,
-        Self::LinearEntropyWeighted,
-        Self::LinearEntropyUnweighted,
-        Self::ModifiedLinearEntropyWeighted,
-        Self::ModifiedLinearEntropyUnweighted,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::CosineHungarian => "CosineHungarian",
-            Self::CosineGreedy => "CosineGreedy",
-            Self::ModifiedCosine => "ModifiedCosine",
-            Self::ModifiedGreedyCosine => "ModifiedGreedyCosine",
-            Self::LinearEntropyWeighted => "LinearEntropyWeighted",
-            Self::LinearEntropyUnweighted => "LinearEntropyUnweighted",
-            Self::ModifiedLinearEntropyWeighted => "ModifiedLinearEntropyWeighted",
-            Self::ModifiedLinearEntropyUnweighted => "ModifiedLinearEntropyUnweighted",
-        }
-    }
-
-    fn needs_linear_entropy_preprocessing(self) -> bool {
-        matches!(
-            self,
-            Self::LinearEntropyWeighted
-                | Self::LinearEntropyUnweighted
-                | Self::ModifiedLinearEntropyWeighted
-                | Self::ModifiedLinearEntropyUnweighted
-        )
-    }
-}
-
-impl Default for SimilarityMetric {
-    fn default() -> Self {
-        Self::CosineGreedy
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ComputeParams {
-    pub metric: SimilarityMetric,
-    pub tolerance: f64,
-    pub mz_power: f64,
-    pub intensity_power: f64,
-}
 
 #[derive(Clone, Debug)]
 pub struct SearchParams {
@@ -89,110 +30,6 @@ pub struct SearchParams {
 pub struct SearchTaxonomyConfig {
     pub lotus: Arc<LotusMetadataIndex>,
     pub query: ResolvedLotusQuery,
-}
-
-enum MetricScorer {
-    CosineHungarian(HungarianCosine<f64, f64>),
-    CosineGreedy(GreedyCosine<f64, f64>),
-    ModifiedCosine(ModifiedHungarianCosine<f64, f64>),
-    ModifiedGreedyCosine(ModifiedGreedyCosine<f64, f64>),
-    LinearEntropyWeighted(LinearEntropy<f64, f64>),
-    LinearEntropyUnweighted(LinearEntropy<f64, f64>),
-    ModifiedLinearEntropyWeighted(ModifiedLinearEntropy<f64, f64>),
-    ModifiedLinearEntropyUnweighted(ModifiedLinearEntropy<f64, f64>),
-}
-
-impl MetricScorer {
-    fn new(params: ComputeParams) -> Result<Self, String> {
-        match params.metric {
-            SimilarityMetric::CosineHungarian => {
-                HungarianCosine::new(params.mz_power, params.intensity_power, params.tolerance)
-                    .map(Self::CosineHungarian)
-                    .map_err(|err| {
-                        format!("failed to configure {}: {err:?}", params.metric.label())
-                    })
-            }
-            SimilarityMetric::CosineGreedy => {
-                GreedyCosine::new(params.mz_power, params.intensity_power, params.tolerance)
-                    .map(Self::CosineGreedy)
-                    .map_err(|err| {
-                        format!("failed to configure {}: {err:?}", params.metric.label())
-                    })
-            }
-            SimilarityMetric::ModifiedCosine => ModifiedHungarianCosine::new(
-                params.mz_power,
-                params.intensity_power,
-                params.tolerance,
-            )
-            .map(Self::ModifiedCosine)
-            .map_err(|err| format!("failed to configure {}: {err:?}", params.metric.label())),
-            SimilarityMetric::ModifiedGreedyCosine => {
-                ModifiedGreedyCosine::new(params.mz_power, params.intensity_power, params.tolerance)
-                    .map(Self::ModifiedGreedyCosine)
-                    .map_err(|err| {
-                        format!("failed to configure {}: {err:?}", params.metric.label())
-                    })
-            }
-            SimilarityMetric::LinearEntropyWeighted => LinearEntropy::new(
-                params.mz_power,
-                params.intensity_power,
-                params.tolerance,
-                true,
-            )
-            .map(Self::LinearEntropyWeighted)
-            .map_err(|err| format!("failed to configure {}: {err:?}", params.metric.label())),
-            SimilarityMetric::LinearEntropyUnweighted => LinearEntropy::new(
-                params.mz_power,
-                params.intensity_power,
-                params.tolerance,
-                false,
-            )
-            .map(Self::LinearEntropyUnweighted)
-            .map_err(|err| format!("failed to configure {}: {err:?}", params.metric.label())),
-            SimilarityMetric::ModifiedLinearEntropyWeighted => ModifiedLinearEntropy::new(
-                params.mz_power,
-                params.intensity_power,
-                params.tolerance,
-                true,
-            )
-            .map(Self::ModifiedLinearEntropyWeighted)
-            .map_err(|err| format!("failed to configure {}: {err:?}", params.metric.label())),
-            SimilarityMetric::ModifiedLinearEntropyUnweighted => ModifiedLinearEntropy::new(
-                params.mz_power,
-                params.intensity_power,
-                params.tolerance,
-                false,
-            )
-            .map(Self::ModifiedLinearEntropyUnweighted)
-            .map_err(|err| format!("failed to configure {}: {err:?}", params.metric.label())),
-        }
-    }
-
-    fn similarity(
-        &self,
-        left: &GenericSpectrum<f64, f64>,
-        right: &GenericSpectrum<f64, f64>,
-        metric: SimilarityMetric,
-        left_idx: usize,
-        right_idx: usize,
-    ) -> Result<(f64, usize), String> {
-        let result = match self {
-            Self::CosineHungarian(sim) => sim.similarity(left, right),
-            Self::CosineGreedy(sim) => sim.similarity(left, right),
-            Self::ModifiedCosine(sim) => sim.similarity(left, right),
-            Self::ModifiedGreedyCosine(sim) => sim.similarity(left, right),
-            Self::LinearEntropyWeighted(sim) => sim.similarity(left, right),
-            Self::LinearEntropyUnweighted(sim) => sim.similarity(left, right),
-            Self::ModifiedLinearEntropyWeighted(sim) => sim.similarity(left, right),
-            Self::ModifiedLinearEntropyUnweighted(sim) => sim.similarity(left, right),
-        };
-        result.map_err(|err| {
-            format!(
-                "{} failed for pair ({left_idx},{right_idx}): {err:?}",
-                metric.label()
-            )
-        })
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -270,27 +107,34 @@ pub enum SearchMessage {
 }
 
 pub struct NativeSearchHandle {
-    total: usize,
-    done: Arc<AtomicUsize>,
-    cancel: Arc<AtomicBool>,
-    rx: Receiver<SearchMessage>,
+    inner: spectral_matcher::NativeSearchHandle,
+    library: Vec<SpectrumRecord>,
+    params: SearchParams,
 }
 
 impl NativeSearchHandle {
     pub fn total(&self) -> usize {
-        self.total
+        self.inner.total()
     }
 
     pub fn done(&self) -> usize {
-        self.done.load(Ordering::Relaxed)
+        self.inner.done()
     }
 
     pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.inner.cancel();
     }
 
     pub fn try_recv(&self) -> Option<SearchMessage> {
-        self.rx.try_recv().ok()
+        self.inner.try_recv().map(|message| match message {
+            BaseSearchMessage::Finished(result) => SearchMessage::Finished(build_search_result(
+                result,
+                &self.library,
+                &self.params,
+            )),
+            BaseSearchMessage::Cancelled => SearchMessage::Cancelled,
+            BaseSearchMessage::Failed(err) => SearchMessage::Failed(err),
+        })
     }
 }
 
@@ -313,7 +157,7 @@ pub fn total_pairs(n: usize) -> usize {
 }
 
 pub fn total_search_pairs(query_count: usize, library_count: usize) -> usize {
-    query_count.saturating_mul(library_count)
+    spectral_matcher::total_search_pairs(query_count, library_count)
 }
 
 pub fn start_native_compute(
@@ -348,11 +192,12 @@ pub fn start_native_compute(
                 }
             };
 
-            let done_worker = Arc::clone(&done_for_thread);
-            let cancel_worker = Arc::clone(&cancel_for_thread);
-
-            let pairs = match score_all_pairs(&spectra, params, &scorer, done_worker, cancel_worker)
-            {
+            let pairs = match score_all_pairs(
+                &spectra,
+                &scorer,
+                done_for_thread,
+                cancel_for_thread,
+            ) {
                 Ok(Some(pairs)) => pairs,
                 Ok(None) => {
                     let _ = tx.send(ComputeMessage::Cancelled);
@@ -389,80 +234,15 @@ pub fn start_native_search(
     library: Vec<SpectrumRecord>,
     params: SearchParams,
 ) -> NativeSearchHandle {
-    let total = total_search_pairs(queries.len(), library.len());
-    let done = Arc::new(AtomicUsize::new(0));
-    let cancel = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::channel();
-    #[cfg(not(target_arch = "wasm32"))]
-    let done_for_thread = Arc::clone(&done);
-    #[cfg(not(target_arch = "wasm32"))]
-    let cancel_for_thread = Arc::clone(&cancel);
-
-    std::thread::spawn(move || {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let queries = match preprocess_spectra_for_metric(queries, params.compute) {
-                Ok(spectra) => spectra,
-                Err(err) => {
-                    let _ = tx.send(SearchMessage::Failed(err));
-                    return;
-                }
-            };
-            let library = match preprocess_spectra_for_metric(library, params.compute) {
-                Ok(spectra) => spectra,
-                Err(err) => {
-                    let _ = tx.send(SearchMessage::Failed(err));
-                    return;
-                }
-            };
-
-            let scorer = match MetricScorer::new(params.compute) {
-                Ok(sim) => sim,
-                Err(err) => {
-                    let _ = tx.send(SearchMessage::Failed(err));
-                    return;
-                }
-            };
-
-            let done_worker = Arc::clone(&done_for_thread);
-            let cancel_worker = Arc::clone(&cancel_for_thread);
-
-            let result = match score_query_library_pairs(
-                &queries,
-                &library,
-                &params,
-                &scorer,
-                done_worker,
-                cancel_worker,
-            ) {
-                Ok(Some(result)) => result,
-                Ok(None) => {
-                    let _ = tx.send(SearchMessage::Cancelled);
-                    return;
-                }
-                Err(err) => {
-                    let _ = tx.send(SearchMessage::Failed(err));
-                    return;
-                }
-            };
-
-            let _ = tx.send(SearchMessage::Finished(result));
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = (queries, library, params);
-            let _ = tx.send(SearchMessage::Failed(
-                "native threaded search is unavailable on wasm".to_string(),
-            ));
-        }
-    });
-
+    let inner = spectral_matcher::start_native_search(
+        queries,
+        library.clone(),
+        base_search_params(&params, library.len()),
+    );
     NativeSearchHandle {
-        total,
-        done,
-        cancel,
-        rx,
+        inner,
+        library,
+        params,
     }
 }
 
@@ -473,7 +253,6 @@ pub enum IncrementalStep {
 }
 
 pub struct IncrementalComputeState {
-    params: ComputeParams,
     scorer: MetricScorer,
     spectra: Vec<SpectrumRecord>,
     i: usize,
@@ -490,7 +269,6 @@ impl IncrementalComputeState {
         let total = total_pairs(spectra.len());
         let scorer = MetricScorer::new(params)?;
         Ok(Self {
-            params,
             scorer,
             spectra,
             i: 0,
@@ -521,10 +299,9 @@ impl IncrementalComputeState {
 
         let n = self.spectra.len();
         if n == 0 || self.i >= n {
-            let result = ComputeResult {
+            return Ok(IncrementalStep::Finished(ComputeResult {
                 pairs: std::mem::take(&mut self.pairs),
-            };
-            return Ok(IncrementalStep::Finished(result));
+            }));
         }
 
         let mut remaining = budget.max(1);
@@ -535,9 +312,7 @@ impl IncrementalComputeState {
 
             let left = self.spectra[self.i].spectrum.as_ref();
             let right = self.spectra[self.j].spectrum.as_ref();
-            let (score, matches) =
-                self.scorer
-                    .similarity(left, right, self.params.metric, self.i, self.j)?;
+            let (score, matches) = self.scorer.similarity(left, right, self.i, self.j)?;
             self.pairs.push(PairScore {
                 left: self.i,
                 right: self.j,
@@ -555,10 +330,9 @@ impl IncrementalComputeState {
         }
 
         if self.i >= n {
-            let result = ComputeResult {
+            Ok(IncrementalStep::Finished(ComputeResult {
                 pairs: std::mem::take(&mut self.pairs),
-            };
-            Ok(IncrementalStep::Finished(result))
+            }))
         } else {
             Ok(IncrementalStep::Progress)
         }
@@ -572,16 +346,9 @@ pub enum IncrementalSearchStep {
 }
 
 pub struct IncrementalSearchState {
-    params: SearchParams,
-    scorer: MetricScorer,
-    queries: Vec<SpectrumRecord>,
+    inner: BaseIncrementalSearchState,
     library: Vec<SpectrumRecord>,
-    query_index: usize,
-    library_index: usize,
-    total: usize,
-    done: usize,
-    cancel: bool,
-    candidates: Vec<SearchCandidate>,
+    params: SearchParams,
 }
 
 impl IncrementalSearchState {
@@ -590,158 +357,51 @@ impl IncrementalSearchState {
         library: Vec<SpectrumRecord>,
         params: SearchParams,
     ) -> Result<Self, String> {
-        let queries = preprocess_spectra_for_metric(queries, params.compute)?;
-        let library = preprocess_spectra_for_metric(library, params.compute)?;
-        let total = total_search_pairs(queries.len(), library.len());
-        let scorer = MetricScorer::new(params.compute)?;
-        Ok(Self {
-            params,
-            scorer,
+        let inner = BaseIncrementalSearchState::new(
             queries,
+            library.clone(),
+            base_search_params(&params, library.len()),
+        )?;
+        Ok(Self {
+            inner,
             library,
-            query_index: 0,
-            library_index: 0,
-            total,
-            done: 0,
-            cancel: false,
-            candidates: Vec::new(),
+            params,
         })
     }
 
     pub fn total(&self) -> usize {
-        self.total
+        self.inner.total()
     }
 
     pub fn done(&self) -> usize {
-        self.done
+        self.inner.done()
     }
 
     pub fn cancel(&mut self) {
-        self.cancel = true;
+        self.inner.cancel();
     }
 
     pub fn step(&mut self, budget: usize) -> Result<IncrementalSearchStep, String> {
-        if self.cancel {
-            return Ok(IncrementalSearchStep::Cancelled);
-        }
-
-        let query_count = self.queries.len();
-        let library_count = self.library.len();
-        if query_count == 0 || library_count == 0 || self.query_index >= query_count {
-            return Ok(IncrementalSearchStep::Finished(SearchResult {
-                hits: finalize_search_candidates(
-                    std::mem::take(&mut self.candidates),
-                    self.params.top_n,
-                ),
-                taxonomic_reranking_applied: self.params.taxonomy.is_some(),
-                taxonomic_query: self
-                    .params
-                    .taxonomy
-                    .as_ref()
-                    .map(|config| config.query.query_label.clone()),
-            }));
-        }
-
-        let mut remaining = budget.max(1);
-        while remaining > 0 && self.query_index < query_count {
-            if self.cancel {
-                return Ok(IncrementalSearchStep::Cancelled);
-            }
-
-            if search_parent_mass_passes(
-                &self.queries[self.query_index],
-                &self.library[self.library_index],
-                &self.params,
-            ) {
-                let left = self.queries[self.query_index].spectrum.as_ref();
-                let right = self.library[self.library_index].spectrum.as_ref();
-                let (score, matches) = self.scorer.similarity(
-                    left,
-                    right,
-                    self.params.compute.metric,
-                    self.query_index,
-                    self.library_index,
-                )?;
-                if search_match_passes(score, matches, &self.params) {
-                    self.candidates.push(build_search_candidate(
-                        self.query_index,
-                        self.library_index,
-                        score,
-                        matches,
-                        &self.library[self.library_index],
-                        self.params.taxonomy.as_ref(),
-                    ));
-                }
-            }
-            self.done += 1;
-
-            self.library_index += 1;
-            if self.library_index >= library_count {
-                self.query_index += 1;
-                self.library_index = 0;
-            }
-            remaining -= 1;
-        }
-
-        if self.query_index >= query_count {
-            Ok(IncrementalSearchStep::Finished(SearchResult {
-                hits: finalize_search_candidates(
-                    std::mem::take(&mut self.candidates),
-                    self.params.top_n,
-                ),
-                taxonomic_reranking_applied: self.params.taxonomy.is_some(),
-                taxonomic_query: self
-                    .params
-                    .taxonomy
-                    .as_ref()
-                    .map(|config| config.query.query_label.clone()),
-            }))
-        } else {
-            Ok(IncrementalSearchStep::Progress)
+        match self.inner.step(budget)? {
+            BaseIncrementalSearchStep::Progress => Ok(IncrementalSearchStep::Progress),
+            BaseIncrementalSearchStep::Cancelled => Ok(IncrementalSearchStep::Cancelled),
+            BaseIncrementalSearchStep::Finished(result) => Ok(IncrementalSearchStep::Finished(
+                build_search_result(result, &self.library, &self.params),
+            )),
         }
     }
-}
-
-fn preprocess_spectra_for_metric(
-    spectra: Vec<SpectrumRecord>,
-    params: ComputeParams,
-) -> Result<Vec<SpectrumRecord>, String> {
-    if !params.metric.needs_linear_entropy_preprocessing() {
-        return Ok(spectra);
-    }
-
-    let cleaner = MsEntropyCleanSpectrum::<f64>::builder()
-        .build()
-        .map_err(|err| format!("failed to configure ms_entropy cleaner: {err:?}"))?;
-    let merger = SiriusMergeClosePeaks::new(params.tolerance)
-        .map_err(|err| format!("failed to configure close-peak merger: {err:?}"))?;
-
-    Ok(spectra
-        .into_iter()
-        .map(|mut record| {
-            let cleaned = cleaner.process(record.spectrum.as_ref());
-            let merged = merger.process(&cleaned);
-            record.spectrum = Arc::new(merged);
-            record
-        })
-        .collect())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn score_all_pairs(
     spectra: &[SpectrumRecord],
-    params: ComputeParams,
     scorer: &MetricScorer,
     done_worker: Arc<AtomicUsize>,
     cancel_worker: Arc<AtomicBool>,
 ) -> Result<Option<Vec<PairScore>>, String> {
-    use rayon::prelude::*;
-
-    let total = total_pairs(spectra.len());
     let pair_indices: Vec<(usize, usize)> = (0..spectra.len())
         .flat_map(|i| (i..spectra.len()).map(move |j| (i, j)))
         .collect();
-    debug_assert_eq!(pair_indices.len(), total);
 
     let error = Arc::new(Mutex::new(None::<String>));
     let error_worker = Arc::clone(&error);
@@ -757,7 +417,7 @@ fn score_all_pairs(
 
             let left = spectra[i].spectrum.as_ref();
             let right = spectra[j].spectrum.as_ref();
-            match scorer.similarity(left, right, params.metric, i, j) {
+            match scorer.similarity(left, right, i, j) {
                 Ok((score, matches)) => {
                     done_for_iter.fetch_add(1, Ordering::Relaxed);
                     Some(PairScore {
@@ -791,104 +451,73 @@ fn score_all_pairs(
     Ok(Some(pairs))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn score_query_library_pairs(
-    queries: &[SpectrumRecord],
+fn base_search_params(params: &SearchParams, library_count: usize) -> LibrarySearchParams {
+    LibrarySearchParams {
+        compute: params.compute,
+        parent_mass_tolerance: params.parent_mass_tolerance,
+        min_matched_peaks: params.min_matched_peaks,
+        min_similarity_threshold: params.min_similarity_threshold,
+        top_n: if params.taxonomy.is_some() {
+            library_count.max(1)
+        } else {
+            params.top_n.max(1)
+        },
+    }
+}
+
+fn build_search_result(
+    base: BaseSearchResult,
     library: &[SpectrumRecord],
     params: &SearchParams,
-    scorer: &MetricScorer,
-    done_worker: Arc<AtomicUsize>,
-    cancel_worker: Arc<AtomicBool>,
-) -> Result<Option<SearchResult>, String> {
-    use rayon::prelude::*;
-
-    let total = total_search_pairs(queries.len(), library.len());
-    let error = Arc::new(Mutex::new(None::<String>));
-    let error_worker = Arc::clone(&error);
-    let done_for_iter = Arc::clone(&done_worker);
-    let cancel_for_iter = Arc::clone(&cancel_worker);
-
-    let candidates: Vec<SearchCandidate> = (0..total)
-        .into_par_iter()
-        .filter_map(|flat_idx| {
-            if cancel_for_iter.load(Ordering::Relaxed) {
-                return None;
-            }
-
-            let query_idx = flat_idx / library.len();
-            let library_idx = flat_idx % library.len();
-            done_for_iter.fetch_add(1, Ordering::Relaxed);
-            if !search_parent_mass_passes(&queries[query_idx], &library[library_idx], params) {
-                return None;
-            }
-            let left = queries[query_idx].spectrum.as_ref();
-            let right = library[library_idx].spectrum.as_ref();
-            match scorer.similarity(left, right, params.compute.metric, query_idx, library_idx) {
-                Ok((score, matches)) => {
-                    if search_match_passes(score, matches, params) {
-                        Some(build_search_candidate(
-                            query_idx,
-                            library_idx,
-                            score,
-                            matches,
-                            &library[library_idx],
-                            params.taxonomy.as_ref(),
-                        ))
-                    } else {
-                        None
-                    }
-                }
-                Err(err) => {
-                    if let Ok(mut slot) = error_worker.lock()
-                        && slot.is_none()
-                    {
-                        *slot = Some(err);
-                    }
-                    cancel_for_iter.store(true, Ordering::Relaxed);
-                    None
-                }
-            }
-        })
-        .collect();
-
-    if let Ok(mut slot) = error.lock()
-        && let Some(err) = slot.take()
-    {
-        return Err(err);
-    }
-    if cancel_worker.load(Ordering::Relaxed) {
-        return Ok(None);
-    }
-    Ok(Some(SearchResult {
-        hits: finalize_search_candidates(candidates, params.top_n),
+) -> SearchResult {
+    let hits = enrich_search_hits(base.hits, library, params);
+    SearchResult {
+        hits,
         taxonomic_reranking_applied: params.taxonomy.is_some(),
         taxonomic_query: params
             .taxonomy
             .as_ref()
             .map(|config| config.query.query_label.clone()),
-    }))
+    }
 }
 
-fn search_match_passes(score: f64, matches: usize, params: &SearchParams) -> bool {
-    matches >= params.min_matched_peaks && score >= params.min_similarity_threshold
-}
-
-fn search_parent_mass_passes(
-    query: &SpectrumRecord,
-    library: &SpectrumRecord,
+fn enrich_search_hits(
+    base_hits: Vec<BaseCandidateHit>,
+    library: &[SpectrumRecord],
     params: &SearchParams,
-) -> bool {
-    (query.meta.precursor_mz - library.meta.precursor_mz).abs() <= params.parent_mass_tolerance
+) -> Vec<SearchHit> {
+    if let Some(taxonomy) = params.taxonomy.as_ref() {
+        let candidates = base_hits
+            .iter()
+            .map(|hit| build_search_candidate(hit, library, Some(taxonomy)))
+            .collect::<Vec<_>>();
+        finalize_search_candidates(candidates, params.top_n)
+    } else {
+        base_hits
+            .into_iter()
+            .map(|hit| SearchHit {
+                query_index: hit.query_index,
+                library_index: hit.library_index,
+                rank: hit.rank,
+                spectral_score: hit.spectral_score,
+                taxonomic_score: 0.0,
+                combined_score: hit.spectral_score,
+                matches: hit.matches,
+                matched_organism_name: None,
+                matched_organism_wikidata: None,
+                matched_shared_rank: None,
+                matched_short_inchikey: None,
+            })
+            .collect()
+    }
 }
 
 fn build_search_candidate(
-    query_index: usize,
-    library_index: usize,
-    spectral_score: f64,
-    matches: usize,
-    library_record: &SpectrumRecord,
+    hit: &BaseCandidateHit,
+    library: &[SpectrumRecord],
     taxonomy: Option<&SearchTaxonomyConfig>,
 ) -> SearchCandidate {
+    let library_record = &library[hit.library_index];
     let (
         taxonomic_score,
         matched_organism_name,
@@ -915,12 +544,12 @@ fn build_search_candidate(
     };
 
     SearchCandidate {
-        query_index,
-        library_index,
-        spectral_score,
+        query_index: hit.query_index,
+        library_index: hit.library_index,
+        spectral_score: hit.spectral_score,
         taxonomic_score,
-        combined_score: spectral_score + taxonomic_score,
-        matches,
+        combined_score: hit.spectral_score + taxonomic_score,
+        matches: hit.matches,
         matched_organism_name,
         matched_organism_wikidata,
         matched_shared_rank,
@@ -981,8 +610,8 @@ mod tests {
 
     use super::{
         ComputeParams, IncrementalComputeState, IncrementalSearchState, IncrementalSearchStep,
-        IncrementalStep, SearchParams, SearchResult, SearchTaxonomyConfig, SimilarityMetric,
-        finalize_search_candidates, start_native_search, total_pairs, total_search_pairs,
+        IncrementalStep, SearchParams, SearchTaxonomyConfig, SimilarityMetric, start_native_search,
+        total_pairs, total_search_pairs,
     };
     use crate::io::{SpectrumMeta, SpectrumRecord};
     use crate::metadata::load_lotus_bytes;
@@ -1023,6 +652,7 @@ mod tests {
             },
             peaks: Arc::new(peaks.to_vec()),
             spectrum: Arc::new(spec),
+            payload: (),
         }
     }
 
@@ -1032,6 +662,7 @@ mod tests {
             tolerance: 0.2,
             mz_power: 0.0,
             intensity_power: 1.0,
+            top_n_peaks: None,
         }
     }
 
@@ -1134,186 +765,6 @@ mod tests {
     }
 
     #[test]
-    fn incremental_search_applies_filters_and_top_n() {
-        let queries = vec![
-            spectrum(0, 100.0, &[(10.0, 1.0), (20.0, 0.8), (30.0, 0.5)]),
-            spectrum(1, 200.0, &[(50.0, 1.0), (60.0, 0.9), (70.0, 0.6)]),
-        ];
-        let library = vec![
-            spectrum(10, 101.0, &[(10.0, 1.0), (20.0, 0.8), (30.0, 0.5)]),
-            spectrum(11, 102.0, &[(10.0, 1.0), (20.1, 0.7), (31.0, 0.4)]),
-            spectrum(12, 201.0, &[(50.0, 1.0), (60.0, 0.9), (71.0, 0.4)]),
-        ];
-        let mut state = IncrementalSearchState::new(
-            queries,
-            library,
-            SearchParams {
-                compute: base_compute_params(SimilarityMetric::CosineGreedy),
-                parent_mass_tolerance: 5.0,
-                min_matched_peaks: 2,
-                min_similarity_threshold: 0.1,
-                top_n: 1,
-                taxonomy: None,
-            },
-        )
-        .expect("failed to create search state");
-
-        let result = loop {
-            match state.step(2).expect("search step failed") {
-                IncrementalSearchStep::Progress => {}
-                IncrementalSearchStep::Finished(result) => break result,
-                IncrementalSearchStep::Cancelled => panic!("unexpected cancel"),
-            }
-        };
-
-        assert_eq!(result.hits.len(), 2);
-        assert_eq!(result.hits[0].query_index, 0);
-        assert_eq!(result.hits[0].library_index, 0);
-        assert_eq!(result.hits[0].rank, 1);
-        assert_eq!(result.hits[1].query_index, 1);
-        assert_eq!(result.hits[1].library_index, 2);
-        assert_eq!(result.hits[1].rank, 1);
-        assert_eq!(state.total(), total_search_pairs(2, 3));
-    }
-
-    #[test]
-    fn search_candidate_sorting_uses_score_matches_then_library_index() {
-        let result = SearchResult {
-            hits: finalize_search_candidates(
-                vec![
-                    super::SearchCandidate {
-                        query_index: 0,
-                        library_index: 2,
-                        spectral_score: 0.8,
-                        taxonomic_score: 0.0,
-                        combined_score: 0.8,
-                        matches: 4,
-                        matched_organism_name: None,
-                        matched_organism_wikidata: None,
-                        matched_shared_rank: None,
-                        matched_short_inchikey: None,
-                    },
-                    super::SearchCandidate {
-                        query_index: 0,
-                        library_index: 1,
-                        spectral_score: 0.8,
-                        taxonomic_score: 0.0,
-                        combined_score: 0.8,
-                        matches: 5,
-                        matched_organism_name: None,
-                        matched_organism_wikidata: None,
-                        matched_shared_rank: None,
-                        matched_short_inchikey: None,
-                    },
-                    super::SearchCandidate {
-                        query_index: 0,
-                        library_index: 0,
-                        spectral_score: 0.8,
-                        taxonomic_score: 0.0,
-                        combined_score: 0.8,
-                        matches: 5,
-                        matched_organism_name: None,
-                        matched_organism_wikidata: None,
-                        matched_shared_rank: None,
-                        matched_short_inchikey: None,
-                    },
-                ],
-                3,
-            ),
-            taxonomic_reranking_applied: false,
-            taxonomic_query: None,
-        };
-
-        assert_eq!(
-            result
-                .hits
-                .iter()
-                .map(|hit| hit.library_index)
-                .collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
-        assert_eq!(
-            result.hits.iter().map(|hit| hit.rank).collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
-    }
-
-    #[test]
-    fn incremental_search_respects_parent_mass_tolerance() {
-        let queries = vec![spectrum(0, 100.0, &[(10.0, 1.0), (20.0, 0.8), (30.0, 0.5)])];
-        let library = vec![
-            spectrum(10, 100.03, &[(10.0, 1.0), (20.0, 0.8), (30.0, 0.5)]),
-            spectrum(11, 100.20, &[(10.0, 1.0), (20.0, 0.8), (30.0, 0.5)]),
-        ];
-        let mut state = IncrementalSearchState::new(
-            queries,
-            library,
-            SearchParams {
-                compute: base_compute_params(SimilarityMetric::CosineGreedy),
-                parent_mass_tolerance: 0.05,
-                min_matched_peaks: 2,
-                min_similarity_threshold: 0.1,
-                top_n: 5,
-                taxonomy: None,
-            },
-        )
-        .expect("failed to create search state");
-
-        let result = loop {
-            match state.step(8).expect("search step failed") {
-                IncrementalSearchStep::Progress => {}
-                IncrementalSearchStep::Finished(result) => break result,
-                IncrementalSearchStep::Cancelled => panic!("unexpected cancel"),
-            }
-        };
-
-        assert_eq!(result.hits.len(), 1);
-        assert_eq!(result.hits[0].library_index, 0);
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn native_search_matches_incremental_result_shape() {
-        let queries = vec![spectrum(0, 100.0, &[(10.0, 1.0), (20.0, 0.8), (30.0, 0.5)])];
-        let library = vec![
-            spectrum(10, 101.0, &[(10.0, 1.0), (20.0, 0.8), (30.0, 0.5)]),
-            spectrum(11, 102.0, &[(10.0, 1.0), (20.1, 0.7), (31.0, 0.4)]),
-        ];
-        let params = SearchParams {
-            compute: base_compute_params(SimilarityMetric::CosineGreedy),
-            parent_mass_tolerance: 5.0,
-            min_matched_peaks: 2,
-            min_similarity_threshold: 0.1,
-            top_n: 2,
-            taxonomy: None,
-        };
-
-        let handle = start_native_search(queries.clone(), library.clone(), params.clone());
-        let native = loop {
-            if let Some(message) = handle.try_recv() {
-                match message {
-                    super::SearchMessage::Finished(result) => break result,
-                    super::SearchMessage::Cancelled => panic!("unexpected cancel"),
-                    super::SearchMessage::Failed(err) => panic!("native search failed: {err}"),
-                }
-            }
-            std::thread::yield_now();
-        };
-
-        let mut incremental =
-            IncrementalSearchState::new(queries, library, params).expect("search state");
-        let incremental = loop {
-            match incremental.step(32).expect("incremental step") {
-                IncrementalSearchStep::Progress => {}
-                IncrementalSearchStep::Finished(result) => break result,
-                IncrementalSearchStep::Cancelled => panic!("unexpected cancel"),
-            }
-        };
-
-        assert_eq!(native, incremental);
-    }
-
-    #[test]
     fn taxonomic_reranking_can_promote_lower_spectral_hit() {
         let queries = vec![spectrum(0, 100.0, &[(10.0, 1.0), (20.0, 0.8), (30.0, 0.5)])];
         let library = vec![
@@ -1360,5 +811,52 @@ mod tests {
             Some("Withania somnifera")
         );
         assert!(result.hits[0].combined_score > result.hits[1].combined_score);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_search_matches_incremental_result_shape() {
+        let queries = vec![spectrum(0, 100.0, &[(10.0, 1.0), (20.0, 0.8), (30.0, 0.5)])];
+        let library = vec![
+            spectrum(10, 101.0, &[(10.0, 1.0), (20.0, 0.8), (30.0, 0.5)]),
+            spectrum(11, 102.0, &[(10.0, 1.0), (20.1, 0.7), (31.0, 0.4)]),
+        ];
+        let params = SearchParams {
+            compute: base_compute_params(SimilarityMetric::CosineGreedy),
+            parent_mass_tolerance: 5.0,
+            min_matched_peaks: 2,
+            min_similarity_threshold: 0.1,
+            top_n: 2,
+            taxonomy: None,
+        };
+
+        let handle = start_native_search(queries.clone(), library.clone(), params.clone());
+        let native = loop {
+            if let Some(message) = handle.try_recv() {
+                match message {
+                    super::SearchMessage::Finished(result) => break result,
+                    super::SearchMessage::Cancelled => panic!("unexpected cancel"),
+                    super::SearchMessage::Failed(err) => panic!("native search failed: {err}"),
+                }
+            }
+            std::thread::yield_now();
+        };
+
+        let mut incremental =
+            IncrementalSearchState::new(queries, library, params).expect("search state");
+        let incremental = loop {
+            match incremental.step(32).expect("incremental step") {
+                IncrementalSearchStep::Progress => {}
+                IncrementalSearchStep::Finished(result) => break result,
+                IncrementalSearchStep::Cancelled => panic!("unexpected cancel"),
+            }
+        };
+
+        assert_eq!(native, incremental);
+    }
+
+    #[test]
+    fn wrapper_total_search_pairs_matches_base() {
+        assert_eq!(total_search_pairs(2, 3), 6);
     }
 }
