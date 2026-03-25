@@ -1,0 +1,37 @@
+[package]
+name = "spectral-matcher"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "spectral_matcher"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spectral-matcher"
+path = "src/main.rs"
+
+[dependencies]
+csv = "1.3"
+mass_spectrometry = { git = "https://github.com/earth-metabolome-initiative/mass-spectrometry-traits" }
+poll-promise = { version = "0.3", features = ["web"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1.10"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+  "Blob",
+  "BlobPropertyBag",
+  "Document",
+  "File",
+  "HtmlAnchorElement",
+  "Url",
+  "Window",
+] }

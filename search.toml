@@ -1,0 +1,20 @@
+[[jobs]]
+name = "demo-search"
+query_mgf = "fixtures/mapp_batch_00231.mgf"
+library_mgf = "fixtures/mapp_batch_00231.mgf"
+output_json = "out/search.json"
+output_tsv = "out/search.tsv"
+
+[jobs.parse]
+min_peaks = 5
+max_peaks = 1000
+
+[jobs.search]
+metric = "CosineGreedy"
+tolerance = 0.02
+mz_power = 0.0
+intensity_power = 1.0
+parent_mass_tolerance = 0.05
+min_matched_peaks = 6
+min_similarity_threshold = 0.7
+top_n = 10

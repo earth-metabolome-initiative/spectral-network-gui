@@ -126,6 +126,17 @@ impl TaxonomyLineage {
         })
     }
 
+    pub fn truncated_to(&self, rank: TaxonomicRank) -> Self {
+        let mut ranks: [Option<String>; 10] = Default::default();
+        for candidate in TaxonomicRank::ALL {
+            if candidate.index() > rank.index() {
+                break;
+            }
+            ranks[candidate.index()] = self.value_for(candidate).map(ToOwned::to_owned);
+        }
+        Self { ranks }
+    }
+
     fn merge_prefer_more_specific(&mut self, other: &Self) {
         if other.specificity_score() > self.specificity_score() {
             *self = other.clone();
@@ -163,6 +174,7 @@ pub struct LotusMetadataIndex {
     by_short_inchikey: HashMap<String, Vec<LotusBiosource>>,
     by_organism_name: HashMap<String, TaxonomyLineage>,
     by_organism_wikidata: HashMap<String, TaxonomyLineage>,
+    by_taxon_name: HashMap<String, TaxonomyLineage>,
 }
 
 impl LotusMetadataIndex {
@@ -180,7 +192,14 @@ impl LotusMetadataIndex {
             });
         }
 
-        let lineage = self.by_organism_name.get(trimmed)?.clone();
+        if let Some(lineage) = self.by_organism_name.get(trimmed) {
+            return Some(ResolvedLotusQuery {
+                query_label: trimmed.to_string(),
+                lineage: lineage.clone(),
+            });
+        }
+
+        let lineage = self.by_taxon_name.get(trimmed)?.clone();
         Some(ResolvedLotusQuery {
             query_label: trimmed.to_string(),
             lineage,
@@ -253,6 +272,7 @@ impl LotusMetadataIndex {
         self.by_organism_name
             .len()
             .max(self.by_organism_wikidata.len())
+            .max(self.by_taxon_name.len())
     }
 }
 
@@ -374,6 +394,7 @@ fn parse_lotus_reader<R: Read>(
     let mut by_short_inchikey: HashMap<String, Vec<LotusBiosource>> = HashMap::new();
     let mut by_organism_name: HashMap<String, TaxonomyLineage> = HashMap::new();
     let mut by_organism_wikidata: HashMap<String, TaxonomyLineage> = HashMap::new();
+    let mut by_taxon_name: HashMap<String, TaxonomyLineage> = HashMap::new();
     let mut rows = 0usize;
 
     for record in csv.records() {
@@ -445,7 +466,18 @@ fn parse_lotus_reader<R: Read>(
             by_organism_wikidata
                 .entry(qid)
                 .and_modify(|existing| existing.merge_prefer_more_specific(&lineage))
-                .or_insert(lineage);
+                .or_insert(lineage.clone());
+        }
+
+        for rank in TaxonomicRank::ALL {
+            let Some(name) = lineage.value_for(rank) else {
+                continue;
+            };
+            let truncated = lineage.truncated_to(rank);
+            by_taxon_name
+                .entry(name.to_string())
+                .and_modify(|existing| existing.merge_prefer_more_specific(&truncated))
+                .or_insert(truncated);
         }
     }
 
@@ -453,6 +485,7 @@ fn parse_lotus_reader<R: Read>(
         by_short_inchikey,
         by_organism_name,
         by_organism_wikidata,
+        by_taxon_name,
     };
     let stats = LotusMetadataStats {
         rows,
@@ -560,6 +593,7 @@ mod tests {
             spectrum: Arc::new(
                 GenericSpectrum::<f64, f64>::with_capacity(100.0, 0).expect("spectrum"),
             ),
+            payload: (),
         }
     }
 
@@ -582,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_query_lineage_by_name_and_qid() {
+    fn resolves_query_lineage_by_name_qid_and_genus() {
         let loaded = sample_lotus();
         let by_name = loaded
             .index
@@ -602,6 +636,21 @@ mod tests {
             by_qid.lineage.value_for(TaxonomicRank::Genus),
             Some("Withania")
         );
+
+        let by_genus = loaded
+            .index
+            .resolve_query_lineage("Withania")
+            .expect("genus lineage");
+        assert_eq!(by_genus.query_label, "Withania");
+        assert_eq!(
+            by_genus.lineage.value_for(TaxonomicRank::Family),
+            Some("Solanaceae")
+        );
+        assert_eq!(
+            by_genus.lineage.value_for(TaxonomicRank::Genus),
+            Some("Withania")
+        );
+        assert_eq!(by_genus.lineage.value_for(TaxonomicRank::Species), None);
     }
 
     #[test]
