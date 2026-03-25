@@ -195,6 +195,8 @@ pub fn build_network(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use crate::compute::PairScore;
     use crate::io::SpectrumMeta;
 
@@ -210,6 +212,7 @@ mod tests {
             filename: None,
             source_scan_usi: None,
             featurelist_feature_id: None,
+            headers: BTreeMap::new(),
             precursor_mz: 100.0 + id as f64,
             num_peaks: 10,
         }
