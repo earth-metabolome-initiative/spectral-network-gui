@@ -343,8 +343,7 @@ mod tests {
     }
 
     fn spectrum_record(id: usize, raw_name: &str, headers: &[(&str, &str)]) -> SpectrumRecord {
-        let spectrum =
-            GenericSpectrum::<f64, f64>::with_capacity(100.0 + id as f64, 0).expect("spectrum");
+        let spectrum = GenericSpectrum::with_capacity(100.0 + id as f64, 0).expect("spectrum");
         let mut header_map = BTreeMap::new();
         for (key, value) in headers {
             header_map.insert((*key).to_string(), (*value).to_string());
