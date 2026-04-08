@@ -1,42 +1,24 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::Path;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::attributes::AttributeTable;
 use crate::attributes::LoadedAttributeTable;
-use crate::compute::{ComputeParams, PairScore, SearchResult, SimilarityMetric};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::compute::SearchHit;
-#[cfg(target_arch = "wasm32")]
-use crate::compute::{
-    ComputeMessage, IncrementalComputeState, IncrementalSearchState, IncrementalSearchStep,
-    IncrementalStep, NativeComputeHandle, NativeSearchHandle, SearchMessage, SearchParams,
-    SearchTaxonomyConfig,
-};
+use crate::attributes::AttributeTable;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::compute::{IncrementalComputeState, IncrementalSearchState};
+use crate::compute::ComputeParams;
+use crate::compute::{SearchHit, SearchResult, SimilarityMetric};
 #[cfg(target_arch = "wasm32")]
 use crate::export::download_tsv_file;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::export::save_tsv_to_path;
 use crate::export::{SearchQueryKey, export_csv_strings, export_search_tsv};
-#[cfg(target_arch = "wasm32")]
-use crate::io::load_mgf_bytes;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::io::start_native_mgf_load;
-use crate::io::{LoadedSpectra, ParseStats, SpectrumRecord};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::io::spectrum_record_from_parts;
-#[cfg(target_arch = "wasm32")]
-use crate::io::SpectrumMeta;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::io::{NativeLoadHandle, NativeLoadMessage};
+use crate::io::{spectrum_record_from_metadata, spectrum_record_from_parts};
+use crate::io::{ParseStats, SpectrumRecord};
 use crate::layout::force_directed_layout;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::matcher_client::{
@@ -44,26 +26,39 @@ use crate::matcher_client::{
     start_native_network_request,
     start_native_search_request,
 };
-#[cfg(target_arch = "wasm32")]
-use crate::metadata::load_lotus_bytes;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::metadata::start_native_lotus_load;
 use crate::metadata::{LoadedLotusMetadata, TaxonomicRank, short_inchikey};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::metadata::{NativeLotusLoadHandle, NativeLotusLoadMessage};
 use crate::network::{ComponentSelection, SpectralNetwork};
-#[cfg(target_arch = "wasm32")]
-use crate::network::build_network;
 use crate::render::{GraphViewState, draw_network};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::search_exports::{
     MergedSearchExportTable, SearchExportJobInput, SearchExportTable, default_search_export_alias,
     merge_search_exports, parse_search_export_tsv,
 };
-#[cfg(not(target_arch = "wasm32"))]
 use spectral_matcher::{NetworkArtifact, NetworkRequest, SearchArtifact, SearchRequest};
 
+#[cfg(target_arch = "wasm32")]
+struct NativeMatcherHandle<T>(std::marker::PhantomData<T>);
+
+#[cfg(target_arch = "wasm32")]
+impl<T> NativeMatcherHandle<T> {
+    fn cancel(&self) {}
+
+    fn try_recv(&self) -> Option<Result<T, String>> {
+        None
+    }
+
+    fn progress(&self) -> Option<(f32, String)> {
+        None
+    }
+
+    fn status_text(&self) -> String {
+        "matcher unavailable on wasm".to_string()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 const MIN_PEAKS: usize = 5;
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_PEAKS: usize = 1000;
 const LAYOUT_STOP_EPSILON: f32 = 0.0015;
 const LAYOUT_STOP_STREAK: usize = 15;
@@ -73,12 +68,6 @@ const DEFAULT_MGF_PATH: &str = "fixtures/mapp_batch_00231.mgf";
 const DEFAULT_LIBRARY_PATH: &str = "";
 #[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_LOTUS_PATH: &str = "";
-
-#[cfg(target_arch = "wasm32")]
-struct UploadedFile {
-    name: String,
-    bytes: Vec<u8>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NodeAttrMatchField {
@@ -247,6 +236,7 @@ struct LoadedSearchExportJob {
     table: SearchExportTable,
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 struct ActiveMergedSearchExportInfo {
     source_label: String,
     row_count: usize,
@@ -328,12 +318,6 @@ pub struct SpectralApp {
     #[cfg(not(target_arch = "wasm32"))]
     loaded_search_export_jobs: Vec<LoadedSearchExportJob>,
     active_merged_search_export: Option<ActiveMergedSearchExportInfo>,
-    #[cfg(not(target_arch = "wasm32"))]
-    query_load: Option<NativeLoadHandle>,
-    #[cfg(not(target_arch = "wasm32"))]
-    library_load: Option<NativeLoadHandle>,
-    #[cfg(not(target_arch = "wasm32"))]
-    lotus_load: Option<NativeLotusLoadHandle>,
     source_label: Option<String>,
     parse_stats: Option<ParseStats>,
     spectra: Vec<SpectrumRecord>,
@@ -375,7 +359,6 @@ pub struct SpectralApp {
     layout_low_motion_streak: usize,
     request_fit_view: bool,
 
-    pair_scores: Option<Vec<PairScore>>,
     network: Option<SpectralNetwork>,
     component_selection: ComponentSelection,
     positions: HashMap<usize, [f32; 2]>,
@@ -384,16 +367,8 @@ pub struct SpectralApp {
     selected_node_id: Option<usize>,
     secondary_selected_node_id: Option<usize>,
 
-    #[cfg(not(target_arch = "wasm32"))]
     native_compute: Option<NativeMatcherHandle<NetworkArtifact>>,
-    #[cfg(target_arch = "wasm32")]
-    native_compute: Option<NativeComputeHandle>,
-    incremental_compute: Option<IncrementalComputeState>,
-    #[cfg(not(target_arch = "wasm32"))]
     native_search: Option<NativeMatcherHandle<SearchArtifact>>,
-    #[cfg(target_arch = "wasm32")]
-    native_search: Option<NativeSearchHandle>,
-    incremental_search: Option<IncrementalSearchState>,
 
     status_message: Option<String>,
     error_message: Option<String>,
@@ -441,13 +416,6 @@ pub struct SpectralApp {
     peak_filter_tolerance: f64,
     peak_filter_tolerance_unit: PeakToleranceUnit,
     peak_filtered_node_ids: Option<HashSet<usize>>,
-
-    #[cfg(target_arch = "wasm32")]
-    upload_promise: Option<poll_promise::Promise<Result<UploadedFile, String>>>,
-    #[cfg(target_arch = "wasm32")]
-    library_upload_promise: Option<poll_promise::Promise<Result<UploadedFile, String>>>,
-    #[cfg(target_arch = "wasm32")]
-    lotus_upload_promise: Option<poll_promise::Promise<Result<UploadedFile, String>>>,
 }
 
 impl SpectralApp {
@@ -470,12 +438,6 @@ impl SpectralApp {
             #[cfg(not(target_arch = "wasm32"))]
             loaded_search_export_jobs: Vec::new(),
             active_merged_search_export: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            query_load: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            library_load: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            lotus_load: None,
             source_label: None,
             parse_stats: None,
             spectra: Vec::new(),
@@ -514,7 +476,6 @@ impl SpectralApp {
             layout_mean_displacement: 0.0,
             layout_low_motion_streak: 0,
             request_fit_view: false,
-            pair_scores: None,
             network: None,
             component_selection: ComponentSelection::All,
             positions: HashMap::new(),
@@ -529,9 +490,7 @@ impl SpectralApp {
             selected_node_id: None,
             secondary_selected_node_id: None,
             native_compute: None,
-            incremental_compute: None,
             native_search: None,
-            incremental_search: None,
             status_message: None,
             error_message: None,
             search_results: None,
@@ -577,17 +536,10 @@ impl SpectralApp {
             peak_filter_tolerance: 0.02,
             peak_filter_tolerance_unit: PeakToleranceUnit::Da,
             peak_filtered_node_ids: None,
-            #[cfg(target_arch = "wasm32")]
-            upload_promise: None,
-            #[cfg(target_arch = "wasm32")]
-            library_upload_promise: None,
-            #[cfg(target_arch = "wasm32")]
-            lotus_upload_promise: None,
         }
     }
 
     fn clear_compute_outputs(&mut self) {
-        self.pair_scores = None;
         self.network = None;
         self.positions.clear();
         self.hovered_node_id = None;
@@ -612,7 +564,6 @@ impl SpectralApp {
         self.search_results = None;
         self.last_search_tsv = None;
         self.native_search = None;
-        self.incremental_search = None;
     }
 
     fn clear_spectrum_view_state(&mut self) {
@@ -807,45 +758,6 @@ impl SpectralApp {
         self.status_message = Some("Peak filter cleared".to_string());
     }
 
-    fn set_loaded_spectra(&mut self, loaded: LoadedSpectra) {
-        self.source_label = Some(loaded.source_label.clone());
-        self.parse_stats = Some(loaded.stats);
-        self.spectra = loaded.spectra;
-        self.clear_compute_outputs();
-        self.clear_search_outputs();
-        self.status_message = Some(format!(
-            "Loaded {} spectra from {}",
-            self.spectra.len(),
-            loaded.source_label
-        ));
-        self.error_message = None;
-    }
-
-    fn set_loaded_library_spectra(&mut self, loaded: LoadedSpectra) {
-        self.library_source_label = Some(loaded.source_label.clone());
-        self.library_parse_stats = Some(loaded.stats);
-        self.library_spectra = loaded.spectra;
-        self.clear_search_outputs();
-        self.status_message = Some(format!(
-            "Loaded spectral library: {} spectra from {}",
-            self.library_spectra.len(),
-            loaded.source_label
-        ));
-        self.error_message = None;
-    }
-
-    fn set_loaded_lotus_metadata(&mut self, loaded: LoadedLotusMetadata) {
-        let stats = loaded.stats.clone();
-        let source_label = loaded.source_label.clone();
-        self.lotus_metadata = Some(loaded);
-        self.clear_search_outputs();
-        self.status_message = Some(format!(
-            "Loaded LOTUS metadata: {} rows, {} structures, {} biosources from {}",
-            stats.rows, stats.indexed_structures, stats.indexed_biosources, source_label
-        ));
-        self.error_message = None;
-    }
-
     #[cfg(not(target_arch = "wasm32"))]
     fn matcher_network_request(&self) -> Result<NetworkRequest, String> {
         let path = self.mgf_path.trim();
@@ -870,6 +782,11 @@ impl SpectralApp {
                 top_k: self.pending_top_k.max(1),
             },
         })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn matcher_network_request(&self) -> Result<NetworkRequest, String> {
+        Err("Matcher-driven build submission is currently unavailable on wasm".to_string())
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -938,7 +855,11 @@ impl SpectralApp {
         })
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(target_arch = "wasm32")]
+    fn matcher_search_request(&self) -> Result<SearchRequest, String> {
+        Err("Matcher-driven spectral search is currently unavailable on wasm".to_string())
+    }
+
     fn apply_network_artifact(&mut self, artifact: NetworkArtifact) {
         let mut spectra = Vec::with_capacity(artifact.spectra.len());
         for spectrum in &artifact.spectra {
@@ -961,7 +882,6 @@ impl SpectralApp {
         self.threshold = artifact.build.threshold.clamp(0.0, 1.0);
         self.top_k = artifact.build.top_k.max(1);
         self.pending_top_k = self.top_k;
-        self.pair_scores = None;
         self.network = Some(SpectralNetwork {
             nodes: artifact
                 .network
@@ -1031,14 +951,32 @@ impl SpectralApp {
         self.error_message = None;
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn apply_search_artifact(&mut self, artifact: SearchArtifact) {
         self.last_search_tsv = Some(artifact.tsv.clone());
+        let query_records = artifact
+            .query_spectra
+            .iter()
+            .cloned()
+            .map(spectrum_record_from_metadata)
+            .collect::<Result<Vec<_>, _>>();
+        let library_records = artifact
+            .library_spectra
+            .iter()
+            .cloned()
+            .map(spectrum_record_from_metadata)
+            .collect::<Result<Vec<_>, _>>();
+        let (Ok(query_records), Ok(library_records)) = (query_records, library_records) else {
+            self.error_message =
+                Some("Failed to rebuild metadata-only spectra from matcher search artifact".to_string());
+            return;
+        };
+
         self.search_results = Some(SearchResult {
             hits: artifact
                 .result
                 .hits
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(|hit| SearchHit {
                     query_index: hit.query_index,
                     library_index: hit.library_index,
@@ -1060,6 +998,8 @@ impl SpectralApp {
         self.library_source_label = Some(artifact.library_source_label.clone());
         self.parse_stats = Some(artifact.query_stats);
         self.library_parse_stats = Some(artifact.library_stats);
+        self.spectra = query_records;
+        self.library_spectra = library_records;
         self.status_message = Some(format!(
             "Spectral search finished: {} hit(s) across {} query spectrum/spectra",
             self.search_results
@@ -1096,75 +1036,6 @@ impl SpectralApp {
             self.color_nodes_by_attribute = false;
         } else if self.node_color_attr_column >= table_columns {
             self.node_color_attr_column = 0;
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn load_from_path(&mut self) {
-        if self.is_computing() {
-            return;
-        }
-        let path = self.mgf_path.trim();
-        if path.is_empty() {
-            self.error_message = Some("MGF path is empty".to_string());
-            return;
-        }
-
-        match start_native_mgf_load(Path::new(path), MIN_PEAKS, MAX_PEAKS) {
-            Ok(handle) => {
-                self.query_load = Some(handle);
-                self.status_message = Some(format!("Loading query spectra from {path}"));
-                self.error_message = None;
-            }
-            Err(err) => {
-                self.error_message = Some(err);
-            }
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn load_library_from_path(&mut self) {
-        if self.is_computing() {
-            return;
-        }
-        let path = self.library_mgf_path.trim();
-        if path.is_empty() {
-            self.error_message = Some("Library MGF path is empty".to_string());
-            return;
-        }
-
-        match start_native_mgf_load(Path::new(path), MIN_PEAKS, MAX_PEAKS) {
-            Ok(handle) => {
-                self.library_load = Some(handle);
-                self.status_message = Some(format!("Loading spectral library from {path}"));
-                self.error_message = None;
-            }
-            Err(err) => {
-                self.error_message = Some(err);
-            }
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn load_lotus_from_path(&mut self) {
-        if self.is_computing() {
-            return;
-        }
-        let path = self.lotus_csv_path.trim();
-        if path.is_empty() {
-            self.error_message = Some("LOTUS CSV path is empty".to_string());
-            return;
-        }
-
-        match start_native_lotus_load(Path::new(path)) {
-            Ok(handle) => {
-                self.lotus_load = Some(handle);
-                self.status_message = Some(format!("Loading LOTUS metadata from {path}"));
-                self.error_message = None;
-            }
-            Err(err) => {
-                self.error_message = Some(err);
-            }
         }
     }
 
@@ -1412,132 +1283,7 @@ impl SpectralApp {
         }
     }
 
-    #[cfg(target_arch = "wasm32")]
-    fn start_upload_dialog(&mut self) {
-        self.upload_promise = Some(poll_promise::Promise::spawn_local(async move {
-            let Some(file_handle) = rfd::AsyncFileDialog::new()
-                .add_filter("MGF", &["mgf"])
-                .pick_file()
-                .await
-            else {
-                return Err("No file selected".to_string());
-            };
-
-            let name = file_handle.file_name();
-            let bytes = file_handle.read().await;
-            Ok(UploadedFile { name, bytes })
-        }));
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn start_library_upload_dialog(&mut self) {
-        self.library_upload_promise = Some(poll_promise::Promise::spawn_local(async move {
-            let Some(file_handle) = rfd::AsyncFileDialog::new()
-                .add_filter("MGF", &["mgf"])
-                .pick_file()
-                .await
-            else {
-                return Err("No file selected".to_string());
-            };
-
-            let name = file_handle.file_name();
-            let bytes = file_handle.read().await;
-            Ok(UploadedFile { name, bytes })
-        }));
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn start_lotus_upload_dialog(&mut self) {
-        self.lotus_upload_promise = Some(poll_promise::Promise::spawn_local(async move {
-            let Some(file_handle) = rfd::AsyncFileDialog::new()
-                .add_filter("CSV", &["csv"])
-                .pick_file()
-                .await
-            else {
-                return Err("No file selected".to_string());
-            };
-
-            let name = file_handle.file_name();
-            let bytes = file_handle.read().await;
-            Ok(UploadedFile { name, bytes })
-        }));
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn poll_upload_dialog(&mut self) {
-        let Some(promise) = &self.upload_promise else {
-            return;
-        };
-
-        let Some(result) = promise.ready() else {
-            return;
-        };
-
-        match result {
-            Ok(file) => match load_mgf_bytes(&file.name, &file.bytes, MIN_PEAKS, MAX_PEAKS) {
-                Ok(loaded) => self.set_loaded_spectra(loaded),
-                Err(err) => self.error_message = Some(err),
-            },
-            Err(err) => {
-                if err != "No file selected" {
-                    self.error_message = Some(err.clone());
-                }
-            }
-        }
-
-        self.upload_promise = None;
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn poll_library_upload_dialog(&mut self) {
-        let Some(promise) = &self.library_upload_promise else {
-            return;
-        };
-
-        let Some(result) = promise.ready() else {
-            return;
-        };
-
-        match result {
-            Ok(file) => match load_mgf_bytes(&file.name, &file.bytes, MIN_PEAKS, MAX_PEAKS) {
-                Ok(loaded) => self.set_loaded_library_spectra(loaded),
-                Err(err) => self.error_message = Some(err),
-            },
-            Err(err) => {
-                if err != "No file selected" {
-                    self.error_message = Some(err.clone());
-                }
-            }
-        }
-
-        self.library_upload_promise = None;
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn poll_lotus_upload_dialog(&mut self) {
-        let Some(promise) = &self.lotus_upload_promise else {
-            return;
-        };
-
-        let Some(result) = promise.ready() else {
-            return;
-        };
-
-        match result {
-            Ok(file) => match load_lotus_bytes(&file.name, &file.bytes) {
-                Ok(loaded) => self.set_loaded_lotus_metadata(loaded),
-                Err(err) => self.error_message = Some(err),
-            },
-            Err(err) => {
-                if err != "No file selected" {
-                    self.error_message = Some(err.clone());
-                }
-            }
-        }
-
-        self.lotus_upload_promise = None;
-    }
-
+    #[cfg(not(target_arch = "wasm32"))]
     fn parse_compute_params_for(
         &self,
         metric: SimilarityMetric,
@@ -1568,49 +1314,8 @@ impl SpectralApp {
         })
     }
 
-    #[cfg(target_arch = "wasm32")]
-    fn parse_search_params(&self) -> Result<SearchParams, String> {
-        let taxonomy = if self.search_enable_taxonomic_reranking {
-            let loaded = self.lotus_metadata.as_ref().ok_or_else(|| {
-                "Load LOTUS metadata before enabling taxonomic reranking".to_string()
-            })?;
-            let trimmed_query = self.search_taxonomic_query.trim();
-            if trimmed_query.is_empty() {
-                return Err(
-                    "Enter a biosource query before running taxonomic reranking".to_string()
-                );
-            }
-            let query = loaded
-                .index
-                .resolve_query_lineage(trimmed_query)
-                .ok_or_else(|| format!("Biosource not found in LOTUS: {trimmed_query}"))?;
-            Some(SearchTaxonomyConfig {
-                lotus: loaded.index.clone(),
-                query,
-            })
-        } else {
-            None
-        };
-
-        Ok(SearchParams {
-            compute: self.parse_compute_params_for(
-                self.search_metric,
-                Some(self.search_top_n_peaks_per_spectrum),
-            )?,
-            parent_mass_tolerance: self.search_parent_mass_tolerance.max(0.0),
-            min_matched_peaks: self.search_min_matched_peaks.max(1),
-            min_similarity_threshold: self.search_min_similarity_threshold.clamp(0.0, 1.0),
-            top_n: self.search_top_n.max(1),
-            taxonomy,
-        })
-    }
-
     fn run_build_network(&mut self) {
         if self.is_computing() {
-            return;
-        }
-        if self.spectra.is_empty() {
-            self.error_message = Some("Load spectra before building network".to_string());
             return;
         }
 
@@ -1623,54 +1328,34 @@ impl SpectralApp {
     }
 
     fn start_compute(&mut self) {
-        if self.spectra.is_empty() {
-            self.error_message = Some("Load spectra before starting compute".to_string());
-            return;
-        }
-
         self.clear_compute_outputs();
         self.error_message = None;
         self.status_message =
             Some("Submitting spectral network job to spectral-matcher...".to_string());
 
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            match self.matcher_network_request() {
-                Ok(request) => {
+        match self.matcher_network_request() {
+            Ok(request) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
                     self.native_compute = Some(start_native_network_request(
                         self.matcher_base_url.clone(),
                         request,
                         self.matcher_log.clone(),
                     ));
                 }
-                Err(err) => {
-                    self.error_message = Some(err);
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = request;
+                    self.error_message = Some(
+                        "Matcher-driven build submission is currently unavailable on wasm"
+                            .to_string(),
+                    );
                     self.status_message = None;
                 }
             }
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            let params = match self.parse_compute_params_for(
-                self.selected_metric,
-                Some(self.build_top_n_peaks_per_spectrum),
-            ) {
-                Ok(params) => params,
-                Err(err) => {
-                    self.error_message = Some(err);
-                    self.status_message = None;
-                    return;
-                }
-            };
-            match IncrementalComputeState::new(self.spectra.clone(), params) {
-                Ok(state) => {
-                    self.incremental_compute = Some(state);
-                }
-                Err(err) => {
-                    self.error_message = Some(err);
-                    self.status_message = None;
-                }
+            Err(err) => {
+                self.error_message = Some(err);
+                self.status_message = None;
             }
         }
     }
@@ -1679,72 +1364,35 @@ impl SpectralApp {
         if self.is_computing() {
             return;
         }
-        if let Some(err) =
-            spectral_search_precondition_error(self.spectra.len(), self.library_spectra.len())
-        {
-            self.error_message = Some(err.to_string());
-            return;
-        }
 
         self.clear_search_outputs();
         self.error_message = None;
 
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            match self.matcher_search_request() {
-                Ok(request) => {
-                    self.status_message = Some(format!(
-                        "Submitting spectral search job to spectral-matcher for {} query spectra...",
-                        self.spectra.len()
-                    ));
+        match self.matcher_search_request() {
+            Ok(request) => {
+                self.status_message =
+                    Some("Submitting spectral search job to spectral-matcher...".to_string());
+                #[cfg(not(target_arch = "wasm32"))]
+                {
                     self.native_search = Some(start_native_search_request(
                         self.matcher_base_url.clone(),
                         request,
                         self.matcher_log.clone(),
                     ));
                 }
-                Err(err) => {
-                    self.error_message = Some(err);
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = request;
+                    self.error_message = Some(
+                        "Matcher-driven search submission is currently unavailable on wasm"
+                            .to_string(),
+                    );
                     self.status_message = None;
                 }
             }
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            let params = match self.parse_search_params() {
-                Ok(params) => params,
-                Err(err) => {
-                    self.error_message = Some(err);
-                    self.status_message = None;
-                    return;
-                }
-            };
-            let taxonomy_suffix = params
-                .taxonomy
-                .as_ref()
-                .map(|config| format!(" with taxonomic reranking for {}", config.query.query_label))
-                .unwrap_or_default();
-            self.status_message = Some(format!(
-                "Searching {} query spectra against {} library spectra with {} (parent mass tolerance {:.4} Da){}...",
-                self.spectra.len(),
-                self.library_spectra.len(),
-                params.compute.metric.label(),
-                params.parent_mass_tolerance,
-                taxonomy_suffix
-            ));
-            match IncrementalSearchState::new(
-                self.spectra.clone(),
-                self.library_spectra.clone(),
-                params,
-            ) {
-                Ok(state) => {
-                    self.incremental_search = Some(state);
-                }
-                Err(err) => {
-                    self.error_message = Some(err);
-                    self.status_message = None;
-                }
+            Err(err) => {
+                self.error_message = Some(err);
+                self.status_message = None;
             }
         }
     }
@@ -1754,29 +1402,14 @@ impl SpectralApp {
             handle.cancel();
         }
         self.native_compute = None;
-        if let Some(state) = &mut self.incremental_compute {
-            state.cancel();
-        }
-        self.incremental_compute = None;
         if let Some(handle) = &self.native_search {
             handle.cancel();
         }
         self.native_search = None;
-        if let Some(state) = &mut self.incremental_search {
-            state.cancel();
-        }
-        self.incremental_search = None;
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.status_message = Some(
-                "Cancellation requested. The GUI released the current job; the matcher should stop it shortly."
-                    .to_string(),
-            );
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.status_message = Some("Cancelling compute...".to_string());
-        }
+        self.status_message = Some(
+            "Cancellation requested. The GUI released the current job; the matcher should stop it shortly."
+                .to_string(),
+        );
     }
 
     fn export_search_results(&mut self) {
@@ -1845,362 +1478,58 @@ impl SpectralApp {
         }
     }
 
-    #[cfg(target_arch = "wasm32")]
-    fn rebuild_network(&mut self) {
-        let Some(scores) = self.pair_scores.as_ref() else {
-            return;
-        };
-
-        let metas: Vec<SpectrumMeta> = self.spectra.iter().map(|s| s.meta.clone()).collect();
-        let network = build_network(&metas, scores, self.threshold, self.top_k);
-
-        if let ComponentSelection::Component(cid) = self.component_selection
-            && cid >= network.components.len()
-        {
-            self.component_selection = ComponentSelection::All;
-        }
-        let visible_set = self.effective_visible_node_set(
-            &network,
-            self.component_selection,
-            self.hide_singletons,
-        );
-        self.clamp_selection_to_visible_set(&visible_set);
-        let mut visible: Vec<usize> = visible_set.into_iter().collect();
-        visible.sort_unstable();
-        let layout = force_directed_layout(
-            &network,
-            &visible,
-            &self.positions,
-            120,
-            self.node_force,
-            self.edge_force,
-        );
-        for (node_id, pos) in layout.positions {
-            self.positions.insert(node_id, pos);
-        }
-        self.layout_mean_displacement = layout.mean_displacement;
-        self.layout_low_motion_streak = 0;
-        self.layout_running = false;
-        self.request_fit_view = true;
-
-        self.status_message = Some(format!(
-            "Network rebuilt: threshold={:.3}, top-k={}, nodes={}, edges={}, components={}",
-            self.threshold,
-            self.top_k,
-            network.nodes.len(),
-            network.edges.len(),
-            network.components.len()
-        ));
-        self.network = Some(network);
-    }
-
     fn poll_compute(&mut self, ctx: &egui::Context) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if let Some(handle) = &self.native_compute {
-                if let Some(result) = handle.try_recv() {
-                    self.native_compute = None;
-                    match result {
-                        Ok(artifact) => self.apply_network_artifact(artifact),
-                        Err(err) if err == "matcher request cancelled" => {
-                            self.status_message = Some("Network job cancelled".to_string());
-                        }
-                        Err(err) => {
-                            self.error_message = Some(err);
-                            self.status_message = None;
-                        }
-                    }
-                } else {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                }
-            }
-            return;
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-        let mut finished: Option<ComputeMessage> = None;
-
         if let Some(handle) = &self.native_compute {
-            if let Some(msg) = handle.try_recv() {
-                finished = Some(msg);
+            if let Some(result) = handle.try_recv() {
+                self.native_compute = None;
+                match result {
+                    Ok(artifact) => self.apply_network_artifact(artifact),
+                    Err(err) if err == "matcher request cancelled" => {
+                        self.status_message = Some("Network job cancelled".to_string());
+                    }
+                    Err(err) => {
+                        self.error_message = Some(err);
+                        self.status_message = None;
+                    }
+                }
             } else {
-                ctx.request_repaint();
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
-        }
-
-        if let Some(state) = &mut self.incremental_compute {
-            match state.step(2_000) {
-                Ok(IncrementalStep::Progress) => {
-                    ctx.request_repaint();
-                }
-                Ok(IncrementalStep::Finished(result)) => {
-                    finished = Some(ComputeMessage::Finished(result));
-                }
-                Ok(IncrementalStep::Cancelled) => {
-                    finished = Some(ComputeMessage::Cancelled);
-                }
-                Err(err) => {
-                    finished = Some(ComputeMessage::Failed(err));
-                }
-            }
-        }
-
-        if let Some(message) = finished {
-            self.native_compute = None;
-            self.incremental_compute = None;
-
-            match message {
-                ComputeMessage::Finished(result) => {
-                    self.pair_scores = Some(result.pairs);
-                    self.status_message = Some("Compute finished".to_string());
-                    self.rebuild_network();
-                }
-                ComputeMessage::Cancelled => {
-                    self.status_message = Some("Compute cancelled".to_string());
-                }
-                ComputeMessage::Failed(err) => {
-                    self.error_message = Some(err);
-                }
-            }
-        }
         }
     }
 
     fn poll_search(&mut self, ctx: &egui::Context) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if let Some(handle) = &self.native_search {
-                if let Some(result) = handle.try_recv() {
-                    self.native_search = None;
-                    match result {
-                        Ok(artifact) => self.apply_search_artifact(artifact),
-                        Err(err) if err == "matcher request cancelled" => {
-                            self.status_message = Some("Spectral search cancelled".to_string());
-                        }
-                        Err(err) => {
-                            self.error_message = Some(err);
-                            self.status_message = None;
-                        }
-                    }
-                } else {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                }
-            }
-            return;
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-        let mut finished: Option<SearchMessage> = None;
-
         if let Some(handle) = &self.native_search {
-            if let Some(msg) = handle.try_recv() {
-                finished = Some(msg);
+            if let Some(result) = handle.try_recv() {
+                self.native_search = None;
+                match result {
+                    Ok(artifact) => self.apply_search_artifact(artifact),
+                    Err(err) if err == "matcher request cancelled" => {
+                        self.status_message = Some("Spectral search cancelled".to_string());
+                    }
+                    Err(err) => {
+                        self.error_message = Some(err);
+                        self.status_message = None;
+                    }
+                }
             } else {
-                ctx.request_repaint();
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
         }
-
-        if let Some(state) = &mut self.incremental_search {
-            match state.step(2_000) {
-                Ok(IncrementalSearchStep::Progress) => {
-                    ctx.request_repaint();
-                }
-                Ok(IncrementalSearchStep::Finished(result)) => {
-                    finished = Some(SearchMessage::Finished(result));
-                }
-                Ok(IncrementalSearchStep::Cancelled) => {
-                    finished = Some(SearchMessage::Cancelled);
-                }
-                Err(err) => {
-                    finished = Some(SearchMessage::Failed(err));
-                }
-            }
-        }
-
-        if let Some(message) = finished {
-            self.native_search = None;
-            self.incremental_search = None;
-
-            match message {
-                SearchMessage::Finished(result) => {
-                    let hit_count = result.hits.len();
-                    let query_count = result
-                        .hits
-                        .iter()
-                        .map(|hit| hit.query_index)
-                        .collect::<HashSet<_>>()
-                        .len();
-                    let rerank_suffix = if result.taxonomic_reranking_applied {
-                        let query = result.taxonomic_query.as_deref().unwrap_or("LOTUS query");
-                        format!(" with taxonomic reranking ({query})")
-                    } else {
-                        String::new()
-                    };
-                    self.search_results = Some(result);
-                    self.status_message = Some(format!(
-                        "Spectral search finished: {hit_count} hit(s) across {query_count} query spectrum/spectra{rerank_suffix}"
-                    ));
-                    self.error_message = None;
-                }
-                SearchMessage::Cancelled => {
-                    self.status_message = Some("Spectral search cancelled".to_string());
-                }
-                SearchMessage::Failed(err) => {
-                    self.error_message = Some(err);
-                }
-            }
-        }
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn load_progress(handle: &NativeLoadHandle, label: &str) -> (f32, String) {
-        let total = handle.total_bytes();
-        let processed = handle.processed_bytes();
-        let frac = if total == 0 {
-            0.0
-        } else if processed >= total {
-            0.95
-        } else {
-            ((processed as f32 / total as f32) * 0.95).clamp(0.0, 0.95)
-        };
-        (
-            frac,
-            format!(
-                "{label}: {} accepted spectra, {} blocks scanned",
-                handle.accepted(),
-                handle.ions_blocks()
-            ),
-        )
     }
 
     fn active_progress(&self) -> Option<(f32, String)> {
-        #[cfg(not(target_arch = "wasm32"))]
         if let Some(handle) = &self.native_compute {
             return Some(handle.progress().unwrap_or_else(|| (0.0, handle.status_text())));
         }
-        #[cfg(not(target_arch = "wasm32"))]
         if let Some(handle) = &self.native_search {
             return Some(handle.progress().unwrap_or_else(|| (0.0, handle.status_text())));
-        }
-        #[cfg(target_arch = "wasm32")]
-        if let Some(handle) = &self.native_compute {
-            let total = handle.total();
-            let done = handle.done();
-            let frac = if total == 0 {
-                0.0
-            } else {
-                done as f32 / total as f32
-            };
-            return Some((frac, format!("Build: {done}/{total}")));
-        }
-        #[cfg(target_arch = "wasm32")]
-        if let Some(state) = &self.incremental_compute {
-            let total = state.total();
-            let done = state.done();
-            let frac = if total == 0 {
-                0.0
-            } else {
-                done as f32 / total as f32
-            };
-            return Some((frac, format!("Build: {done}/{total}")));
-        }
-        #[cfg(target_arch = "wasm32")]
-        if let Some(handle) = &self.native_search {
-            let total = handle.total();
-            let done = handle.done();
-            let frac = if total == 0 {
-                0.0
-            } else {
-                done as f32 / total as f32
-            };
-            return Some((frac, format!("Search: {done}/{total}")));
-        }
-        #[cfg(target_arch = "wasm32")]
-        if let Some(state) = &self.incremental_search {
-            let total = state.total();
-            let done = state.done();
-            let frac = if total == 0 {
-                0.0
-            } else {
-                done as f32 / total as f32
-            };
-            return Some((frac, format!("Search: {done}/{total}")));
         }
         None
     }
 
     fn is_computing(&self) -> bool {
-        #[cfg(not(target_arch = "wasm32"))]
-        if self.query_load.is_some() || self.library_load.is_some() || self.lotus_load.is_some() {
-            return true;
-        }
-        self.native_compute.is_some()
-            || self.incremental_compute.is_some()
-            || self.native_search.is_some()
-            || self.incremental_search.is_some()
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn poll_native_loads(&mut self, ctx: &egui::Context) {
-        let mut query_finished: Option<NativeLoadMessage> = None;
-        if let Some(handle) = &self.query_load {
-            if let Some(message) = handle.try_recv() {
-                query_finished = Some(message);
-            } else {
-                ctx.request_repaint();
-            }
-        }
-        if let Some(message) = query_finished {
-            self.query_load = None;
-            match message {
-                NativeLoadMessage::Finished(loaded) => self.set_loaded_spectra(loaded),
-                NativeLoadMessage::Failed(err) => {
-                    self.status_message = None;
-                    self.error_message = Some(err);
-                }
-            }
-        }
-
-        let mut library_finished: Option<NativeLoadMessage> = None;
-        if let Some(handle) = &self.library_load {
-            if let Some(message) = handle.try_recv() {
-                library_finished = Some(message);
-            } else {
-                ctx.request_repaint();
-            }
-        }
-        if let Some(message) = library_finished {
-            self.library_load = None;
-            match message {
-                NativeLoadMessage::Finished(loaded) => self.set_loaded_library_spectra(loaded),
-                NativeLoadMessage::Failed(err) => {
-                    self.status_message = None;
-                    self.error_message = Some(err);
-                }
-            }
-        }
-
-        let mut lotus_finished: Option<NativeLotusLoadMessage> = None;
-        if let Some(handle) = &self.lotus_load {
-            if let Some(message) = handle.try_recv() {
-                lotus_finished = Some(message);
-            } else {
-                ctx.request_repaint();
-            }
-        }
-        if let Some(message) = lotus_finished {
-            self.lotus_load = None;
-            match message {
-                NativeLotusLoadMessage::Finished(loaded) => self.set_loaded_lotus_metadata(loaded),
-                NativeLotusLoadMessage::Failed(err) => {
-                    self.status_message = None;
-                    self.error_message = Some(err);
-                }
-            }
-        }
+        self.native_compute.is_some() || self.native_search.is_some()
     }
 
     fn relayout_visible(&mut self, iterations: usize) -> Option<f32> {
@@ -2422,34 +1751,18 @@ impl SpectralApp {
             return cached_value;
         }
 
-        let score = self.pair_scores.as_ref().and_then(|pairs| {
-            pairs.iter().find_map(|pair| {
-                let (pair_left, pair_right) = if pair.left <= pair.right {
-                    (pair.left, pair.right)
+        let score = self.network.as_ref().and_then(|network| {
+            network.edges.iter().find_map(|edge| {
+                let (edge_left, edge_right) = if edge.source <= edge.target {
+                    (edge.source, edge.target)
                 } else {
-                    (pair.right, pair.left)
+                    (edge.target, edge.source)
                 };
-                if pair_left == left && pair_right == right {
-                    Some(pair.score)
+                if edge_left == left && edge_right == right {
+                    Some(edge.score)
                 } else {
                     None
                 }
-            })
-        })
-        .or_else(|| {
-            self.network.as_ref().and_then(|network| {
-                network.edges.iter().find_map(|edge| {
-                    let (edge_left, edge_right) = if edge.source <= edge.target {
-                        (edge.source, edge.target)
-                    } else {
-                        (edge.target, edge.source)
-                    };
-                    if edge_left == left && edge_right == right {
-                        Some(edge.score)
-                    } else {
-                        None
-                    }
-                })
             })
         });
         self.spectrum_similarity_cache = Some((left, right, score));
@@ -4442,37 +3755,23 @@ impl SpectralApp {
                     }
                 });
                 ui.separator();
-                ui.label("Query MGF path (native)");
+                ui.label("Query MGF path passed to spectral-matcher");
                 ui.text_edit_singleline(&mut self.mgf_path);
                 ui.horizontal(|ui| {
-                    if ui.button("↥ Load path").clicked() {
-                        self.load_from_path();
-                    }
-
                     if ui.button("📁 Pick file").clicked()
                         && let Some(path) = rfd::FileDialog::new()
                             .add_filter("MGF", &["mgf"])
                             .pick_file()
                     {
                         self.mgf_path = path.display().to_string();
-                        self.load_from_path();
                     }
                 });
-                if let Some(handle) = &self.query_load {
-                    let (frac, text) = Self::load_progress(handle, "Loading query MGF");
-                    ui.add(egui::ProgressBar::new(frac).text(text));
-                }
+                ui.small("The GUI no longer parses MGF locally; the matcher handles query loading.");
             }
 
             #[cfg(target_arch = "wasm32")]
             {
-                if ui.button("📁 Upload query MGF").clicked() {
-                    self.start_upload_dialog();
-                }
-                if self.upload_promise.is_some() {
-                    ui.label("Waiting for query file selection...");
-                    ctx.request_repaint();
-                }
+                ui.small("Matcher job submission is currently native-only.");
             }
 
             if let Some(source) = &self.source_label {
@@ -4504,37 +3803,23 @@ impl SpectralApp {
             }
             #[cfg(not(target_arch = "wasm32"))]
             {
-                ui.label("Library MGF path (native)");
+                ui.label("Library MGF path passed to spectral-matcher");
                 ui.text_edit_singleline(&mut self.library_mgf_path);
                 ui.horizontal(|ui| {
-                    if ui.button("↥ Load library").clicked() {
-                        self.load_library_from_path();
-                    }
-
                     if ui.button("📁 Pick library").clicked()
                         && let Some(path) = rfd::FileDialog::new()
                             .add_filter("MGF", &["mgf"])
                             .pick_file()
                     {
                         self.library_mgf_path = path.display().to_string();
-                        self.load_library_from_path();
                     }
                 });
-                if let Some(handle) = &self.library_load {
-                    let (frac, text) = Self::load_progress(handle, "Loading library MGF");
-                    ui.add(egui::ProgressBar::new(frac).text(text));
-                }
+                ui.small("The GUI no longer parses library MGF locally; the matcher handles it.");
             }
 
             #[cfg(target_arch = "wasm32")]
             {
-                if ui.button("📁 Upload library MGF").clicked() {
-                    self.start_library_upload_dialog();
-                }
-                if self.library_upload_promise.is_some() {
-                    ui.label("Waiting for library file selection...");
-                    ctx.request_repaint();
-                }
+                ui.small("Matcher spectral search submission is currently native-only.");
             }
 
             if let Some(source) = &self.library_source_label {
@@ -4561,49 +3846,23 @@ impl SpectralApp {
             ui.collapsing("LOTUS Taxonomic Reranking", |ui| {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    ui.label("LOTUS CSV path (native)");
+                    ui.label("LOTUS CSV path passed to spectral-matcher");
                     ui.text_edit_singleline(&mut self.lotus_csv_path);
                     ui.horizontal(|ui| {
-                        if ui.button("↥ Load LOTUS").clicked() {
-                            self.load_lotus_from_path();
-                        }
-
                         if ui.button("📁 Pick LOTUS").clicked()
                             && let Some(path) = rfd::FileDialog::new()
                                 .add_filter("CSV", &["csv"])
                                 .pick_file()
                         {
                             self.lotus_csv_path = path.display().to_string();
-                            self.load_lotus_from_path();
                         }
                     });
-                    if self.lotus_load.is_some() {
-                        ui.small("Loading LOTUS metadata...");
-                    }
+                    ui.small("Taxonomic reranking is executed by spectral-matcher.");
                 }
 
                 #[cfg(target_arch = "wasm32")]
                 {
-                    if ui.button("📁 Upload LOTUS CSV").clicked() {
-                        self.start_lotus_upload_dialog();
-                    }
-                    if self.lotus_upload_promise.is_some() {
-                        ui.label("Waiting for LOTUS file selection...");
-                        ctx.request_repaint();
-                    }
-                }
-
-                if let Some(loaded) = &self.lotus_metadata {
-                    ui.label(format!("LOTUS source: {}", loaded.source_label));
-                    ui.small(format!(
-                        "Rows={} / Structures={} / Biosources={} / Queryable organisms={}",
-                        loaded.stats.rows,
-                        loaded.stats.indexed_structures,
-                        loaded.stats.indexed_biosources,
-                        loaded.stats.queryable_organisms
-                    ));
-                } else {
-                    ui.small("No LOTUS metadata loaded.");
+                    ui.small("Matcher taxonomic reranking submission is currently native-only.");
                 }
 
                 ui.checkbox(
@@ -5083,7 +4342,7 @@ impl SpectralApp {
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(
-                            !self.is_computing() && !self.spectra.is_empty(),
+                            !self.is_computing(),
                             egui::Button::new("▶ Run build"),
                         )
                         .clicked()
@@ -5134,21 +4393,13 @@ impl SpectralApp {
 
         ui.separator();
         ui.label("Network Controls");
-        let mut changed = false;
         let mut layout_changed = false;
-        ui.horizontal(|ui| {
-            ui.label("Similarity threshold");
-            changed |= ui
-                .add(egui::Slider::new(&mut self.threshold, 0.0..=1.0).show_value(false))
-                .changed();
-            changed |= ui
-                .add(
-                    egui::DragValue::new(&mut self.threshold)
-                        .range(0.0..=1.0)
-                        .speed(0.01),
-                )
-                .changed();
-        });
+        ui.small(format!(
+            "Loaded matcher build: threshold={:.3} | top-k={} | similarity={}",
+            self.threshold,
+            self.top_k,
+            self.selected_metric.label()
+        ));
         layout_changed |= ui
             .add(egui::Slider::new(&mut self.node_force, 0.1..=5.0).text("Node force"))
             .changed();
@@ -5156,11 +4407,6 @@ impl SpectralApp {
             .add(egui::Slider::new(&mut self.edge_force, 0.1..=5.0).text("Edge force"))
             .changed();
 
-        if changed {
-            self.threshold = self.threshold.clamp(0.0, 1.0);
-            #[cfg(target_arch = "wasm32")]
-            self.rebuild_network();
-        }
         if layout_changed {
             let _ = self.relayout_visible(50);
         }
@@ -6066,19 +5312,6 @@ fn sanitize_filename_fragment(raw: &str) -> String {
     }
 }
 
-fn spectral_search_precondition_error(
-    query_count: usize,
-    library_count: usize,
-) -> Option<&'static str> {
-    if query_count == 0 {
-        Some("Load query spectra before running spectral search")
-    } else if library_count == 0 {
-        Some("Load a spectral library before running spectral search")
-    } else {
-        None
-    }
-}
-
 fn default_search_export_filename(
     query_source: Option<&str>,
     library_source: Option<&str>,
@@ -6417,6 +5650,7 @@ fn structure_library_hit_passes_rank_limit(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn merged_table_library_rank_maxima(table: &AttributeTable, prefixes: &[String]) -> Vec<usize> {
     prefixes
         .iter()
@@ -6657,17 +5891,6 @@ fn default_structure_caption_columns(columns: &[String], smiles_col: Option<usiz
 
 impl eframe::App for SpectralApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.poll_upload_dialog();
-            self.poll_library_upload_dialog();
-            self.poll_lotus_upload_dialog();
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.poll_native_loads(ctx);
-        }
-
         self.poll_compute(ctx);
         self.poll_search(ctx);
         self.poll_depiction(ctx);
@@ -6889,11 +6112,7 @@ fn visible_node_ids_for_view(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use crate::compute::PairScore;
-    use crate::io::SpectrumMeta;
-    use crate::network::{ComponentSelection, build_network};
+    use crate::network::{ComponentSelection, NetworkEdge, NetworkNode, SpectralNetwork};
 
     use super::{
         ActiveMergedSearchExportInfo, SelectedStructureEntry, SelectedStructureTaxonomicMetadata,
@@ -6901,24 +6120,60 @@ mod tests {
         StructureTaxonomyFilter, build_structure_display_groups, default_search_export_filename,
         default_structure_caption_columns, keep_selected_if_visible, merged_structure_library_hits,
         occurrence_matches_reranked_taxon, parse_taxonomic_rank, selected_structure_short_inchikey,
-        selected_structure_taxonomic_metadata, spectral_search_precondition_error,
-        structure_matches_source_filter, visible_node_ids_for_view,
+        selected_structure_taxonomic_metadata, structure_matches_source_filter,
+        visible_node_ids_for_view,
     };
     use crate::metadata::{LotusBiosource, TaxonomicRank, TaxonomyLineage};
 
-    fn meta(id: usize) -> SpectrumMeta {
-        SpectrumMeta {
-            id,
-            label: format!("s{id}"),
-            raw_name: format!("raw{id}"),
-            feature_id: Some(format!("f{id}")),
-            scans: None,
-            filename: None,
-            source_scan_usi: None,
-            featurelist_feature_id: None,
-            headers: BTreeMap::new(),
-            precursor_mz: 100.0 + id as f64,
-            num_peaks: 10,
+    fn sample_network(nodes: &[(usize, usize, usize)], edges: &[(usize, usize)]) -> SpectralNetwork {
+        let network_nodes = nodes
+            .iter()
+            .map(|(id, component_id, degree)| NetworkNode {
+                id: *id,
+                label: format!("s{id}"),
+                raw_name: format!("raw{id}"),
+                feature_id: Some(format!("f{id}")),
+                scans: None,
+                filename: None,
+                source_scan_usi: None,
+                featurelist_feature_id: None,
+                precursor_mz: 100.0 + *id as f64,
+                num_peaks: 10,
+                component_id: *component_id,
+                degree: *degree,
+            })
+            .collect();
+        let network_edges = edges
+            .iter()
+            .map(|(source, target)| NetworkEdge {
+                source: *source,
+                target: *target,
+                score: 0.95,
+                matches: 2,
+            })
+            .collect();
+        let mut components = Vec::new();
+        let max_component = nodes.iter().map(|(_, component_id, _)| *component_id).max().unwrap_or(0);
+        for component_id in 0..=max_component {
+            let members = nodes
+                .iter()
+                .filter(|(_, cid, _)| *cid == component_id)
+                .map(|(id, _, _)| *id)
+                .collect::<Vec<_>>();
+            if !members.is_empty() {
+                components.push(members);
+            }
+        }
+        let largest_component_id = components
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, members)| members.len())
+            .map(|(idx, _)| idx);
+        SpectralNetwork {
+            nodes: network_nodes,
+            edges: network_edges,
+            components,
+            largest_component_id,
         }
     }
 
@@ -6959,22 +6214,7 @@ mod tests {
 
     #[test]
     fn selection_survives_when_node_stays_visible() {
-        let metas = vec![meta(0), meta(1), meta(2)];
-        let scores = vec![
-            PairScore {
-                left: 0,
-                right: 1,
-                score: 0.9,
-                matches: 2,
-            },
-            PairScore {
-                left: 1,
-                right: 2,
-                score: 0.9,
-                matches: 2,
-            },
-        ];
-        let network = build_network(&metas, &scores, 0.2, 5);
+        let network = sample_network(&[(0, 0, 1), (1, 0, 2), (2, 0, 1)], &[(0, 1), (1, 2)]);
         assert_eq!(
             keep_selected_if_visible(Some(1), &network, ComponentSelection::All, false),
             Some(1)
@@ -6983,22 +6223,7 @@ mod tests {
 
     #[test]
     fn selection_clears_when_filtered_out_by_component_scope() {
-        let metas = vec![meta(0), meta(1), meta(2), meta(3)];
-        let scores = vec![
-            PairScore {
-                left: 0,
-                right: 1,
-                score: 0.95,
-                matches: 2,
-            },
-            PairScore {
-                left: 2,
-                right: 3,
-                score: 0.95,
-                matches: 2,
-            },
-        ];
-        let network = build_network(&metas, &scores, 0.2, 5);
+        let network = sample_network(&[(0, 0, 1), (1, 0, 1), (2, 1, 1), (3, 1, 1)], &[(0, 1), (2, 3)]);
         assert_eq!(
             keep_selected_if_visible(Some(3), &network, ComponentSelection::Component(0), false),
             None
@@ -7007,14 +6232,7 @@ mod tests {
 
     #[test]
     fn hide_singletons_removes_isolated_nodes_from_visible_set() {
-        let metas = vec![meta(0), meta(1), meta(2)];
-        let scores = vec![PairScore {
-            left: 0,
-            right: 1,
-            score: 0.95,
-            matches: 2,
-        }];
-        let network = build_network(&metas, &scores, 0.2, 5);
+        let network = sample_network(&[(0, 0, 1), (1, 0, 1), (2, 1, 0)], &[(0, 1)]);
 
         let visible = visible_node_ids_for_view(&network, ComponentSelection::All, true);
         assert_eq!(visible, vec![0, 1]);
@@ -7022,38 +6240,13 @@ mod tests {
 
     #[test]
     fn largest_component_ignores_singleton_components_when_hidden() {
-        let metas = vec![meta(0), meta(1), meta(2), meta(3), meta(4)];
-        let scores = vec![
-            PairScore {
-                left: 0,
-                right: 1,
-                score: 0.95,
-                matches: 2,
-            },
-            PairScore {
-                left: 1,
-                right: 2,
-                score: 0.95,
-                matches: 2,
-            },
-        ];
-        let network = build_network(&metas, &scores, 0.2, 5);
+        let network = sample_network(
+            &[(0, 0, 1), (1, 0, 2), (2, 0, 1), (3, 1, 0), (4, 2, 0)],
+            &[(0, 1), (1, 2)],
+        );
 
         let visible = visible_node_ids_for_view(&network, ComponentSelection::Largest, true);
         assert_eq!(visible, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn spectral_search_requires_query_and_library_inputs() {
-        assert_eq!(
-            spectral_search_precondition_error(0, 1),
-            Some("Load query spectra before running spectral search")
-        );
-        assert_eq!(
-            spectral_search_precondition_error(1, 0),
-            Some("Load a spectral library before running spectral search")
-        );
-        assert_eq!(spectral_search_precondition_error(1, 1), None);
     }
 
     #[test]

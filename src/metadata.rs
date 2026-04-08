@@ -590,9 +590,7 @@ mod tests {
                 num_peaks: 0,
             },
             peaks: Arc::new(Vec::new()),
-            spectrum: Arc::new(
-                GenericSpectrum::<f64, f64>::with_capacity(100.0, 0).expect("spectrum"),
-            ),
+            spectrum: Arc::new(GenericSpectrum::with_capacity(100.0, 0).expect("spectrum")),
             payload: (),
         }
     }
