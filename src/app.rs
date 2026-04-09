@@ -6,9 +6,9 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::attributes::LoadedAttributeTable;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::attributes::AttributeTable;
+use crate::attributes::LoadedAttributeTable;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::compute::ComputeParams;
 use crate::compute::{SearchHit, SearchResult, SimilarityMetric};
@@ -17,14 +17,13 @@ use crate::export::download_tsv_file;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::export::save_tsv_to_path;
 use crate::export::{SearchQueryKey, export_csv_strings, export_search_tsv};
-use crate::io::{spectrum_record_from_metadata, spectrum_record_from_parts};
 use crate::io::{ParseStats, SpectrumRecord};
+use crate::io::{spectrum_record_from_metadata, spectrum_record_from_parts};
 use crate::layout::force_directed_layout;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::matcher_client::{
     NativeMatcherHandle, SharedMatcherLog, default_base_url, new_matcher_log,
-    start_native_network_request,
-    start_native_search_request,
+    start_native_network_request, start_native_search_request,
 };
 use crate::metadata::{LoadedLotusMetadata, TaxonomicRank, short_inchikey};
 use crate::network::{ComponentSelection, SpectralNetwork};
@@ -817,7 +816,7 @@ impl SpectralApp {
             let query_text = self.search_taxonomic_query.trim();
             if query_text.is_empty() {
                 return Err(
-                    "Enter a biosource query before running taxonomic reranking".to_string(),
+                    "Enter a biosource query before running taxonomic reranking".to_string()
                 );
             }
             Some(spectral_matcher::SearchTaxonomyRequest {
@@ -944,8 +943,14 @@ impl SpectralApp {
         }
         self.status_message = Some(format!(
             "Loaded spectral network: {} nodes, {} edges from {}",
-            self.network.as_ref().map(|network| network.nodes.len()).unwrap_or(0),
-            self.network.as_ref().map(|network| network.edges.len()).unwrap_or(0),
+            self.network
+                .as_ref()
+                .map(|network| network.nodes.len())
+                .unwrap_or(0),
+            self.network
+                .as_ref()
+                .map(|network| network.edges.len())
+                .unwrap_or(0),
             artifact.source_label
         ));
         self.error_message = None;
@@ -966,8 +971,9 @@ impl SpectralApp {
             .map(spectrum_record_from_metadata)
             .collect::<Result<Vec<_>, _>>();
         let (Ok(query_records), Ok(library_records)) = (query_records, library_records) else {
-            self.error_message =
-                Some("Failed to rebuild metadata-only spectra from matcher search artifact".to_string());
+            self.error_message = Some(
+                "Failed to rebuild metadata-only spectra from matcher search artifact".to_string(),
+            );
             return;
         };
 
@@ -1520,10 +1526,18 @@ impl SpectralApp {
 
     fn active_progress(&self) -> Option<(f32, String)> {
         if let Some(handle) = &self.native_compute {
-            return Some(handle.progress().unwrap_or_else(|| (0.0, handle.status_text())));
+            return Some(
+                handle
+                    .progress()
+                    .unwrap_or_else(|| (0.0, handle.status_text())),
+            );
         }
         if let Some(handle) = &self.native_search {
-            return Some(handle.progress().unwrap_or_else(|| (0.0, handle.status_text())));
+            return Some(
+                handle
+                    .progress()
+                    .unwrap_or_else(|| (0.0, handle.status_text())),
+            );
         }
         None
     }
@@ -4341,10 +4355,7 @@ impl SpectralApp {
                 ui.checkbox(&mut self.pending_hide_singletons, "Hide singleton nodes");
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(
-                            !self.is_computing(),
-                            egui::Button::new("▶ Run build"),
-                        )
+                        .add_enabled(!self.is_computing(), egui::Button::new("▶ Run build"))
                         .clicked()
                     {
                         self.run_build_network();
@@ -5826,15 +5837,14 @@ fn preferred_node_attribute_mapping_for_search_query_key(
     key: SearchQueryKey,
 ) -> Option<(&'static str, NodeAttrMatchField)> {
     match key {
-        SearchQueryKey::FeatureId => Some(("query_feature_id", NodeAttrMatchField::FeatureId)),
-        SearchQueryKey::FeaturelistFeatureId => Some((
-            "query_featurelist_feature_id",
-            NodeAttrMatchField::FeaturelistFeatureId,
-        )),
-        SearchQueryKey::Scans => Some(("query_scans", NodeAttrMatchField::Scans)),
+        SearchQueryKey::FeatureId => Some(("query_export_key", NodeAttrMatchField::FeatureId)),
+        SearchQueryKey::FeaturelistFeatureId => {
+            Some(("query_export_key", NodeAttrMatchField::FeaturelistFeatureId))
+        }
+        SearchQueryKey::Scans => Some(("query_export_key", NodeAttrMatchField::Scans)),
         SearchQueryKey::RawName => Some(("query_export_key", NodeAttrMatchField::RawName)),
-        SearchQueryKey::Label => Some(("query_label", NodeAttrMatchField::Label)),
-        SearchQueryKey::NodeId => Some(("query_node_id", NodeAttrMatchField::NodeId)),
+        SearchQueryKey::Label => Some(("query_export_key", NodeAttrMatchField::Label)),
+        SearchQueryKey::NodeId => Some(("query_export_key", NodeAttrMatchField::NodeId)),
     }
 }
 
@@ -6116,16 +6126,19 @@ mod tests {
 
     use super::{
         ActiveMergedSearchExportInfo, SelectedStructureEntry, SelectedStructureTaxonomicMetadata,
-        StructureLibraryHit, StructureSourceFilter, StructureTaxonomicLinks, depict_cache_key,
+        StructureLibraryHit, StructureSourceFilter, StructureTaxonomicLinks,
         StructureTaxonomyFilter, build_structure_display_groups, default_search_export_filename,
-        default_structure_caption_columns, keep_selected_if_visible, merged_structure_library_hits,
-        occurrence_matches_reranked_taxon, parse_taxonomic_rank, selected_structure_short_inchikey,
-        selected_structure_taxonomic_metadata, structure_matches_source_filter,
-        visible_node_ids_for_view,
+        default_structure_caption_columns, depict_cache_key, keep_selected_if_visible,
+        merged_structure_library_hits, occurrence_matches_reranked_taxon, parse_taxonomic_rank,
+        selected_structure_short_inchikey, selected_structure_taxonomic_metadata,
+        structure_matches_source_filter, visible_node_ids_for_view,
     };
     use crate::metadata::{LotusBiosource, TaxonomicRank, TaxonomyLineage};
 
-    fn sample_network(nodes: &[(usize, usize, usize)], edges: &[(usize, usize)]) -> SpectralNetwork {
+    fn sample_network(
+        nodes: &[(usize, usize, usize)],
+        edges: &[(usize, usize)],
+    ) -> SpectralNetwork {
         let network_nodes = nodes
             .iter()
             .map(|(id, component_id, degree)| NetworkNode {
@@ -6153,7 +6166,11 @@ mod tests {
             })
             .collect();
         let mut components = Vec::new();
-        let max_component = nodes.iter().map(|(_, component_id, _)| *component_id).max().unwrap_or(0);
+        let max_component = nodes
+            .iter()
+            .map(|(_, component_id, _)| *component_id)
+            .max()
+            .unwrap_or(0);
         for component_id in 0..=max_component {
             let members = nodes
                 .iter()
@@ -6223,7 +6240,10 @@ mod tests {
 
     #[test]
     fn selection_clears_when_filtered_out_by_component_scope() {
-        let network = sample_network(&[(0, 0, 1), (1, 0, 1), (2, 1, 1), (3, 1, 1)], &[(0, 1), (2, 3)]);
+        let network = sample_network(
+            &[(0, 0, 1), (1, 0, 1), (2, 1, 1), (3, 1, 1)],
+            &[(0, 1), (2, 3)],
+        );
         assert_eq!(
             keep_selected_if_visible(Some(3), &network, ComponentSelection::Component(0), false),
             None

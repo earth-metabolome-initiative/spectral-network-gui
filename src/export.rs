@@ -76,12 +76,7 @@ pub fn export_search_tsv(
 
     let mut header = vec![
         "query_export_key".to_string(),
-        "query_node_id".to_string(),
-        "query_feature_id".to_string(),
-        "query_featurelist_feature_id".to_string(),
-        "query_scans".to_string(),
-        "query_label".to_string(),
-        "query_raw_name".to_string(),
+        "query_key_mode".to_string(),
         "hit_rank".to_string(),
         "hit_spectral_score".to_string(),
         "hit_taxonomic_score".to_string(),
@@ -109,16 +104,7 @@ pub fn export_search_tsv(
 
         let mut row = vec![
             query_key.value_for(query),
-            query.meta.id.to_string(),
-            query.meta.feature_id.clone().unwrap_or_default(),
-            query
-                .meta
-                .featurelist_feature_id
-                .clone()
-                .unwrap_or_default(),
-            query.meta.scans.clone().unwrap_or_default(),
-            query.meta.label.clone(),
-            query.meta.raw_name.clone(),
+            query_key.label().to_string(),
             hit.rank.to_string(),
             format!("{:.8}", hit.spectral_score),
             format!("{:.8}", hit.taxonomic_score),
@@ -439,10 +425,11 @@ mod tests {
         assert!(header.contains("hit_spectral_score"));
         assert!(header.contains("hit_taxonomic_score"));
         assert!(header.contains("hit_combined_score"));
+        assert!(header.contains("query_key_mode"));
 
         let first = lines.next().expect("first row");
         let second = lines.next().expect("second row");
-        assert!(first.starts_with("feature_0\t0\tfeature_0"));
+        assert!(first.starts_with("feature_0\tFEATURE_ID"));
         assert!(first.contains("\t1\t0.95000000\t9.00000000\t9.95000000\t6\tspecies\tWithania somnifera\tQ1\tAAAA\t110.000000\thit one\t"));
         assert!(first.contains("cmpd 1"));
         assert!(second.contains(

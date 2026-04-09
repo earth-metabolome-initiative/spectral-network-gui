@@ -1,10 +1,10 @@
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -67,7 +67,8 @@ impl<T> NativeMatcherHandle<T> {
         if let Ok(mut status) = self.status.lock() {
             *status = "Cancellation requested".to_string();
         }
-        self.log.push("GUI -> matcher | cancel requested".to_string());
+        self.log
+            .push("GUI -> matcher | cancel requested".to_string());
         (self.cancel_request)();
     }
 
@@ -111,8 +112,7 @@ pub fn start_native_network_request(
         .unwrap_or_else(|| format!("source={}", request.source_label));
     let request_summary = format!(
         "GUI -> matcher | POST /v1/network/jobs | {source_ref} | spectra_build threshold={:.3} top_k={}",
-        request.build.threshold,
-        request.build.top_k
+        request.build.threshold, request.build.top_k
     );
     let job_id_for_request = Arc::clone(&job_id);
     start_native_job(base_url, log, job_id, move |client| {
@@ -121,9 +121,10 @@ pub fn start_native_network_request(
         if let Ok(mut slot) = job_id_for_request.lock() {
             *slot = Some(created.job_id);
         }
-        client
-            .log
-            .push(format!("matcher -> GUI | 202 /v1/network/jobs | job_id={}", created.job_id));
+        client.log.push(format!(
+            "matcher -> GUI | 202 /v1/network/jobs | job_id={}",
+            created.job_id
+        ));
         let result = client.wait_for_job(created.job_id, "network")?;
         match result {
             MatcherJobResult::Network(artifact) => Ok(artifact),
@@ -261,7 +262,10 @@ impl LocalMatcherClient {
         log: SharedMatcherLog,
     ) -> Result<Self, String> {
         let endpoint = Endpoint::parse(&base_url)?;
-        log.push(format!("GUI | matcher base URL = http://{}", endpoint.socket_addr));
+        log.push(format!(
+            "GUI | matcher base URL = http://{}",
+            endpoint.socket_addr
+        ));
         Ok(Self {
             endpoint,
             status,
@@ -276,14 +280,17 @@ impl LocalMatcherClient {
         self.log.push("GUI -> matcher | GET /v1/health".to_string());
         if self.health_check().is_ok() {
             self.set_status("Connected to local spectral-matcher");
-            self.log
-                .push("matcher -> GUI | 200 /v1/health | local matcher already running".to_string());
+            self.log.push(
+                "matcher -> GUI | 200 /v1/health | local matcher already running".to_string(),
+            );
             return Ok(());
         }
 
         self.set_status("Starting local spectral-matcher");
-        self.log
-            .push(format!("GUI | attempting local matcher spawn on {}", self.endpoint.bind_address()));
+        self.log.push(format!(
+            "GUI | attempting local matcher spawn on {}",
+            self.endpoint.bind_address()
+        ));
         let _child = spawn_local_matcher(&self.endpoint.bind_address())?;
         let started = Instant::now();
         while started.elapsed() < HEALTH_TIMEOUT {
@@ -311,8 +318,7 @@ impl LocalMatcherClient {
                 return Err(format!("timed out while waiting for {label} job {job_id}"));
             }
 
-            let status: JobStatusResponse =
-                self.get_json(&format!("/v1/jobs/{job_id}"))?;
+            let status: JobStatusResponse = self.get_json(&format!("/v1/jobs/{job_id}"))?;
             self.set_progress(status.progress.as_ref(), label);
             if last_status != Some(status.status) {
                 self.log.push(format!(
@@ -326,14 +332,16 @@ impl LocalMatcherClient {
                 JobStatus::Running => self.set_status(&format!("Running {label} job {job_id}")),
                 JobStatus::Finished => {
                     self.set_status(&format!("Loading {label} result"));
-                    self.set_progress(Some(&JobProgress {
-                        stage: JobProgressStage::Finalizing,
-                        completed: 1,
-                        total: 1,
-                    }), label);
-                    self.log.push(format!(
-                        "GUI -> matcher | GET /v1/jobs/{job_id}/result"
-                    ));
+                    self.set_progress(
+                        Some(&JobProgress {
+                            stage: JobProgressStage::Finalizing,
+                            completed: 1,
+                            total: 1,
+                        }),
+                        label,
+                    );
+                    self.log
+                        .push(format!("GUI -> matcher | GET /v1/jobs/{job_id}/result"));
                     return self.get_json(&format!("/v1/jobs/{job_id}/result"));
                 }
                 JobStatus::Failed => {
@@ -361,7 +369,9 @@ impl LocalMatcherClient {
         let response = self.request("POST", path, Some(&body))?;
         self.log.push(format!(
             "matcher -> GUI | {} {} | {} bytes",
-            response.status, path, response.body.len()
+            response.status,
+            path,
+            response.body.len()
         ));
         decode_json_response(response)
     }
@@ -370,12 +380,19 @@ impl LocalMatcherClient {
         let response = self.request("GET", path, None)?;
         self.log.push(format!(
             "matcher -> GUI | {} {} | {} bytes",
-            response.status, path, response.body.len()
+            response.status,
+            path,
+            response.body.len()
         ));
         decode_json_response(response)
     }
 
-    fn request(&self, method: &str, path: &str, body: Option<&[u8]>) -> Result<HttpResponse, String> {
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse, String> {
         let mut stream = TcpStream::connect(self.endpoint.socket_addr.as_str())
             .map_err(|err| format!("failed to connect to spectral-matcher: {err}"))?;
         stream
@@ -440,20 +457,14 @@ fn map_progress(progress: &JobProgress, label: &str) -> (f32, String) {
     let pct = ratio * 100.0;
     match progress.stage {
         JobProgressStage::Queued => (0.0, format!("Queued {label} job")),
-        JobProgressStage::LoadingSpectra => (
-            0.05 * ratio,
-            format!("Loading spectra ({pct:.1}%)"),
-        ),
-        JobProgressStage::LoadingQuery => (
-            0.05 * ratio,
-            format!("Loading query spectra ({pct:.1}%)"),
-        ),
-        JobProgressStage::LoadingLibrary => {
-            (
-                0.05 + 0.15 * ratio,
-                format!("Loading library spectra ({pct:.1}%)"),
-            )
+        JobProgressStage::LoadingSpectra => (0.05 * ratio, format!("Loading spectra ({pct:.1}%)")),
+        JobProgressStage::LoadingQuery => {
+            (0.05 * ratio, format!("Loading query spectra ({pct:.1}%)"))
         }
+        JobProgressStage::LoadingLibrary => (
+            0.05 + 0.15 * ratio,
+            format!("Loading library spectra ({pct:.1}%)"),
+        ),
         JobProgressStage::Scoring => (
             (0.20 + 0.75 * ratio).clamp(0.0, 0.95),
             format!("Scoring similarities: {done}/{total} ({pct:.1}%)"),
@@ -525,7 +536,11 @@ fn spawn_local_matcher(bind: &str) -> Result<Child, String> {
     if let Some(dir) = repo_root {
         let mut command = Command::new("cargo");
         command.current_dir(dir);
-        command.arg("run").arg("-p").arg("spectral-matcher").arg("--");
+        command
+            .arg("run")
+            .arg("-p")
+            .arg("spectral-matcher")
+            .arg("--");
         return spawn_command(command, bind);
     }
 
@@ -560,7 +575,10 @@ impl Endpoint {
             .strip_prefix("http://")
             .ok_or_else(|| "matcher base URL must start with http://".to_string())?;
         let (host_port, base_path) = match without_scheme.split_once('/') {
-            Some((host_port, rest)) => (host_port.to_string(), format!("/{}", rest.trim_matches('/'))),
+            Some((host_port, rest)) => (
+                host_port.to_string(),
+                format!("/{}", rest.trim_matches('/')),
+            ),
             None => (without_scheme.to_string(), String::new()),
         };
         if host_port.is_empty() {
@@ -605,7 +623,9 @@ impl HttpResponse {
     }
 }
 
-fn decode_json_response<T: serde::de::DeserializeOwned>(response: HttpResponse) -> Result<T, String> {
+fn decode_json_response<T: serde::de::DeserializeOwned>(
+    response: HttpResponse,
+) -> Result<T, String> {
     if (200..300).contains(&response.status) {
         serde_json::from_slice(&response.body)
             .map_err(|err| format!("failed to decode matcher response: {err}"))
@@ -616,15 +636,14 @@ fn decode_json_response<T: serde::de::DeserializeOwned>(response: HttpResponse) 
             .and_then(|json| json.get("error"))
             .and_then(|err| err.as_str())
             .map(str::to_string)
-            .unwrap_or_else(|| {
-                String::from_utf8_lossy(&response.body)
-                    .trim()
-                    .to_string()
-            });
+            .unwrap_or_else(|| String::from_utf8_lossy(&response.body).trim().to_string());
         Err(if message.is_empty() {
             format!("spectral-matcher returned HTTP {}", response.status)
         } else {
-            format!("spectral-matcher returned HTTP {}: {message}", response.status)
+            format!(
+                "spectral-matcher returned HTTP {}: {message}",
+                response.status
+            )
         })
     }
 }

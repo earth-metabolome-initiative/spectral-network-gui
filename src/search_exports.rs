@@ -164,11 +164,7 @@ pub fn merge_search_exports(
 
     let mut header = vec![
         "query_export_key".to_string(),
-        "query_node_id".to_string(),
-        "query_feature_id".to_string(),
-        "query_featurelist_feature_id".to_string(),
-        "query_scans".to_string(),
-        "query_label".to_string(),
+        "query_key_mode".to_string(),
         "structure_short_inchikey".to_string(),
         "structure_name".to_string(),
         "structure_smiles".to_string(),
@@ -212,11 +208,10 @@ pub fn merge_search_exports(
 
         let mut row = vec![
             query_export_key.clone(),
-            pick_first_value(&matched_rows, "query_node_id"),
-            pick_first_value(&matched_rows, "query_feature_id"),
-            pick_first_value(&matched_rows, "query_featurelist_feature_id"),
-            pick_first_value(&matched_rows, "query_scans"),
-            pick_first_value(&matched_rows, "query_label"),
+            jobs.first()
+                .and_then(|job| job.table.inferred_query_key)
+                .map(|mode| mode.label().to_string())
+                .unwrap_or_default(),
             short_inchikey.clone(),
             pick_structure_name(&matched_rows),
             pick_structure_smiles(&matched_rows),
@@ -319,53 +314,44 @@ fn parse_f64_field(
 }
 
 fn infer_query_key_mode(table: &AttributeTable) -> Option<SearchQueryKey> {
-    let export_idx = table
+    let mode_idx = table
         .columns
         .iter()
-        .position(|column| normalized_column_name(column) == "queryexportkey")?;
+        .position(|column| normalized_column_name(column) == "querykeymode")?;
 
-    for mode in SearchQueryKey::ALL {
-        let candidate_column = match mode {
-            SearchQueryKey::FeatureId => "query_feature_id",
-            SearchQueryKey::FeaturelistFeatureId => "query_featurelist_feature_id",
-            SearchQueryKey::Scans => "query_scans",
-            SearchQueryKey::RawName => "query_raw_name",
-            SearchQueryKey::Label => "query_label",
-            SearchQueryKey::NodeId => "query_node_id",
-        };
-        let Some(candidate_idx) = table.columns.iter().position(|column| {
-            normalized_column_name(column) == normalized_column_name(candidate_column)
-        }) else {
+    let mut resolved = None;
+    for row in &table.rows {
+        let value = row
+            .get(mode_idx)
+            .map(String::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if value.is_empty() {
             continue;
-        };
-
-        let mut compared = 0usize;
-        let mut all_match = true;
-        for row in &table.rows {
-            let exported = row
-                .get(export_idx)
-                .map(String::as_str)
-                .map(str::trim)
-                .unwrap_or_default();
-            let candidate = row
-                .get(candidate_idx)
-                .map(String::as_str)
-                .map(str::trim)
-                .unwrap_or_default();
-            if exported.is_empty() || candidate.is_empty() {
-                continue;
-            }
-            compared += 1;
-            if exported != candidate {
-                all_match = false;
-                break;
-            }
         }
-        if compared > 0 && all_match {
-            return Some(mode);
+        let mode = search_query_key_from_str(value)?;
+        if let Some(existing) = resolved {
+            if existing != mode {
+                return None;
+            }
+        } else {
+            resolved = Some(mode);
         }
     }
-    None
+    resolved
+}
+
+fn search_query_key_from_str(value: &str) -> Option<SearchQueryKey> {
+    let normalized = normalized_column_name(value);
+    match normalized.as_str() {
+        "featureid" => Some(SearchQueryKey::FeatureId),
+        "featurelistfeatureid" => Some(SearchQueryKey::FeaturelistFeatureId),
+        "scans" => Some(SearchQueryKey::Scans),
+        "rawname" => Some(SearchQueryKey::RawName),
+        "label" => Some(SearchQueryKey::Label),
+        "nodeid" => Some(SearchQueryKey::NodeId),
+        _ => None,
+    }
 }
 
 fn sanitize_alias(alias: &str) -> String {
@@ -480,7 +466,7 @@ mod tests {
 
     fn sample_export(rows: &[&str]) -> String {
         let mut out = String::from(
-            "query_export_key\tquery_node_id\tquery_feature_id\tquery_featurelist_feature_id\tquery_scans\tquery_label\tquery_raw_name\thit_rank\thit_spectral_score\thit_taxonomic_score\thit_combined_score\thit_matches\thit_taxonomic_shared_rank\thit_taxonomic_organism_name\thit_taxonomic_organism_wikidata\thit_taxonomic_short_inchikey\thit_precursor_mz\thit_raw_name\thit_SMILES\n",
+            "query_export_key\tquery_key_mode\thit_rank\thit_spectral_score\thit_taxonomic_score\thit_combined_score\thit_matches\thit_taxonomic_shared_rank\thit_taxonomic_organism_name\thit_taxonomic_organism_wikidata\thit_taxonomic_short_inchikey\thit_precursor_mz\thit_raw_name\thit_SMILES\n",
         );
         for row in rows {
             out.push_str(row);
@@ -492,7 +478,7 @@ mod tests {
     #[test]
     fn parses_search_export_rows_and_infers_query_mode() {
         let text = sample_export(&[
-            "feat1\t1\tfeat1\t\t\tlabel1\traw1\t1\t0.9\t0\t0.9\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\thit1\tCCO",
+            "feat1\tFEATURE_ID\t1\t0.9\t0\t0.9\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\thit1\tCCO",
         ]);
         let parsed = parse_search_export_tsv("a.tsv", &text).expect("search export");
         assert_eq!(parsed.rows.len(), 1);
@@ -508,15 +494,15 @@ mod tests {
         let lotus = parse_search_export_tsv(
             "lotus.tsv",
             &sample_export(&[
-                "feat1\t1\tfeat1\t\t\tlabel1\traw1\t1\t0.9\t0\t0.9\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\tlotus_hit\tCCO",
+                "feat1\tFEATURE_ID\t1\t0.9\t0\t0.9\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\tlotus_hit\tCCO",
             ]),
         )
         .expect("lotus");
         let gnps = parse_search_export_tsv(
             "gnps.tsv",
             &sample_export(&[
-                "feat1\t1\tfeat1\t\t\tlabel1\traw1\t3\t0.7\t0\t0.7\t4\t\t\t\tABCDEFGHIJKLMN\t100.0\tgnps_hit\tCCO",
-                "feat1\t1\tfeat1\t\t\tlabel1\traw1\t1\t0.8\t0\t0.8\t6\t\t\t\tZZZZZZZZZZZZZZ\t100.0\tother\tCCC",
+                "feat1\tFEATURE_ID\t3\t0.7\t0\t0.7\t4\t\t\t\tABCDEFGHIJKLMN\t100.0\tgnps_hit\tCCO",
+                "feat1\tFEATURE_ID\t1\t0.8\t0\t0.8\t6\t\t\t\tZZZZZZZZZZZZZZ\t100.0\tother\tCCC",
             ]),
         )
         .expect("gnps");
@@ -554,16 +540,16 @@ mod tests {
         let lotus = parse_search_export_tsv(
             "lotus.tsv",
             &sample_export(&[
-                "feat1\t1\tfeat1\t\t\tlabel1\traw1\t2\t0.8\t0\t0.8\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\tworse\tCCO",
-                "feat1\t1\tfeat1\t\t\tlabel1\traw1\t1\t0.7\t0\t0.7\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\tbetter_rank\tCCO",
-                "feat1\t1\tfeat1\t\t\tlabel1\traw1\t1\t0.9\t0\t0.9\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\tbest_score\tCCO",
+                "feat1\tFEATURE_ID\t2\t0.8\t0\t0.8\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\tworse\tCCO",
+                "feat1\tFEATURE_ID\t1\t0.7\t0\t0.7\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\tbetter_rank\tCCO",
+                "feat1\tFEATURE_ID\t1\t0.9\t0\t0.9\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\tbest_score\tCCO",
             ]),
         )
         .expect("lotus");
         let gnps = parse_search_export_tsv(
             "gnps.tsv",
             &sample_export(&[
-                "feat1\t1\tfeat1\t\t\tlabel1\traw1\t1\t0.7\t0\t0.7\t4\t\t\t\tABCDEFGHIJKLMN\t100.0\tgnps_hit\tCCO",
+                "feat1\tFEATURE_ID\t1\t0.7\t0\t0.7\t4\t\t\t\tABCDEFGHIJKLMN\t100.0\tgnps_hit\tCCO",
             ]),
         )
         .expect("gnps");
@@ -602,15 +588,13 @@ mod tests {
     fn merge_excludes_rows_missing_short_inchikey() {
         let lotus = parse_search_export_tsv(
             "lotus.tsv",
-            &sample_export(&[
-                "feat1\t1\tfeat1\t\t\tlabel1\traw1\t1\t0.9\t0\t0.9\t5\t\t\t\t\t100.0\thit1\tCCO",
-            ]),
+            &sample_export(&["feat1\tFEATURE_ID\t1\t0.9\t0\t0.9\t5\t\t\t\t\t100.0\thit1\tCCO"]),
         )
         .expect("lotus");
         let gnps = parse_search_export_tsv(
             "gnps.tsv",
             &sample_export(&[
-                "feat1\t1\tfeat1\t\t\tlabel1\traw1\t1\t0.7\t0\t0.7\t4\t\t\t\tABCDEFGHIJKLMN\t100.0\thit2\tCCO",
+                "feat1\tFEATURE_ID\t1\t0.7\t0\t0.7\t4\t\t\t\tABCDEFGHIJKLMN\t100.0\thit2\tCCO",
             ]),
         )
         .expect("gnps");
@@ -644,14 +628,14 @@ mod tests {
         let lotus = parse_search_export_tsv(
             "lotus.tsv",
             &sample_export(&[
-                "feat1\t1\tfeat1\t\t\tlabel1\traw1\t1\t0.9\t0\t0.9\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\tlotus_hit\tCCO",
+                "feat1\tFEATURE_ID\t1\t0.9\t0\t0.9\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\tlotus_hit\tCCO",
             ]),
         )
         .expect("lotus");
         let gnps = parse_search_export_tsv(
             "gnps.tsv",
             &sample_export(&[
-                "feat1\t1\tfeat1\t\t\tlabel1\traw1\t3\t0.7\t0\t0.7\t4\t\t\t\tABCDEFGHIJKLMN\t100.0\tgnps_hit\tCCO",
+                "feat1\tFEATURE_ID\t3\t0.7\t0\t0.7\t4\t\t\t\tABCDEFGHIJKLMN\t100.0\tgnps_hit\tCCO",
             ]),
         )
         .expect("gnps");
@@ -693,18 +677,18 @@ mod tests {
     }
 
     #[test]
-    fn merged_table_drops_query_raw_name_column() {
+    fn merged_table_keeps_compact_query_identity_columns() {
         let lotus = parse_search_export_tsv(
             "lotus.tsv",
             &sample_export(&[
-                "feat1\t1\tfeat1\t\t\tlabel1\traw1\t1\t0.9\t0\t0.9\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\tlotus_hit\tCCO",
+                "feat1\tFEATURE_ID\t1\t0.9\t0\t0.9\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\tlotus_hit\tCCO",
             ]),
         )
         .expect("lotus");
         let gnps = parse_search_export_tsv(
             "gnps.tsv",
             &sample_export(&[
-                "feat1\t1\tfeat1\t\t\tlabel1\traw1\t1\t0.7\t0\t0.7\t4\t\t\t\tABCDEFGHIJKLMN\t100.0\tgnps_hit\tCCO",
+                "feat1\tFEATURE_ID\t1\t0.7\t0\t0.7\t4\t\t\t\tABCDEFGHIJKLMN\t100.0\tgnps_hit\tCCO",
             ]),
         )
         .expect("gnps");
@@ -723,6 +707,34 @@ mod tests {
         ])
         .expect("merged");
 
+        assert!(
+            merged
+                .table
+                .columns
+                .iter()
+                .any(|column| column == "query_export_key")
+        );
+        assert!(
+            merged
+                .table
+                .columns
+                .iter()
+                .any(|column| column == "query_key_mode")
+        );
+        assert!(
+            !merged
+                .table
+                .columns
+                .iter()
+                .any(|column| column == "query_feature_id")
+        );
+        assert!(
+            !merged
+                .table
+                .columns
+                .iter()
+                .any(|column| column == "query_label")
+        );
         assert!(
             !merged
                 .table
