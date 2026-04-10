@@ -374,13 +374,15 @@ fn parse_lotus_reader<R: Read>(
     let short_inchikey_idx = header_index(&headers, "structure_inchikey")?;
     let organism_name_idx = header_index(&headers, "organism_name")?;
     let organism_wikidata_idx = header_index(&headers, "organism_wikidata")?;
-    let compound_name_idx = optional_header_index_any(
+    let compound_name_indices = optional_header_indices_any(
         &headers,
         &[
             "structure_nameTraditional",
+            "traditional_name",
+            "structure_nameIupac",
+            "iupac_name",
             "structure_name",
             "compound_name",
-            "traditional_name",
         ],
     );
     let compound_wikidata_idx =
@@ -419,11 +421,13 @@ fn parse_lotus_reader<R: Read>(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        let compound_name = compound_name_idx
-            .and_then(|idx| record.get(idx))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
+        let compound_name = compound_name_indices.iter().find_map(|idx| {
+            record
+                .get(*idx)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        });
         let compound_wikidata = compound_wikidata_idx
             .and_then(|idx| record.get(idx))
             .map(str::trim)
@@ -508,6 +512,17 @@ fn optional_header_index_any(headers: &csv::StringRecord, targets: &[&str]) -> O
             .iter()
             .any(|target| normalized == normalize_key(target))
     })
+}
+
+fn optional_header_indices_any(headers: &csv::StringRecord, targets: &[&str]) -> Vec<usize> {
+    targets
+        .iter()
+        .filter_map(|target| {
+            headers
+                .iter()
+                .position(|header| normalize_key(header) == normalize_key(target))
+        })
+        .collect()
 }
 
 fn header_index(headers: &csv::StringRecord, target: &str) -> Result<usize, String> {
@@ -719,6 +734,20 @@ mod tests {
             occurrences[0].reference_doi.as_deref(),
             Some("10.1000/alpha")
         );
+    }
+
+    #[test]
+    fn lotus_name_falls_back_to_iupac_per_row() {
+        let csv = concat!(
+            "structure_inchikey,structure_nameTraditional,structure_nameIupac,structure_wikidata,reference_doi,organism_wikidata,organism_name,organism_taxonomy_01domain,organism_taxonomy_02kingdom,organism_taxonomy_03phylum,organism_taxonomy_04class,organism_taxonomy_05order,organism_taxonomy_06family,organism_taxonomy_07tribe,organism_taxonomy_08genus,organism_taxonomy_09species,organism_taxonomy_10varietas\n",
+            "\"ABCDEFGHIJKLMN-AAAA\",,Withaferin A,http://www.wikidata.org/entity/Q100,10.1000/alpha,http://www.wikidata.org/entity/Q1,\"Withania somnifera\",Eukaryota,Archaeplastida,Streptophyta,Magnoliopsida,Solanales,Solanaceae,NA,Withania,Withania somnifera,NA\n"
+        );
+        let loaded = load_lotus_bytes("lotus.csv", csv.as_bytes()).expect("lotus should parse");
+        let occurrences = loaded
+            .index
+            .occurrences_for_short_inchikey("ABCDEFGHIJKLMN")
+            .expect("occurrences");
+        assert_eq!(occurrences[0].compound_name.as_deref(), Some("Withaferin A"));
     }
 
     #[test]

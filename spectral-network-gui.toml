@@ -1,0 +1,5 @@
+# Loaded automatically on startup when `lotus_metadata_path` is set.
+# Relative paths are resolved relative to this file.
+
+lotus_metadata_path = "/Users/pma/01_large_files/lotus/230106_frozen_metadata.csv"
+auto_load_lotus_metadata = true

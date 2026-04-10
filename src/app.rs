@@ -10,6 +10,8 @@ use egui_extras::{Column, TableBuilder};
 use crate::attributes::AttributeTable;
 use crate::attributes::LoadedAttributeTable;
 #[cfg(not(target_arch = "wasm32"))]
+use crate::config::load_default_config;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::compute::ComputeParams;
 use crate::compute::{SearchHit, SearchResult, SimilarityMetric};
 #[cfg(target_arch = "wasm32")]
@@ -25,6 +27,8 @@ use crate::matcher_client::{
     NativeMatcherHandle, SharedMatcherLog, default_base_url, new_matcher_log,
     start_native_network_request, start_native_search_request,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use crate::metadata::{NativeLotusLoadHandle, NativeLotusLoadMessage, start_native_lotus_load};
 use crate::metadata::{LoadedLotusMetadata, TaxonomicRank, short_inchikey};
 use crate::network::{ComponentSelection, SpectralNetwork};
 use crate::render::{GraphViewState, draw_network};
@@ -79,14 +83,16 @@ enum NodeAttrMatchField {
 }
 
 impl NodeAttrMatchField {
-    fn label(self) -> &'static str {
+    fn ui_label(self) -> &'static str {
         match self {
-            Self::NodeId => "node_id",
-            Self::FeatureId => "feature_id",
-            Self::FeaturelistFeatureId => "featurelist_feature_id",
-            Self::Scans => "scans",
-            Self::RawName => "raw_name",
-            Self::Label => "label",
+            Self::NodeId => "Network node index (`node_id`, internal)",
+            Self::FeatureId => "Network feature ID (`feature_id`)",
+            Self::FeaturelistFeatureId => {
+                "Compatibility: `featurelist_feature_id` (full feature-list id)"
+            }
+            Self::Scans => "Compatibility: `scans`",
+            Self::RawName => "Compatibility: `raw_name`",
+            Self::Label => "Compatibility: `label`",
         }
     }
 }
@@ -183,6 +189,8 @@ struct SelectedStructureEntry {
     display_label: String,
     smiles: String,
     annotations: Vec<(String, String)>,
+    preferred_compound_label: Option<String>,
+    compound_qid: Option<String>,
     short_inchikey: Option<String>,
     library_hits: Vec<StructureLibraryHit>,
     matched_taxonomic_organism_name: Option<String>,
@@ -206,12 +214,16 @@ struct StructureTaxonomicLinks {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LotusOccurrenceSummary {
-    compound_name: Option<String>,
+    compound_label: String,
     compound_qid: Option<String>,
-    taxon_name: String,
-    taxon_qid: Option<String>,
-    reference_doi: Option<String>,
-    additional_occurrences: usize,
+    taxa: Vec<LotusOccurrenceTaxon>,
+    reference_dois: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LotusOccurrenceTaxon {
+    name: String,
+    qid: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -316,6 +328,8 @@ pub struct SpectralApp {
     matcher_log: SharedMatcherLog,
     #[cfg(not(target_arch = "wasm32"))]
     loaded_search_export_jobs: Vec<LoadedSearchExportJob>,
+    #[cfg(not(target_arch = "wasm32"))]
+    native_lotus_load: Option<NativeLotusLoadHandle>,
     active_merged_search_export: Option<ActiveMergedSearchExportInfo>,
     source_label: Option<String>,
     parse_stats: Option<ParseStats>,
@@ -424,7 +438,7 @@ impl SpectralApp {
         let (depict_tx, depict_rx) = mpsc::channel();
         #[cfg(not(target_arch = "wasm32"))]
         let matcher_log = new_matcher_log();
-        Self {
+        let mut app = Self {
             #[cfg(not(target_arch = "wasm32"))]
             mgf_path: DEFAULT_MGF_PATH.to_string(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -437,6 +451,8 @@ impl SpectralApp {
             matcher_log,
             #[cfg(not(target_arch = "wasm32"))]
             loaded_search_export_jobs: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            native_lotus_load: None,
             active_merged_search_export: None,
             source_label: None,
             parse_stats: None,
@@ -520,8 +536,8 @@ impl SpectralApp {
             selection_structures_limit: 48,
             selection_structures_image_height: 260.0,
             selection_structures_taxonomy_filter: StructureTaxonomyFilter::All,
-            selection_structures_collapse_identical_hits: false,
-            selection_structures_show_lotus_metadata: false,
+            selection_structures_collapse_identical_hits: true,
+            selection_structures_show_lotus_metadata: true,
             selection_structures_source_filter: StructureSourceFilter::Any,
             selection_structures_library_rank_limits: Vec::new(),
             structure_caption_columns: Vec::new(),
@@ -537,7 +553,147 @@ impl SpectralApp {
             peak_filter_tolerance: 0.02,
             peak_filter_tolerance_unit: PeakToleranceUnit::Da,
             peak_filtered_node_ids: None,
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        app.apply_startup_config();
+        app
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn apply_startup_config(&mut self) {
+        match load_default_config() {
+            Ok(Some(config)) => {
+                if let Some(path) = config.lotus_metadata_path {
+                    self.lotus_csv_path = path.display().to_string();
+                    if config.auto_load_lotus_metadata {
+                        self.start_lotus_metadata_load();
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.error_message = Some(format!("Config load failed: {err}"));
+            }
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_lotus_metadata_load(&mut self) {
+        let path_text = self.lotus_csv_path.trim();
+        if path_text.is_empty() {
+            self.error_message = Some("LOTUS metadata path is empty".to_string());
+            return;
+        }
+        match start_native_lotus_load(std::path::Path::new(path_text)) {
+            Ok(handle) => {
+                self.native_lotus_load = Some(handle);
+                self.status_message = Some(format!("Loading LOTUS metadata from {path_text}"));
+                self.error_message = None;
+            }
+            Err(err) => {
+                self.native_lotus_load = None;
+                self.error_message = Some(err);
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn clear_lotus_metadata(&mut self) {
+        self.native_lotus_load = None;
+        self.lotus_metadata = None;
+        self.status_message = Some("Cleared LOTUS metadata".to_string());
+        self.error_message = None;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_lotus_metadata(&mut self, ctx: &egui::Context) {
+        let Some(message) = self.native_lotus_load.as_ref().and_then(|handle| handle.try_recv()) else {
+            return;
+        };
+        self.native_lotus_load = None;
+        match message {
+            NativeLotusLoadMessage::Finished(loaded) => {
+                let source_label = loaded.source_label.clone();
+                let stats = loaded.stats.clone();
+                self.lotus_csv_path = source_label.clone();
+                self.lotus_metadata = Some(loaded);
+                self.status_message = Some(format!(
+                    "Loaded LOTUS metadata: {} rows, {} structures, {} biosources",
+                    stats.rows, stats.indexed_structures, stats.indexed_biosources
+                ));
+                self.error_message = None;
+            }
+            NativeLotusLoadMessage::Failed(err) => {
+                self.error_message = Some(err);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn draw_lotus_metadata_panel(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.label("LOTUS metadata");
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                ui.label("LOTUS CSV path");
+                ui.text_edit_singleline(&mut self.lotus_csv_path);
+                ui.horizontal(|ui| {
+                    if ui.button("📁 Pick LOTUS").clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .pick_file()
+                    {
+                        self.lotus_csv_path = path.display().to_string();
+                    }
+                    let load_label = if self.lotus_metadata.is_some() {
+                        "↻ Reload"
+                    } else {
+                        "Load"
+                    };
+                    if ui.button(load_label).clicked() {
+                        self.start_lotus_metadata_load();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.lotus_metadata.is_some() || self.native_lotus_load.is_some(),
+                            egui::Button::new("Clear"),
+                        )
+                        .clicked()
+                    {
+                        self.clear_lotus_metadata();
+                    }
+                });
+                if self.native_lotus_load.is_some() {
+                    ui.small("LOTUS metadata is loading in the background...");
+                } else if let Some(loaded) = &self.lotus_metadata {
+                    ui.small(format!(
+                        "{} | rows={} | structures={} | biosources={} | queryable organisms={}",
+                        loaded.source_label,
+                        loaded.stats.rows,
+                        loaded.stats.indexed_structures,
+                        loaded.stats.indexed_biosources,
+                        loaded.stats.queryable_organisms
+                    ));
+                } else {
+                    ui.small("No LOTUS metadata loaded.");
+                }
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                ui.small("LOTUS metadata loading is currently native-only.");
+            }
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn lotus_metadata_loading(&self) -> bool {
+        self.native_lotus_load.is_some()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn lotus_metadata_loading(&self) -> bool {
+        false
     }
 
     fn clear_compute_outputs(&mut self) {
@@ -1054,7 +1210,8 @@ impl SpectralApp {
         preferred_key_column: Option<&str>,
         preferred_match_field: Option<NodeAttrMatchField>,
     ) {
-        if let Some(column_name) = preferred_key_column
+        let inferred_mapping = inferred_node_attribute_mapping_for_table(&loaded.table);
+        if let Some(column_name) = preferred_key_column.or(inferred_mapping.map(|(column, _)| column))
             && let Some(idx) = loaded.table.columns.iter().position(|column| {
                 normalized_column_name(column) == normalized_column_name(column_name)
             })
@@ -1064,7 +1221,7 @@ impl SpectralApp {
         let column_names = loaded.table.columns.clone();
         self.node_attributes = Some(loaded);
         self.reset_node_attribute_table_state(&column_names);
-        if let Some(field) = preferred_match_field {
+        if let Some(field) = preferred_match_field.or(inferred_mapping.map(|(_, field)| field)) {
             self.node_attr_match_field = field;
         }
     }
@@ -2867,7 +3024,8 @@ impl SpectralApp {
             selected_structure_matched_taxonomic_organism_name(&table.table.columns, row);
         let matched_taxonomic_organism_qid =
             selected_structure_matched_taxonomic_organism_qid(&table.table.columns, row);
-        Some(SelectedStructureEntry {
+        let short_inchikey = selected_structure_short_inchikey(&table.table.columns, row);
+        let mut entry = SelectedStructureEntry {
             node_id: node.id,
             feature_id: node
                 .feature_id
@@ -2878,14 +3036,26 @@ impl SpectralApp {
             display_label,
             smiles: smiles.to_string(),
             annotations,
-            short_inchikey: selected_structure_short_inchikey(&table.table.columns, row),
+            preferred_compound_label: preferred_compound_label_from_row(&table.table.columns, row),
+            compound_qid: compound_qid_from_row(&table.table.columns, row),
+            short_inchikey,
             library_hits,
             matched_taxonomic_organism_name,
             matched_taxonomic_organism_qid,
             taxonomic_reranked: taxonomic_metadata.reranked,
             taxonomic_shared_rank: taxonomic_metadata.shared_rank,
             taxonomic_links: taxonomic_metadata.links,
-        })
+        };
+        if entry.compound_qid.is_none() {
+            entry.compound_qid = self
+                .lotus_occurrence_summary_for_entry(&entry)
+                .and_then(|summary| summary.compound_qid);
+        }
+        entry.taxonomic_links.compound = entry.compound_qid.clone().map(|compound_qid| StructureLink {
+                label: compound_qid.clone(),
+                url: wikidata_entity_url(&compound_qid),
+            });
+        Some(entry)
     }
 
     fn structure_display_groups<'a>(
@@ -2910,37 +3080,7 @@ impl SpectralApp {
         let short = entry.short_inchikey.as_deref()?;
         let loaded = self.lotus_metadata.as_ref()?;
         let occurrences = loaded.index.occurrences_for_short_inchikey(short)?;
-        let representative = occurrences
-            .iter()
-            .filter(|occurrence| occurrence_matches_reranked_taxon(entry, occurrence))
-            .max_by_key(|occurrence| {
-                (
-                    occurrence.reference_doi.is_some(),
-                    occurrence.compound_wikidata.is_some(),
-                    occurrence.compound_name.is_some(),
-                )
-            })
-            .or_else(|| {
-                occurrences.iter().max_by_key(|occurrence| {
-                    (
-                        occurrence.reference_doi.is_some(),
-                        occurrence.compound_wikidata.is_some(),
-                        occurrence.compound_name.is_some(),
-                    )
-                })
-            })
-            .or_else(|| occurrences.first())?;
-        Some(LotusOccurrenceSummary {
-            compound_name: representative.compound_name.clone(),
-            compound_qid: representative.compound_wikidata.clone(),
-            taxon_name: representative.organism_name.clone(),
-            taxon_qid: representative
-                .organism_wikidata
-                .as_deref()
-                .and_then(normalize_qid),
-            reference_doi: representative.reference_doi.clone(),
-            additional_occurrences: occurrences.len().saturating_sub(1),
-        })
+        build_lotus_occurrence_summary(entry, occurrences)
     }
 
     fn draw_selected_structures_gallery(&mut self, ui: &mut egui::Ui, id_suffix: &str) {
@@ -3057,7 +3197,11 @@ impl SpectralApp {
                 return;
             }
             if self.selection_structures_show_lotus_metadata && self.lotus_metadata.is_none() {
-                ui.small("Load LOTUS metadata to display LOTUS occurrence summaries.");
+                if self.lotus_metadata_loading() {
+                    ui.small("LOTUS metadata is loading in the background...");
+                } else {
+                    ui.small("Load LOTUS metadata to display LOTUS occurrence summaries.");
+                }
             }
 
             let selected_structures = self.selected_structures_from_node_selection();
@@ -3201,42 +3345,13 @@ impl SpectralApp {
                                     if let Some(summary) =
                                         self.lotus_occurrence_summary_for_entry(entry)
                                     {
-                                        ui.horizontal_wrapped(|ui| {
-                                            let compound_label = summary
-                                                .compound_name
-                                                .as_deref()
-                                                .or(summary.compound_qid.as_deref())
-                                                .unwrap_or("Compound");
-                                            if let Some(qid) = summary.compound_qid.as_deref() {
-                                                ui.hyperlink_to(compound_label, wikidata_entity_url(qid));
-                                            } else {
-                                                ui.small(compound_label);
-                                            }
-                                            ui.small("is found in");
-                                            if let Some(qid) = summary.taxon_qid.as_deref() {
-                                                ui.hyperlink_to(&summary.taxon_name, wikidata_entity_url(qid));
-                                            } else {
-                                                ui.small(&summary.taxon_name);
-                                            }
-                                            if let Some(doi) = summary.reference_doi.as_deref() {
-                                                ui.small("according to");
-                                                ui.hyperlink_to(
-                                                    doi,
-                                                    format!(
-                                                        "https://doi.org/{}",
-                                                        url_encode_component(doi)
-                                                    ),
-                                                );
-                                            }
-                                        });
-                                        if summary.additional_occurrences > 0 {
-                                            ui.small(format!(
-                                                "{} other occurrence(s) are described in LOTUS.",
-                                                summary.additional_occurrences
-                                            ));
-                                        }
+                                        render_lotus_occurrence_summary(ui, &summary);
+                                    } else if self.lotus_metadata_loading() {
+                                        ui.small("LOTUS metadata is loading in the background...");
                                     } else {
-                                        ui.small("No LOTUS occurrence metadata found for this structure.");
+                                        ui.small(
+                                            "No LOTUS occurrence metadata found for this structure.",
+                                        );
                                     }
                                 }
                             });
@@ -3378,8 +3493,21 @@ impl SpectralApp {
                     loaded.table.rows.len(),
                     loaded.table.columns.len()
                 ));
+                let inferred_mapping = inferred_node_attribute_mapping_for_table(&loaded.table);
+                if show_match_field {
+                    if let Some((results_key_column, match_field)) = inferred_mapping {
+                        ui.small(format!(
+                            "Detected spectral-search mapping: results `{results_key_column}` -> {}",
+                            match_field.ui_label()
+                        ));
+                    } else {
+                        ui.small(
+                            "Pick the identifier column in the loaded results table, then choose which network key it should match.",
+                        );
+                    }
+                }
                 let mut key_col = loaded.key_column();
-                egui::ComboBox::from_label("Key column")
+                egui::ComboBox::from_label("Results TSV key column")
                     .selected_text(
                         loaded
                             .table
@@ -3398,40 +3526,49 @@ impl SpectralApp {
                 }
 
                 if show_match_field {
-                    egui::ComboBox::from_label("Node match field")
-                        .selected_text(node_attr_match_field.label())
+                    egui::ComboBox::from_label("Network node key")
+                        .selected_text(node_attr_match_field.ui_label())
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 node_attr_match_field,
                                 NodeAttrMatchField::NodeId,
-                                NodeAttrMatchField::NodeId.label(),
+                                NodeAttrMatchField::NodeId.ui_label(),
                             );
                             ui.selectable_value(
                                 node_attr_match_field,
                                 NodeAttrMatchField::FeatureId,
-                                NodeAttrMatchField::FeatureId.label(),
+                                NodeAttrMatchField::FeatureId.ui_label(),
                             );
                             ui.selectable_value(
                                 node_attr_match_field,
                                 NodeAttrMatchField::FeaturelistFeatureId,
-                                NodeAttrMatchField::FeaturelistFeatureId.label(),
+                                NodeAttrMatchField::FeaturelistFeatureId.ui_label(),
                             );
                             ui.selectable_value(
                                 node_attr_match_field,
                                 NodeAttrMatchField::Scans,
-                                NodeAttrMatchField::Scans.label(),
+                                NodeAttrMatchField::Scans.ui_label(),
                             );
                             ui.selectable_value(
                                 node_attr_match_field,
                                 NodeAttrMatchField::RawName,
-                                NodeAttrMatchField::RawName.label(),
+                                NodeAttrMatchField::RawName.ui_label(),
                             );
                             ui.selectable_value(
                                 node_attr_match_field,
                                 NodeAttrMatchField::Label,
-                                NodeAttrMatchField::Label.label(),
+                                NodeAttrMatchField::Label.ui_label(),
                             );
                         });
+                    ui.small(format!(
+                        "Current mapping: results `{}` -> {}",
+                        loaded
+                            .table
+                            .columns
+                            .get(loaded.key_column())
+                            .map_or("<none>", String::as_str),
+                        node_attr_match_field.ui_label()
+                    ));
                 }
             } else {
                 ui.small("No table loaded");
@@ -3451,14 +3588,14 @@ impl SpectralApp {
             }
             if let Some(table) = &self.node_attributes {
                 ui.small(format!(
-                    "Node TSV: {} rows | key={} | match={}",
+                    "Node TSV: {} rows | results key={} | network key={}",
                     table.table.rows.len(),
                     table
                         .table
                         .columns
                         .get(table.key_column())
                         .map_or("<none>", String::as_str),
-                    self.node_attr_match_field.label()
+                    self.node_attr_match_field.ui_label()
                 ));
             } else {
                 ui.small("Load a node attributes TSV from the left panel.");
@@ -3861,25 +3998,13 @@ impl SpectralApp {
 
             ui.separator();
             ui.collapsing("LOTUS Taxonomic Reranking", |ui| {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    ui.label("LOTUS CSV path passed to spectral-matcher");
-                    ui.text_edit_singleline(&mut self.lotus_csv_path);
-                    ui.horizontal(|ui| {
-                        if ui.button("📁 Pick LOTUS").clicked()
-                            && let Some(path) = rfd::FileDialog::new()
-                                .add_filter("CSV", &["csv"])
-                                .pick_file()
-                        {
-                            self.lotus_csv_path = path.display().to_string();
-                        }
-                    });
-                    ui.small("Taxonomic reranking is executed by spectral-matcher.");
-                }
-
-                #[cfg(target_arch = "wasm32")]
-                {
-                    ui.small("Matcher taxonomic reranking submission is currently native-only.");
+                ui.small(
+                    "Taxonomic reranking is executed by spectral-matcher using the configured LOTUS CSV path.",
+                );
+                if self.lotus_csv_path.trim().is_empty() {
+                    ui.small("Configure a LOTUS metadata path in the LOTUS metadata panel.");
+                } else {
+                    ui.small(format!("LOTUS CSV path: {}", self.lotus_csv_path));
                 }
 
                 ui.checkbox(
@@ -4106,6 +4231,9 @@ impl SpectralApp {
                 false,
                 &mut self.node_attr_match_field,
             );
+
+            ui.separator();
+            self.draw_lotus_metadata_panel(ui);
 
             ui.group(|ui| {
                 ui.label("Structure depiction");
@@ -5053,10 +5181,22 @@ impl SpectralApp {
                 self.ensure_depiction_request(depict_key.clone(), depict_fetch_uri(&entry.smiles));
                 self.draw_depiction_widget(ui, &depict_key, egui::vec2(img_width, img_height));
                 draw_structure_library_hits(ui, &entry.library_hits);
-                for (column, value) in &entry.annotations {
-                    ui.add(egui::Label::new(format!("{column}: {value}")).wrap());
+                if entry.annotations.is_empty() {
+                    ui.small("No additional structure metadata selected.");
+                } else {
+                    for (column, value) in &entry.annotations {
+                        ui.add(egui::Label::new(format!("{column}: {value}")).wrap());
+                    }
                 }
-                if entry.taxonomic_reranked {
+                if self.selection_structures_show_lotus_metadata {
+                    if let Some(summary) = self.lotus_occurrence_summary_for_entry(&entry) {
+                        render_lotus_occurrence_summary(ui, &summary);
+                    } else if self.lotus_metadata_loading() {
+                        ui.small("LOTUS metadata is loading in the background...");
+                    } else {
+                        ui.small("No LOTUS occurrence metadata found for this structure.");
+                    }
+                } else if entry.taxonomic_reranked {
                     ui.horizontal_wrapped(|ui| {
                         ui.small("Taxonomic links:");
                         if let Some(link) = &entry.taxonomic_links.compound {
@@ -5724,6 +5864,162 @@ fn build_structure_display_groups<'a>(
     groups
 }
 
+fn build_lotus_occurrence_summary(
+    entry: &SelectedStructureEntry,
+    occurrences: &[crate::metadata::LotusBiosource],
+) -> Option<LotusOccurrenceSummary> {
+    let filtered: Vec<&crate::metadata::LotusBiosource> = occurrences
+        .iter()
+        .filter(|occurrence| occurrence_matches_reranked_taxon(entry, occurrence))
+        .collect();
+    let considered = if filtered.is_empty() {
+        occurrences.iter().collect::<Vec<_>>()
+    } else {
+        filtered
+    };
+    let preferred_compound_occurrence = considered.iter().copied().max_by_key(|occurrence| {
+        (
+            compound_name_preference(occurrence.compound_name.as_deref()),
+            occurrence.compound_wikidata.is_some(),
+            occurrence.reference_doi.is_some(),
+        )
+    })?;
+
+    let compound_qid = preferred_compound_occurrence
+        .compound_wikidata
+        .clone()
+        .or_else(|| entry.compound_qid.clone())
+        .or_else(|| {
+            considered
+                .iter()
+                .find_map(|occurrence| occurrence.compound_wikidata.clone())
+        });
+    let compound_label = preferred_compound_occurrence
+        .compound_name
+        .clone()
+        .or_else(|| entry.preferred_compound_label.clone())
+        .or_else(|| {
+            considered
+                .iter()
+                .find_map(|occurrence| occurrence.compound_name.clone())
+        })
+        .or_else(|| entry.short_inchikey.clone())
+        .or_else(|| compound_qid.clone())
+        .unwrap_or_else(|| "Compound".to_string());
+
+    let mut taxa = Vec::new();
+    for occurrence in &considered {
+        let taxon = LotusOccurrenceTaxon {
+            name: occurrence.organism_name.clone(),
+            qid: occurrence
+                .organism_wikidata
+                .as_deref()
+                .and_then(normalize_qid),
+        };
+        if !taxa.iter().any(|existing: &LotusOccurrenceTaxon| *existing == taxon) {
+            taxa.push(taxon);
+        }
+    }
+
+    let mut reference_dois = Vec::new();
+    for occurrence in &considered {
+        let Some(doi) = occurrence.reference_doi.clone() else {
+            continue;
+        };
+        if !reference_dois.iter().any(|existing| existing == &doi) {
+            reference_dois.push(doi);
+        }
+    }
+
+    Some(LotusOccurrenceSummary {
+        compound_label,
+        compound_qid,
+        taxa,
+        reference_dois,
+    })
+}
+
+fn render_lotus_occurrence_summary(ui: &mut egui::Ui, summary: &LotusOccurrenceSummary) {
+    ui.horizontal_wrapped(|ui| {
+        if let Some(qid) = summary.compound_qid.as_deref() {
+            ui.hyperlink_to(&summary.compound_label, wikidata_entity_url(qid));
+        } else {
+            ui.small(&summary.compound_label);
+        }
+        ui.small("is found in");
+        if let Some(taxon) = summary.taxa.first() {
+            if let Some(qid) = taxon.qid.as_deref() {
+                ui.hyperlink_to(&taxon.name, wikidata_entity_url(qid));
+            } else {
+                ui.small(&taxon.name);
+            }
+        }
+        if summary.taxa.len() > 1 {
+            ui.small(format!("and {} additional biosource(s)", summary.taxa.len() - 1));
+        }
+        if let Some(doi) = summary.reference_dois.first() {
+            ui.small("according to");
+            ui.hyperlink_to(doi, format!("https://doi.org/{}", url_encode_component(doi)));
+        }
+        if summary.reference_dois.len() > 1 {
+            ui.small(format!(
+                "and {} additional reference(s)",
+                summary.reference_dois.len() - 1
+            ));
+        }
+    });
+}
+
+fn is_structure_annotation_column_useful(column_name: &str) -> bool {
+    let normalized = normalized_column_name(column_name);
+    !(normalized.starts_with("representative")
+        || normalized.contains("taxonomic")
+        || normalized.ends_with("wikidata")
+        || normalized.ends_with("doi")
+        || normalized == "queryfeatureid"
+        || normalized == "querynodeid"
+        || normalized == "queryrawname")
+}
+
+fn compound_name_preference(name: Option<&str>) -> (u8, usize) {
+    let Some(name) = name.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (0, 0);
+    };
+    let quality = if looks_like_systematic_compound_name(name) {
+        1
+    } else {
+        2
+    };
+    (quality, usize::MAX - name.len())
+}
+
+fn looks_like_systematic_compound_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.starts_with('(')
+        || trimmed.contains('[')
+        || trimmed.contains("@")
+        || trimmed.chars().filter(|ch| ch.is_ascii_digit()).count() >= 4
+        || trimmed.matches(',').count() >= 3
+        || trimmed.matches('-').count() >= 6
+        || trimmed.len() >= 80
+}
+
+fn preferred_compound_label_from_row(columns: &[String], row: &[String]) -> Option<String> {
+    for target in [
+        "structure_nameTraditional",
+        "traditional_name",
+        "structure_nameIupac",
+        "iupac_name",
+        "structure_name",
+        "compound_name",
+    ] {
+        if let Some(value) = find_row_value(columns, row, |normalized| normalized == normalized_column_name(target)) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 fn find_row_value<'a, F>(columns: &'a [String], row: &'a [String], predicate: F) -> Option<&'a str>
 where
     F: Fn(&str) -> bool,
@@ -5757,14 +6053,7 @@ fn parse_taxonomic_rank(value: &str) -> Option<TaxonomicRank> {
 }
 
 fn compound_link_from_row(columns: &[String], row: &[String]) -> Option<StructureLink> {
-    let qid = find_row_value(columns, row, |normalized| {
-        normalized.contains("wikidata")
-            && !normalized.contains("organism")
-            && (normalized.contains("compound")
-                || normalized.contains("structure")
-                || normalized.contains("molecule"))
-    })
-    .and_then(normalize_qid);
+    let qid = compound_qid_from_row(columns, row);
     if let Some(qid) = qid {
         return Some(StructureLink {
             label: qid.clone(),
@@ -5799,6 +6088,17 @@ fn compound_link_from_row(columns: &[String], row: &[String]) -> Option<Structur
             url_encode_component(inchikey)
         ),
     })
+}
+
+fn compound_qid_from_row(columns: &[String], row: &[String]) -> Option<String> {
+    find_row_value(columns, row, |normalized| {
+        normalized.contains("wikidata")
+            && !normalized.contains("organism")
+            && (normalized.contains("compound")
+                || normalized.contains("structure")
+                || normalized.contains("molecule"))
+    })
+    .and_then(normalize_qid)
 }
 
 fn organism_link_from_row(columns: &[String], row: &[String]) -> Option<StructureLink> {
@@ -5851,6 +6151,79 @@ fn preferred_node_attribute_mapping_for_search_query_key(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn inferred_node_attribute_mapping_for_table(
+    table: &AttributeTable,
+) -> Option<(&'static str, NodeAttrMatchField)> {
+    let query_export_key_idx = table
+        .columns
+        .iter()
+        .position(|column| normalized_column_name(column) == "queryexportkey");
+    let query_key_mode_idx = table
+        .columns
+        .iter()
+        .position(|column| normalized_column_name(column) == "querykeymode");
+    if query_export_key_idx.is_some()
+        && let Some(query_key) = query_key_mode_idx.and_then(|idx| infer_single_search_query_key_mode(table, idx))
+        && let Some(mapping) = preferred_node_attribute_mapping_for_search_query_key(query_key)
+    {
+        return Some(mapping);
+    }
+
+    for (column_name, field) in [
+        ("feature_id", NodeAttrMatchField::FeatureId),
+        ("featurelist_feature_id", NodeAttrMatchField::FeaturelistFeatureId),
+        ("scans", NodeAttrMatchField::Scans),
+        ("raw_name", NodeAttrMatchField::RawName),
+        ("label", NodeAttrMatchField::Label),
+        ("node_id", NodeAttrMatchField::NodeId),
+    ] {
+        if table
+            .columns
+            .iter()
+            .any(|column| normalized_column_name(column) == normalized_column_name(column_name))
+        {
+            return Some((column_name, field));
+        }
+    }
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn infer_single_search_query_key_mode(
+    table: &AttributeTable,
+    query_key_mode_idx: usize,
+) -> Option<SearchQueryKey> {
+    let mut inferred: Option<SearchQueryKey> = None;
+    for row in &table.rows {
+        let Some(value) = row.get(query_key_mode_idx).map(String::as_str) else {
+            continue;
+        };
+        let Some(parsed) = parse_search_query_key_mode(value) else {
+            continue;
+        };
+        match inferred {
+            Some(existing) if existing != parsed => return None,
+            Some(_) => {}
+            None => inferred = Some(parsed),
+        }
+    }
+    inferred
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_search_query_key_mode(value: &str) -> Option<SearchQueryKey> {
+    match normalized_column_name(value).as_str() {
+        "featureid" => Some(SearchQueryKey::FeatureId),
+        "featurelistfeatureid" => Some(SearchQueryKey::FeaturelistFeatureId),
+        "scans" => Some(SearchQueryKey::Scans),
+        "rawname" => Some(SearchQueryKey::RawName),
+        "label" => Some(SearchQueryKey::Label),
+        "nodeid" => Some(SearchQueryKey::NodeId),
+        _ => None,
+    }
+}
+
 fn url_encode_component(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
@@ -5874,7 +6247,7 @@ fn default_structure_caption_columns(columns: &[String], smiles_col: Option<usiz
             continue;
         }
         let normalized = normalized_column_name(name);
-        if normalized == "queryrawname" {
+        if !is_structure_annotation_column_useful(name) {
             continue;
         }
         let preferred = normalized.contains("name")
@@ -5891,7 +6264,7 @@ fn default_structure_caption_columns(columns: &[String], smiles_col: Option<usiz
     }
 
     for (idx, _name) in columns.iter().enumerate() {
-        if Some(idx) == smiles_col || seen.contains(&idx) {
+        if Some(idx) == smiles_col || seen.contains(&idx) || !is_structure_annotation_column_useful(&_name) {
             continue;
         }
         picks.push(idx);
@@ -5907,6 +6280,8 @@ impl eframe::App for SpectralApp {
         self.poll_compute(ctx);
         self.poll_search(ctx);
         self.poll_depiction(ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_lotus_metadata(ctx);
 
         if self.show_left_panel {
             egui::SidePanel::left("controls_panel")
@@ -6137,14 +6512,19 @@ fn visible_node_ids_for_view(
 
 #[cfg(test)]
 mod tests {
+    use crate::attributes::AttributeTable;
+    use crate::export::SearchQueryKey;
     use crate::network::{ComponentSelection, NetworkEdge, NetworkNode, SpectralNetwork};
 
     use super::{
-        ActiveMergedSearchExportInfo, SelectedStructureEntry, SelectedStructureTaxonomicMetadata,
-        StructureLibraryHit, StructureSourceFilter, StructureTaxonomicLinks,
-        StructureTaxonomyFilter, build_structure_display_groups, default_search_export_filename,
-        default_structure_caption_columns, depict_cache_key, keep_selected_if_visible,
-        merged_structure_library_hits, occurrence_matches_reranked_taxon, parse_taxonomic_rank,
+        ActiveMergedSearchExportInfo, NodeAttrMatchField, SelectedStructureEntry,
+        SelectedStructureTaxonomicMetadata, StructureLibraryHit, StructureSourceFilter,
+        StructureTaxonomicLinks, StructureTaxonomyFilter, build_lotus_occurrence_summary,
+        build_structure_display_groups, default_search_export_filename,
+        default_structure_caption_columns, depict_cache_key, infer_single_search_query_key_mode,
+        inferred_node_attribute_mapping_for_table, keep_selected_if_visible,
+        merged_structure_library_hits, occurrence_matches_reranked_taxon,
+        parse_taxonomic_rank, preferred_compound_label_from_row,
         selected_structure_short_inchikey, selected_structure_taxonomic_metadata,
         structure_matches_source_filter, visible_node_ids_for_view,
     };
@@ -6234,6 +6614,8 @@ mod tests {
             display_label: feature_id.unwrap_or("entry").to_string(),
             smiles: smiles.to_string(),
             annotations: Vec::new(),
+            preferred_compound_label: None,
+            compound_qid: None,
             short_inchikey: None,
             library_hits: Vec::new(),
             matched_taxonomic_organism_name: None,
@@ -6441,6 +6823,65 @@ mod tests {
     }
 
     #[test]
+    fn preferred_compound_label_prefers_traditional_then_iupac() {
+        let columns = vec![
+            "structure_nameTraditional".to_string(),
+            "structure_nameIupac".to_string(),
+            "compound_name".to_string(),
+        ];
+        let row = vec!["Withaferin A".to_string(), "Long IUPAC".to_string(), "Other".to_string()];
+        assert_eq!(
+            preferred_compound_label_from_row(&columns, &row).as_deref(),
+            Some("Withaferin A")
+        );
+
+        let row_without_traditional =
+            vec!["".to_string(), "Long IUPAC".to_string(), "Other".to_string()];
+        assert_eq!(
+            preferred_compound_label_from_row(&columns, &row_without_traditional).as_deref(),
+            Some("Long IUPAC")
+        );
+    }
+
+    #[test]
+    fn infers_node_attribute_mapping_from_query_export_key_and_mode() {
+        let table = AttributeTable {
+            columns: vec![
+                "query_export_key".to_string(),
+                "query_key_mode".to_string(),
+                "value".to_string(),
+            ],
+            rows: vec![
+                vec!["1062".to_string(), "FEATURE_ID".to_string(), "a".to_string()],
+                vec!["1063".to_string(), "FEATURE_ID".to_string(), "b".to_string()],
+            ],
+        };
+        assert_eq!(
+            infer_single_search_query_key_mode(&table, 1),
+            Some(SearchQueryKey::FeatureId)
+        );
+        assert_eq!(
+            inferred_node_attribute_mapping_for_table(&table),
+            Some(("query_export_key", NodeAttrMatchField::FeatureId))
+        );
+    }
+
+    #[test]
+    fn does_not_infer_mapping_for_mixed_query_key_modes() {
+        let table = AttributeTable {
+            columns: vec![
+                "query_export_key".to_string(),
+                "query_key_mode".to_string(),
+            ],
+            rows: vec![
+                vec!["1062".to_string(), "FEATURE_ID".to_string()],
+                vec!["1063".to_string(), "SCANS".to_string()],
+            ],
+        };
+        assert_eq!(infer_single_search_query_key_mode(&table, 1), None);
+    }
+
+    #[test]
     fn occurrence_matching_prefers_reranked_taxon() {
         let entry = SelectedStructureEntry {
             short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
@@ -6475,6 +6916,91 @@ mod tests {
             &entry,
             &other_occurrence
         ));
+    }
+
+    #[test]
+    fn lotus_occurrence_summary_collapses_biosources_and_dois() {
+        let entry = SelectedStructureEntry {
+            short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
+            ..selected_structure_entry(1, None, "CCO")
+        };
+        let occurrences = vec![
+            LotusBiosource {
+                compound_name: Some("Withanolide A".to_string()),
+                organism_name: "Withania somnifera".to_string(),
+                organism_wikidata: Some("Q852660".to_string()),
+                compound_wikidata: Some("Q27137465".to_string()),
+                reference_doi: Some("10.1021/NP200635R".to_string()),
+                lineage: TaxonomyLineage::default(),
+            },
+            LotusBiosource {
+                compound_name: Some("Withanolide A".to_string()),
+                organism_name: "Withania somnifera".to_string(),
+                organism_wikidata: Some("http://www.wikidata.org/entity/Q852660".to_string()),
+                compound_wikidata: Some("Q27137465".to_string()),
+                reference_doi: Some("10.1021/NP200635R".to_string()),
+                lineage: TaxonomyLineage::default(),
+            },
+            LotusBiosource {
+                compound_name: Some("Withanolide A".to_string()),
+                organism_name: "Physalis longifolia".to_string(),
+                organism_wikidata: Some("Q123".to_string()),
+                compound_wikidata: Some("Q27137465".to_string()),
+                reference_doi: Some("10.0000/other".to_string()),
+                lineage: TaxonomyLineage::default(),
+            },
+        ];
+
+        let summary = build_lotus_occurrence_summary(&entry, &occurrences).unwrap();
+        assert_eq!(summary.compound_label, "Withanolide A");
+        assert_eq!(summary.compound_qid.as_deref(), Some("Q27137465"));
+        assert_eq!(summary.taxa.len(), 2);
+        assert_eq!(summary.taxa[0].name, "Withania somnifera");
+        assert_eq!(summary.taxa[0].qid.as_deref(), Some("Q852660"));
+        assert_eq!(summary.taxa[1].name, "Physalis longifolia");
+        assert_eq!(summary.reference_dois, vec![
+            "10.1021/NP200635R".to_string(),
+            "10.0000/other".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn lotus_occurrence_summary_falls_back_to_short_inchikey() {
+        let entry = SelectedStructureEntry {
+            short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
+            ..selected_structure_entry(1, None, "CCO")
+        };
+        let occurrences = vec![LotusBiosource {
+            compound_name: None,
+            organism_name: "Withania somnifera".to_string(),
+            organism_wikidata: Some("Q852660".to_string()),
+            compound_wikidata: Some("Q27137465".to_string()),
+            reference_doi: None,
+            lineage: TaxonomyLineage::default(),
+        }];
+
+        let summary = build_lotus_occurrence_summary(&entry, &occurrences).unwrap();
+        assert_eq!(summary.compound_label, "ABCDEFGHIJKLMN");
+    }
+
+    #[test]
+    fn lotus_occurrence_summary_prefers_lotus_name_over_row_iupac() {
+        let entry = SelectedStructureEntry {
+            short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
+            preferred_compound_label: Some("Very Long IUPAC Name".to_string()),
+            ..selected_structure_entry(1, None, "CCO")
+        };
+        let occurrences = vec![LotusBiosource {
+            compound_name: Some("Withaferin A".to_string()),
+            organism_name: "Withania somnifera".to_string(),
+            organism_wikidata: Some("Q852660".to_string()),
+            compound_wikidata: Some("Q27137465".to_string()),
+            reference_doi: Some("10.1021/example".to_string()),
+            lineage: TaxonomyLineage::default(),
+        }];
+
+        let summary = build_lotus_occurrence_summary(&entry, &occurrences).unwrap();
+        assert_eq!(summary.compound_label, "Withaferin A");
     }
 
     #[test]

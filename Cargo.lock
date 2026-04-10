@@ -3754,6 +3754,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spectral-matcher",
+ "toml",
  "urlencoding",
  "wasm-bindgen",
  "wasm-bindgen-futures",
