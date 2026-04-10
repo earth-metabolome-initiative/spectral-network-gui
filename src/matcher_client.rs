@@ -465,9 +465,17 @@ fn map_progress(progress: &JobProgress, label: &str) -> (f32, String) {
             0.05 + 0.15 * ratio,
             format!("Loading library spectra ({pct:.1}%)"),
         ),
+        JobProgressStage::LoadingTaxonomy => (
+            (0.20 + 0.05 * ratio).clamp(0.20, 0.25),
+            format!("Loading taxonomy ({pct:.1}%)"),
+        ),
         JobProgressStage::Scoring => (
-            (0.20 + 0.75 * ratio).clamp(0.0, 0.95),
+            (0.25 + 0.65 * ratio).clamp(0.25, 0.90),
             format!("Scoring similarities: {done}/{total} ({pct:.1}%)"),
+        ),
+        JobProgressStage::TaxonomicReranking => (
+            (0.90 + 0.05 * ratio).clamp(0.90, 0.95),
+            format!("Taxonomic reranking ({pct:.1}%)"),
         ),
         JobProgressStage::BuildingNetwork => (0.97, "Building spectral network".to_string()),
         JobProgressStage::Finalizing => (

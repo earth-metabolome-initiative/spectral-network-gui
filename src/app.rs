@@ -346,6 +346,7 @@ pub struct SpectralApp {
     search_taxonomic_query: String,
     show_left_panel: bool,
     show_right_panel: bool,
+    selected_node_panel_width: f32,
 
     threshold: f64,
     top_k: usize,
@@ -465,6 +466,7 @@ impl SpectralApp {
             search_taxonomic_query: String::new(),
             show_left_panel: true,
             show_right_panel: true,
+            selected_node_panel_width: 360.0,
             threshold: 0.2,
             top_k: 10,
             hide_singletons: true,
@@ -803,7 +805,7 @@ impl SpectralApp {
                 self.search_metric,
                 Some(self.search_top_n_peaks_per_spectrum),
             )?,
-            parent_mass_tolerance: self.search_parent_mass_tolerance.max(0.0),
+            precursor_mz_tolerance: self.search_parent_mass_tolerance.max(0.0),
             min_matched_peaks: self.search_min_matched_peaks.max(1),
             min_similarity_threshold: self.search_min_similarity_threshold.clamp(0.0, 1.0),
             top_n: self.search_top_n.max(1),
@@ -1313,7 +1315,7 @@ impl SpectralApp {
 
         Ok(ComputeParams {
             metric,
-            tolerance,
+            fragment_mz_tolerance: tolerance,
             mz_power,
             intensity_power,
             top_n_peaks: top_n_peaks.filter(|limit| *limit > 0),
@@ -2943,7 +2945,7 @@ impl SpectralApp {
 
     fn draw_selected_structures_gallery(&mut self, ui: &mut egui::Ui, id_suffix: &str) {
         ui.push_id(("selected_structures_gallery", id_suffix), |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Max structures");
                 ui.add(
                     egui::DragValue::new(&mut self.selection_structures_limit)
@@ -3122,7 +3124,7 @@ impl SpectralApp {
                         let entry = group.representative;
                         ui.push_id(entry.node_id, |ui| {
                             ui.group(|ui| {
-                                let card_width = ui.available_width().max(260.0);
+                                let card_width = ui.available_width().clamp(140.0, 420.0);
                                 let card_height =
                                     self.selection_structures_image_height.clamp(140.0, 700.0);
                                 let depict_key = depict_cache_key(&entry.smiles);
@@ -3438,7 +3440,7 @@ impl SpectralApp {
     }
 
     fn draw_node_attributes_panel(&mut self, ui: &mut egui::Ui, panel_id_suffix: &str) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let label = if self.show_node_attributes_panel {
                 "Hide node attributes"
             } else {
@@ -3478,7 +3480,7 @@ impl SpectralApp {
         let column_names = table.table.columns.clone();
 
         if let Some(filter_len) = self.table_node_filter.as_ref().map(|f| f.len()) {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.small(format!("Rectangle filter: {} node(s)", filter_len));
                 if ui.button("Clear rectangle filter").clicked() {
                     self.table_node_filter = None;
@@ -3528,9 +3530,10 @@ impl SpectralApp {
             }
         }
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Search");
-            ui.add(
+            ui.add_sized(
+                [ui.available_width().max(120.0), 0.0],
                 egui::TextEdit::singleline(&mut self.node_attr_search_query)
                     .hint_text("Filter matched rows..."),
             );
@@ -3638,7 +3641,7 @@ impl SpectralApp {
             |ui| {
                 egui::ScrollArea::horizontal()
                     .id_salt(format!("node_attr_horizontal_scroll_{panel_id_suffix}"))
-                    .auto_shrink([false, false])
+                    .auto_shrink([true, false])
                     .show(ui, |ui| {
                         let mut table_builder = TableBuilder::new(ui)
                             .striped(true)
@@ -3650,9 +3653,9 @@ impl SpectralApp {
 
                         for _ in &table.table.columns {
                             table_builder = table_builder.column(
-                                Column::initial(170.0)
-                                    .at_least(120.0)
-                                    .clip(false)
+                                Column::initial(120.0)
+                                    .at_least(72.0)
+                                    .clip(true)
                                     .resizable(true),
                             );
                         }
@@ -3947,7 +3950,7 @@ impl SpectralApp {
                         }
                     });
                 ui.horizontal(|ui| {
-                    ui.label("Parent mass tolerance (Da)");
+                    ui.label("Precursor m/z tolerance (Da)");
                     ui.add(
                         egui::DragValue::new(&mut self.search_parent_mass_tolerance)
                             .range(0.0..=1000.0)
@@ -5934,9 +5937,11 @@ impl eframe::App for SpectralApp {
         }
 
         if self.show_right_panel {
-            egui::SidePanel::right("selected_node_panel")
+            let panel = egui::SidePanel::right("selected_node_panel")
                 .resizable(true)
-                .default_width(360.0)
+                .default_width(self.selected_node_panel_width)
+                .min_width(240.0)
+                .max_width(960.0)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.small("[NODE]");
@@ -5947,6 +5952,7 @@ impl eframe::App for SpectralApp {
                     ui.separator();
                     self.draw_selected_node_panel(ui);
                 });
+            self.selected_node_panel_width = panel.response.rect.width().clamp(240.0, 960.0);
         } else {
             egui::SidePanel::right("selected_node_panel_collapsed")
                 .resizable(false)
@@ -5962,16 +5968,25 @@ impl eframe::App for SpectralApp {
         }
 
         if self.node_attr_panel_dock == NodeAttrPanelDock::Right {
-            egui::SidePanel::right("node_attributes_side_panel")
-                .resizable(false)
-                .exact_width(if self.show_node_attributes_panel {
+            let panel = egui::SidePanel::right("node_attributes_side_panel")
+                .resizable(self.show_node_attributes_panel)
+                .default_width(if self.show_node_attributes_panel {
                     self.node_attr_right_width
+                } else {
+                    58.0
+                })
+                .min_width(if self.show_node_attributes_panel { 220.0 } else { 58.0 })
+                .max_width(if self.show_node_attributes_panel {
+                    1800.0
                 } else {
                     58.0
                 })
                 .show(ctx, |ui| {
                     self.draw_node_attributes_panel(ui, "right");
                 });
+            if self.show_node_attributes_panel {
+                self.node_attr_right_width = panel.response.rect.width().clamp(220.0, 1800.0);
+            }
         }
 
         if self.node_attr_panel_dock == NodeAttrPanelDock::Bottom {
