@@ -6,6 +6,7 @@ use crate::network::{ComponentSelection, SpectralNetwork};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchQueryKey {
+    SpectrumId,
     FeatureId,
     FeaturelistFeatureId,
     Scans,
@@ -15,7 +16,8 @@ pub enum SearchQueryKey {
 }
 
 impl SearchQueryKey {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
+        Self::SpectrumId,
         Self::FeatureId,
         Self::FeaturelistFeatureId,
         Self::Scans,
@@ -26,6 +28,7 @@ impl SearchQueryKey {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::SpectrumId => "spectrum_id",
             Self::FeatureId => "FEATURE_ID",
             Self::FeaturelistFeatureId => "FEATURELIST_FEATURE_ID",
             Self::Scans => "SCANS",
@@ -37,6 +40,7 @@ impl SearchQueryKey {
 
     pub fn value_for(self, record: &SpectrumRecord) -> String {
         match self {
+            Self::SpectrumId => record.meta.spectrum_id.clone(),
             Self::FeatureId => record.meta.feature_id.clone().unwrap_or_default(),
             Self::FeaturelistFeatureId => record
                 .meta
@@ -290,6 +294,7 @@ mod tests {
             nodes: vec![
                 NetworkNode {
                     id: 0,
+                    spectrum_id: "spectrum_0".to_string(),
                     label: "a".to_string(),
                     raw_name: "A raw".to_string(),
                     feature_id: None,
@@ -304,6 +309,7 @@ mod tests {
                 },
                 NetworkNode {
                     id: 1,
+                    spectrum_id: "spectrum_1".to_string(),
                     label: "b".to_string(),
                     raw_name: "B,raw".to_string(),
                     feature_id: None,
@@ -337,6 +343,7 @@ mod tests {
         SpectrumRecord {
             meta: SpectrumMeta {
                 id,
+                spectrum_id: format!("feature_{id}"),
                 label: format!("label_{id}"),
                 raw_name: raw_name.to_string(),
                 feature_id: Some(format!("feature_{id}")),

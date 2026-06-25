@@ -40,8 +40,8 @@ pub fn load_default_config() -> Result<Option<AppConfig>, String> {
 fn load_config_path(path: &Path) -> Result<AppConfig, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-    let raw: RawAppConfig = toml::from_str(&text)
-        .map_err(|err| format!("cannot parse {}: {err}", path.display()))?;
+    let raw: RawAppConfig =
+        toml::from_str(&text).map_err(|err| format!("cannot parse {}: {err}", path.display()))?;
     let base_dir = path
         .parent()
         .map(Path::to_path_buf)

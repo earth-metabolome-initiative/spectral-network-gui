@@ -1,7 +1,7 @@
 pub mod app;
 pub mod attributes;
-pub mod config;
 pub mod compute;
+pub mod config;
 pub mod export;
 pub mod io;
 pub mod layout;

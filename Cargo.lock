@@ -1441,7 +1441,7 @@ dependencies = [
 [[package]]
 name = "geometric-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/geometric-traits#1c8193c0a3bc8e6c700ab8c0d53d6ed93ab19cea"
+source = "git+https://github.com/earth-metabolome-initiative/geometric-traits#e71de69217563d4306bb5ae16564db0b63c3f267"
 dependencies = [
  "bitvec",
  "hashbrown 0.16.1",
@@ -3720,7 +3720,7 @@ dependencies = [
 [[package]]
 name = "spectral-matcher"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/spectral-matcher#89841d9594881f9c3fa2ab00cb0bb92f6baa1f88"
+source = "git+https://github.com/earth-metabolome-initiative/spectral-matcher#b7405f6c70f1cf15397bba585372217e6a94388c"
 dependencies = [
  "csv",
  "indicatif",

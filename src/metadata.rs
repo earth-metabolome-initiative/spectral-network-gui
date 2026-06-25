@@ -593,6 +593,7 @@ mod tests {
         SpectrumRecord {
             meta: SpectrumMeta {
                 id: 1,
+                spectrum_id: "record".to_string(),
                 label: "record".to_string(),
                 raw_name: "record".to_string(),
                 feature_id: None,
@@ -747,7 +748,10 @@ mod tests {
             .index
             .occurrences_for_short_inchikey("ABCDEFGHIJKLMN")
             .expect("occurrences");
-        assert_eq!(occurrences[0].compound_name.as_deref(), Some("Withaferin A"));
+        assert_eq!(
+            occurrences[0].compound_name.as_deref(),
+            Some("Withaferin A")
+        );
     }
 
     #[test]

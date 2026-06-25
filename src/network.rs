@@ -3,6 +3,7 @@ use std::collections::HashSet;
 #[derive(Clone, Debug)]
 pub struct NetworkNode {
     pub id: usize,
+    pub spectrum_id: String,
     pub label: String,
     pub raw_name: String,
     pub feature_id: Option<String>,

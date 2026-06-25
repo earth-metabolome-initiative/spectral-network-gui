@@ -344,6 +344,7 @@ fn infer_query_key_mode(table: &AttributeTable) -> Option<SearchQueryKey> {
 fn search_query_key_from_str(value: &str) -> Option<SearchQueryKey> {
     let normalized = normalized_column_name(value);
     match normalized.as_str() {
+        "spectrumid" => Some(SearchQueryKey::SpectrumId),
         "featureid" => Some(SearchQueryKey::FeatureId),
         "featurelistfeatureid" => Some(SearchQueryKey::FeaturelistFeatureId),
         "scans" => Some(SearchQueryKey::Scans),
@@ -478,11 +479,11 @@ mod tests {
     #[test]
     fn parses_search_export_rows_and_infers_query_mode() {
         let text = sample_export(&[
-            "feat1\tFEATURE_ID\t1\t0.9\t0\t0.9\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\thit1\tCCO",
+            "feat1\tspectrum_id\t1\t0.9\t0\t0.9\t5\t\t\t\tABCDEFGHIJKLMN\t100.0\thit1\tCCO",
         ]);
         let parsed = parse_search_export_tsv("a.tsv", &text).expect("search export");
         assert_eq!(parsed.rows.len(), 1);
-        assert_eq!(parsed.inferred_query_key, Some(SearchQueryKey::FeatureId));
+        assert_eq!(parsed.inferred_query_key, Some(SearchQueryKey::SpectrumId));
         assert_eq!(
             parsed.rows[0].short_inchikey.as_deref(),
             Some("ABCDEFGHIJKLMN")

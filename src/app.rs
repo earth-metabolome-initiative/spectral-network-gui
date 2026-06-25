@@ -6,14 +6,12 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-#[cfg(not(target_arch = "wasm32"))]
-use crate::attributes::AttributeTable;
-use crate::attributes::LoadedAttributeTable;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::config::load_default_config;
+use crate::attributes::{AttributeTable, LoadedAttributeTable};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::compute::ComputeParams;
 use crate::compute::{SearchHit, SearchResult, SimilarityMetric};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::config::load_default_config;
 #[cfg(target_arch = "wasm32")]
 use crate::export::download_tsv_file;
 #[cfg(not(target_arch = "wasm32"))]
@@ -27,9 +25,9 @@ use crate::matcher_client::{
     NativeMatcherHandle, SharedMatcherLog, default_base_url, new_matcher_log,
     start_native_network_request, start_native_search_request,
 };
+use crate::metadata::{LoadedLotusMetadata, TaxonomicRank, short_inchikey};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::metadata::{NativeLotusLoadHandle, NativeLotusLoadMessage, start_native_lotus_load};
-use crate::metadata::{LoadedLotusMetadata, TaxonomicRank, short_inchikey};
 use crate::network::{ComponentSelection, SpectralNetwork};
 use crate::render::{GraphViewState, draw_network};
 #[cfg(not(target_arch = "wasm32"))]
@@ -75,6 +73,7 @@ const DEFAULT_LOTUS_PATH: &str = "";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NodeAttrMatchField {
     NodeId,
+    SpectrumId,
     FeatureId,
     FeaturelistFeatureId,
     Scans,
@@ -86,6 +85,7 @@ impl NodeAttrMatchField {
     fn ui_label(self) -> &'static str {
         match self {
             Self::NodeId => "Network node index (`node_id`, internal)",
+            Self::SpectrumId => "Network spectrum ID (`spectrum_id`)",
             Self::FeatureId => "Network feature ID (`feature_id`)",
             Self::FeaturelistFeatureId => {
                 "Compatibility: `featurelist_feature_id` (full feature-list id)"
@@ -438,6 +438,7 @@ impl SpectralApp {
         let (depict_tx, depict_rx) = mpsc::channel();
         #[cfg(not(target_arch = "wasm32"))]
         let matcher_log = new_matcher_log();
+        #[allow(unused_mut)]
         let mut app = Self {
             #[cfg(not(target_arch = "wasm32"))]
             mgf_path: DEFAULT_MGF_PATH.to_string(),
@@ -607,7 +608,11 @@ impl SpectralApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn poll_lotus_metadata(&mut self, ctx: &egui::Context) {
-        let Some(message) = self.native_lotus_load.as_ref().and_then(|handle| handle.try_recv()) else {
+        let Some(message) = self
+            .native_lotus_load
+            .as_ref()
+            .and_then(|handle| handle.try_recv())
+        else {
             return;
         };
         self.native_lotus_load = None;
@@ -932,10 +937,12 @@ impl SpectralApp {
             parse: spectral_matcher::ParseConfig {
                 min_peaks: MIN_PEAKS,
                 max_peaks: MAX_PEAKS,
+                ..Default::default()
             },
             build: spectral_matcher::NetworkBuildParams {
                 compute,
                 threshold: self.threshold.clamp(0.0, 1.0),
+                min_matched_peaks: 1,
                 top_k: self.pending_top_k.max(1),
             },
         })
@@ -996,11 +1003,13 @@ impl SpectralApp {
             parse: spectral_matcher::ParseConfig {
                 min_peaks: MIN_PEAKS,
                 max_peaks: MAX_PEAKS,
+                ..Default::default()
             },
             search,
             taxonomy,
             query_key: Some(match self.search_query_key {
                 SearchQueryKey::FeatureId => spectral_matcher::SearchQueryKey::FeatureId,
+                SearchQueryKey::SpectrumId => spectral_matcher::SearchQueryKey::SpectrumId,
                 SearchQueryKey::FeaturelistFeatureId => {
                     spectral_matcher::SearchQueryKey::FeaturelistFeatureId
                 }
@@ -1046,6 +1055,7 @@ impl SpectralApp {
                 .into_iter()
                 .map(|node| crate::network::NetworkNode {
                     id: node.id,
+                    spectrum_id: node.spectrum_id,
                     label: node.label,
                     raw_name: node.raw_name,
                     feature_id: node.feature_id,
@@ -1211,7 +1221,8 @@ impl SpectralApp {
         preferred_match_field: Option<NodeAttrMatchField>,
     ) {
         let inferred_mapping = inferred_node_attribute_mapping_for_table(&loaded.table);
-        if let Some(column_name) = preferred_key_column.or(inferred_mapping.map(|(column, _)| column))
+        if let Some(column_name) =
+            preferred_key_column.or(inferred_mapping.map(|(column, _)| column))
             && let Some(idx) = loaded.table.columns.iter().position(|column| {
                 normalized_column_name(column) == normalized_column_name(column_name)
             })
@@ -1222,8 +1233,42 @@ impl SpectralApp {
         self.node_attributes = Some(loaded);
         self.reset_node_attribute_table_state(&column_names);
         if let Some(field) = preferred_match_field.or(inferred_mapping.map(|(_, field)| field)) {
-            self.node_attr_match_field = field;
+            self.node_attr_match_field = self.best_node_attr_match_field(field);
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn best_node_attr_match_field(&self, preferred: NodeAttrMatchField) -> NodeAttrMatchField {
+        if self.count_node_attribute_matches(preferred) > 0 {
+            return preferred;
+        }
+
+        [
+            NodeAttrMatchField::NodeId,
+            NodeAttrMatchField::Scans,
+            NodeAttrMatchField::SpectrumId,
+            NodeAttrMatchField::FeatureId,
+            NodeAttrMatchField::FeaturelistFeatureId,
+            NodeAttrMatchField::RawName,
+            NodeAttrMatchField::Label,
+        ]
+        .into_iter()
+        .max_by_key(|field| self.count_node_attribute_matches(*field))
+        .filter(|field| self.count_node_attribute_matches(*field) > 0)
+        .unwrap_or(preferred)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn count_node_attribute_matches(&self, field: NodeAttrMatchField) -> usize {
+        let (Some(network), Some(table)) = (&self.network, &self.node_attributes) else {
+            return 0;
+        };
+        network
+            .nodes
+            .iter()
+            .filter_map(|node| Self::node_attribute_key_for_field(node, field))
+            .filter(|key| table.find_row_index(key).is_some())
+            .count()
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1862,8 +1907,16 @@ impl SpectralApp {
     }
 
     fn node_attribute_key_for_node(&self, node: &crate::network::NetworkNode) -> Option<String> {
-        match self.node_attr_match_field {
+        Self::node_attribute_key_for_field(node, self.node_attr_match_field)
+    }
+
+    fn node_attribute_key_for_field(
+        node: &crate::network::NetworkNode,
+        field: NodeAttrMatchField,
+    ) -> Option<String> {
+        match field {
             NodeAttrMatchField::NodeId => Some(node.id.to_string()),
+            NodeAttrMatchField::SpectrumId => Some(node.spectrum_id.clone()),
             NodeAttrMatchField::FeatureId => node.feature_id.clone(),
             NodeAttrMatchField::FeaturelistFeatureId => node.featurelist_feature_id.clone(),
             NodeAttrMatchField::Scans => node.scans.clone(),
@@ -3051,10 +3104,14 @@ impl SpectralApp {
                 .lotus_occurrence_summary_for_entry(&entry)
                 .and_then(|summary| summary.compound_qid);
         }
-        entry.taxonomic_links.compound = entry.compound_qid.clone().map(|compound_qid| StructureLink {
-                label: compound_qid.clone(),
-                url: wikidata_entity_url(&compound_qid),
-            });
+        entry.taxonomic_links.compound =
+            entry
+                .compound_qid
+                .clone()
+                .map(|compound_qid| StructureLink {
+                    label: compound_qid.clone(),
+                    url: wikidata_entity_url(&compound_qid),
+                });
         Some(entry)
     }
 
@@ -3536,6 +3593,11 @@ impl SpectralApp {
                             );
                             ui.selectable_value(
                                 node_attr_match_field,
+                                NodeAttrMatchField::SpectrumId,
+                                NodeAttrMatchField::SpectrumId.ui_label(),
+                            );
+                            ui.selectable_value(
+                                node_attr_match_field,
                                 NodeAttrMatchField::FeatureId,
                                 NodeAttrMatchField::FeatureId.ui_label(),
                             );
@@ -4001,10 +4063,17 @@ impl SpectralApp {
                 ui.small(
                     "Taxonomic reranking is executed by spectral-matcher using the configured LOTUS CSV path.",
                 );
-                if self.lotus_csv_path.trim().is_empty() {
-                    ui.small("Configure a LOTUS metadata path in the LOTUS metadata panel.");
-                } else {
-                    ui.small(format!("LOTUS CSV path: {}", self.lotus_csv_path));
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if self.lotus_csv_path.trim().is_empty() {
+                        ui.small("Configure a LOTUS metadata path in the LOTUS metadata panel.");
+                    } else {
+                        ui.small(format!("LOTUS CSV path: {}", self.lotus_csv_path));
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    ui.small("Taxonomic reranking is unavailable in the browser build.");
                 }
 
                 ui.checkbox(
@@ -5916,7 +5985,10 @@ fn build_lotus_occurrence_summary(
                 .as_deref()
                 .and_then(normalize_qid),
         };
-        if !taxa.iter().any(|existing: &LotusOccurrenceTaxon| *existing == taxon) {
+        if !taxa
+            .iter()
+            .any(|existing: &LotusOccurrenceTaxon| *existing == taxon)
+        {
             taxa.push(taxon);
         }
     }
@@ -5955,11 +6027,17 @@ fn render_lotus_occurrence_summary(ui: &mut egui::Ui, summary: &LotusOccurrenceS
             }
         }
         if summary.taxa.len() > 1 {
-            ui.small(format!("and {} additional biosource(s)", summary.taxa.len() - 1));
+            ui.small(format!(
+                "and {} additional biosource(s)",
+                summary.taxa.len() - 1
+            ));
         }
         if let Some(doi) = summary.reference_dois.first() {
             ui.small("according to");
-            ui.hyperlink_to(doi, format!("https://doi.org/{}", url_encode_component(doi)));
+            ui.hyperlink_to(
+                doi,
+                format!("https://doi.org/{}", url_encode_component(doi)),
+            );
         }
         if summary.reference_dois.len() > 1 {
             ui.small(format!(
@@ -5970,6 +6048,7 @@ fn render_lotus_occurrence_summary(ui: &mut egui::Ui, summary: &LotusOccurrenceS
     });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn is_structure_annotation_column_useful(column_name: &str) -> bool {
     let normalized = normalized_column_name(column_name);
     !(normalized.starts_with("representative")
@@ -6013,7 +6092,9 @@ fn preferred_compound_label_from_row(columns: &[String], row: &[String]) -> Opti
         "structure_name",
         "compound_name",
     ] {
-        if let Some(value) = find_row_value(columns, row, |normalized| normalized == normalized_column_name(target)) {
+        if let Some(value) = find_row_value(columns, row, |normalized| {
+            normalized == normalized_column_name(target)
+        }) {
             return Some(value.to_string());
         }
     }
@@ -6135,11 +6216,11 @@ fn wikidata_entity_url(qid: &str) -> String {
     )
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn preferred_node_attribute_mapping_for_search_query_key(
     key: SearchQueryKey,
 ) -> Option<(&'static str, NodeAttrMatchField)> {
     match key {
+        SearchQueryKey::SpectrumId => Some(("query_export_key", NodeAttrMatchField::SpectrumId)),
         SearchQueryKey::FeatureId => Some(("query_export_key", NodeAttrMatchField::FeatureId)),
         SearchQueryKey::FeaturelistFeatureId => {
             Some(("query_export_key", NodeAttrMatchField::FeaturelistFeatureId))
@@ -6151,7 +6232,6 @@ fn preferred_node_attribute_mapping_for_search_query_key(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn inferred_node_attribute_mapping_for_table(
     table: &AttributeTable,
 ) -> Option<(&'static str, NodeAttrMatchField)> {
@@ -6164,15 +6244,20 @@ fn inferred_node_attribute_mapping_for_table(
         .iter()
         .position(|column| normalized_column_name(column) == "querykeymode");
     if query_export_key_idx.is_some()
-        && let Some(query_key) = query_key_mode_idx.and_then(|idx| infer_single_search_query_key_mode(table, idx))
+        && let Some(query_key) =
+            query_key_mode_idx.and_then(|idx| infer_single_search_query_key_mode(table, idx))
         && let Some(mapping) = preferred_node_attribute_mapping_for_search_query_key(query_key)
     {
         return Some(mapping);
     }
 
     for (column_name, field) in [
+        ("spectrum_id", NodeAttrMatchField::SpectrumId),
         ("feature_id", NodeAttrMatchField::FeatureId),
-        ("featurelist_feature_id", NodeAttrMatchField::FeaturelistFeatureId),
+        (
+            "featurelist_feature_id",
+            NodeAttrMatchField::FeaturelistFeatureId,
+        ),
         ("scans", NodeAttrMatchField::Scans),
         ("raw_name", NodeAttrMatchField::RawName),
         ("label", NodeAttrMatchField::Label),
@@ -6189,7 +6274,6 @@ fn inferred_node_attribute_mapping_for_table(
     None
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn infer_single_search_query_key_mode(
     table: &AttributeTable,
     query_key_mode_idx: usize,
@@ -6211,9 +6295,9 @@ fn infer_single_search_query_key_mode(
     inferred
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn parse_search_query_key_mode(value: &str) -> Option<SearchQueryKey> {
     match normalized_column_name(value).as_str() {
+        "spectrumid" => Some(SearchQueryKey::SpectrumId),
         "featureid" => Some(SearchQueryKey::FeatureId),
         "featurelistfeatureid" => Some(SearchQueryKey::FeaturelistFeatureId),
         "scans" => Some(SearchQueryKey::Scans),
@@ -6264,7 +6348,10 @@ fn default_structure_caption_columns(columns: &[String], smiles_col: Option<usiz
     }
 
     for (idx, _name) in columns.iter().enumerate() {
-        if Some(idx) == smiles_col || seen.contains(&idx) || !is_structure_annotation_column_useful(&_name) {
+        if Some(idx) == smiles_col
+            || seen.contains(&idx)
+            || !is_structure_annotation_column_useful(&_name)
+        {
             continue;
         }
         picks.push(idx);
@@ -6350,7 +6437,11 @@ impl eframe::App for SpectralApp {
                 } else {
                     58.0
                 })
-                .min_width(if self.show_node_attributes_panel { 220.0 } else { 58.0 })
+                .min_width(if self.show_node_attributes_panel {
+                    220.0
+                } else {
+                    58.0
+                })
                 .max_width(if self.show_node_attributes_panel {
                     1800.0
                 } else {
@@ -6523,10 +6614,10 @@ mod tests {
         build_structure_display_groups, default_search_export_filename,
         default_structure_caption_columns, depict_cache_key, infer_single_search_query_key_mode,
         inferred_node_attribute_mapping_for_table, keep_selected_if_visible,
-        merged_structure_library_hits, occurrence_matches_reranked_taxon,
-        parse_taxonomic_rank, preferred_compound_label_from_row,
-        selected_structure_short_inchikey, selected_structure_taxonomic_metadata,
-        structure_matches_source_filter, visible_node_ids_for_view,
+        merged_structure_library_hits, occurrence_matches_reranked_taxon, parse_taxonomic_rank,
+        preferred_compound_label_from_row, selected_structure_short_inchikey,
+        selected_structure_taxonomic_metadata, structure_matches_source_filter,
+        visible_node_ids_for_view,
     };
     use crate::metadata::{LotusBiosource, TaxonomicRank, TaxonomyLineage};
 
@@ -6538,6 +6629,7 @@ mod tests {
             .iter()
             .map(|(id, component_id, degree)| NetworkNode {
                 id: *id,
+                spectrum_id: format!("spectrum_{id}"),
                 label: format!("s{id}"),
                 raw_name: format!("raw{id}"),
                 feature_id: Some(format!("f{id}")),
@@ -6829,14 +6921,21 @@ mod tests {
             "structure_nameIupac".to_string(),
             "compound_name".to_string(),
         ];
-        let row = vec!["Withaferin A".to_string(), "Long IUPAC".to_string(), "Other".to_string()];
+        let row = vec![
+            "Withaferin A".to_string(),
+            "Long IUPAC".to_string(),
+            "Other".to_string(),
+        ];
         assert_eq!(
             preferred_compound_label_from_row(&columns, &row).as_deref(),
             Some("Withaferin A")
         );
 
-        let row_without_traditional =
-            vec!["".to_string(), "Long IUPAC".to_string(), "Other".to_string()];
+        let row_without_traditional = vec![
+            "".to_string(),
+            "Long IUPAC".to_string(),
+            "Other".to_string(),
+        ];
         assert_eq!(
             preferred_compound_label_from_row(&columns, &row_without_traditional).as_deref(),
             Some("Long IUPAC")
@@ -6852,27 +6951,32 @@ mod tests {
                 "value".to_string(),
             ],
             rows: vec![
-                vec!["1062".to_string(), "FEATURE_ID".to_string(), "a".to_string()],
-                vec!["1063".to_string(), "FEATURE_ID".to_string(), "b".to_string()],
+                vec![
+                    "1062".to_string(),
+                    "spectrum_id".to_string(),
+                    "a".to_string(),
+                ],
+                vec![
+                    "1063".to_string(),
+                    "spectrum_id".to_string(),
+                    "b".to_string(),
+                ],
             ],
         };
         assert_eq!(
             infer_single_search_query_key_mode(&table, 1),
-            Some(SearchQueryKey::FeatureId)
+            Some(SearchQueryKey::SpectrumId)
         );
         assert_eq!(
             inferred_node_attribute_mapping_for_table(&table),
-            Some(("query_export_key", NodeAttrMatchField::FeatureId))
+            Some(("query_export_key", NodeAttrMatchField::SpectrumId))
         );
     }
 
     #[test]
     fn does_not_infer_mapping_for_mixed_query_key_modes() {
         let table = AttributeTable {
-            columns: vec![
-                "query_export_key".to_string(),
-                "query_key_mode".to_string(),
-            ],
+            columns: vec!["query_export_key".to_string(), "query_key_mode".to_string()],
             rows: vec![
                 vec!["1062".to_string(), "FEATURE_ID".to_string()],
                 vec!["1063".to_string(), "SCANS".to_string()],
@@ -6958,10 +7062,10 @@ mod tests {
         assert_eq!(summary.taxa[0].name, "Withania somnifera");
         assert_eq!(summary.taxa[0].qid.as_deref(), Some("Q852660"));
         assert_eq!(summary.taxa[1].name, "Physalis longifolia");
-        assert_eq!(summary.reference_dois, vec![
-            "10.1021/NP200635R".to_string(),
-            "10.0000/other".to_string(),
-        ]);
+        assert_eq!(
+            summary.reference_dois,
+            vec!["10.1021/NP200635R".to_string(), "10.0000/other".to_string(),]
+        );
     }
 
     #[test]
