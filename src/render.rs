@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use egui::{Color32, PointerButton, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 use crate::network::SpectralNetwork;
+use crate::pie_palette::PiePalette;
 
 #[derive(Default)]
 pub struct GraphViewState {
@@ -36,6 +37,8 @@ pub fn draw_network(
     positions: &HashMap<usize, [f32; 2]>,
     visible: &HashSet<usize>,
     node_fill_colors: Option<&HashMap<usize, Color32>>,
+    node_radii: Option<&HashMap<usize, f32>>,
+    node_pies: Option<(&HashMap<usize, Vec<Vec<f64>>>, usize, PiePalette, usize)>,
     view_state: &mut GraphViewState,
     selected_node_ids: &[usize],
 ) -> GraphInteraction {
@@ -108,12 +111,24 @@ pub fn draw_network(
             continue;
         }
 
-        let radius = (2.0 + (node.degree as f32).sqrt() * 0.8).clamp(2.5, 10.0);
+        let radius = node_radii
+            .and_then(|sizes| sizes.get(&node.id))
+            .copied()
+            .unwrap_or_else(|| (2.0 + (node.degree as f32).sqrt() * 0.8).clamp(2.5, 10.0));
         let fill = node_fill_colors
             .and_then(|colors| colors.get(&node.id))
             .copied()
             .unwrap_or_else(|| component_color(node.component_id));
-        painter.circle_filled(pos, radius, fill);
+        if !node_pies
+            .and_then(|(pies, axis, palette, count)| {
+                pies.get(&node.id)
+                    .and_then(|values| values.get(axis))
+                    .map(|values| paint_pie(&painter, pos, radius, values, palette, count))
+            })
+            .unwrap_or(false)
+        {
+            painter.circle_filled(pos, radius, fill);
+        }
         node_geometry.push(NodeScreenGeom {
             id: node.id,
             pos,
@@ -123,7 +138,7 @@ pub fn draw_network(
             painter.circle_stroke(
                 pos,
                 radius + 2.5,
-                Stroke::new(1.8, Color32::from_rgb(255, 210, 80)),
+                Stroke::new(1.8_f32, Color32::from_rgb(255, 210, 80)),
             );
         }
     }
@@ -131,7 +146,7 @@ pub fn draw_network(
     painter.rect_stroke(
         rect,
         0.0,
-        Stroke::new(1.0, Color32::from_gray(60)),
+        Stroke::new(1.0_f32, Color32::from_gray(60)),
         egui::StrokeKind::Outside,
     );
 
@@ -233,7 +248,7 @@ pub fn draw_network(
         painter.rect_stroke(
             select_rect,
             0.0,
-            Stroke::new(1.0, Color32::from_rgb(90, 140, 220)),
+            Stroke::new(1.0_f32, Color32::from_rgb(90, 140, 220)),
             egui::StrokeKind::Outside,
         );
     }
@@ -247,6 +262,59 @@ pub fn draw_network(
         box_selected_node_ids,
         &node_geometry,
     )
+}
+
+fn paint_pie(
+    painter: &egui::Painter,
+    center: Pos2,
+    radius: f32,
+    values: &[f64],
+    palette: PiePalette,
+    category_count: usize,
+) -> bool {
+    let total: f64 = values
+        .iter()
+        .copied()
+        .filter(|value| *value > 0.0 && value.is_finite())
+        .sum();
+    if !total.is_finite() || total <= 0.0 {
+        return false;
+    }
+
+    let mut mesh = egui::Mesh::default();
+    let mut angle = -std::f32::consts::FRAC_PI_2;
+    for (index, &value) in values.iter().enumerate() {
+        if !value.is_finite() || value <= 0.0 {
+            continue;
+        }
+        let sweep = std::f32::consts::TAU * (value / total) as f32;
+        let segments = (sweep / std::f32::consts::TAU * 48.0).ceil().max(1.0) as usize;
+        let color = palette.color(index, category_count);
+        let first = mesh.vertices.len() as u32;
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: center,
+            uv: egui::epaint::WHITE_UV,
+            color,
+        });
+        for step in 0..=segments {
+            let theta = angle + sweep * step as f32 / segments as f32;
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: center + egui::vec2(theta.cos(), theta.sin()) * radius,
+                uv: egui::epaint::WHITE_UV,
+                color,
+            });
+            if step > 0 {
+                mesh.indices.extend_from_slice(&[
+                    first,
+                    first + step as u32,
+                    first + step as u32 + 1,
+                ]);
+            }
+        }
+        angle += sweep;
+    }
+    painter.add(egui::Shape::mesh(mesh));
+    true
 }
 
 fn pan_for_cursor_zoom(

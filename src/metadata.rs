@@ -3,8 +3,6 @@ use std::io::Read;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::Arc;
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::mpsc;
 
 use crate::io::SpectrumRecord;
 
@@ -292,45 +290,10 @@ pub struct LoadedLotusMetadata {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub enum NativeLotusLoadMessage {
-    Finished(LoadedLotusMetadata),
-    Failed(String),
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub struct NativeLotusLoadHandle {
-    rx: mpsc::Receiver<NativeLotusLoadMessage>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl NativeLotusLoadHandle {
-    pub fn try_recv(&self) -> Option<NativeLotusLoadMessage> {
-        self.rx.try_recv().ok()
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 pub fn load_lotus_path(path: &Path) -> Result<LoadedLotusMetadata, String> {
     let bytes =
         std::fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
     load_lotus_bytes(&path.display().to_string(), &bytes)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn start_native_lotus_load(path: &Path) -> Result<NativeLotusLoadHandle, String> {
-    let source_label = path.display().to_string();
-    let bytes =
-        std::fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || match load_lotus_bytes(&source_label, &bytes) {
-        Ok(loaded) => {
-            let _ = tx.send(NativeLotusLoadMessage::Finished(loaded));
-        }
-        Err(err) => {
-            let _ = tx.send(NativeLotusLoadMessage::Failed(err));
-        }
-    });
-    Ok(NativeLotusLoadHandle { rx })
 }
 
 pub fn load_lotus_bytes(source_label: &str, bytes: &[u8]) -> Result<LoadedLotusMetadata, String> {

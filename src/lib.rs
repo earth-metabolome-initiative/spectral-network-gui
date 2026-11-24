@@ -1,16 +1,12 @@
 pub mod app;
 pub mod attributes;
-pub mod compute;
-pub mod config;
-pub mod export;
+mod grouped_attributes;
 pub mod io;
 pub mod layout;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod matcher_client;
 pub mod metadata;
 pub mod network;
+pub mod pie_palette;
 pub mod render;
-pub mod search_exports;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;

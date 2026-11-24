@@ -5,70 +5,59 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
+#[cfg(not(target_arch = "wasm32"))]
+use serde::Deserialize;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::{Path, PathBuf};
 
 use crate::attributes::{AttributeTable, LoadedAttributeTable};
+use crate::grouped_attributes::GroupAxis;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::compute::ComputeParams;
-use crate::compute::{SearchHit, SearchResult, SimilarityMetric};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::config::load_default_config;
-#[cfg(target_arch = "wasm32")]
-use crate::export::download_tsv_file;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::export::save_tsv_to_path;
-use crate::export::{SearchQueryKey, export_csv_strings, export_search_tsv};
-use crate::io::{ParseStats, SpectrumRecord};
+use crate::grouped_attributes::aggregate_grouped_attributes;
+use crate::io::SpectrumRecord;
 use crate::io::{spectrum_record_from_metadata, spectrum_record_from_parts};
 use crate::layout::force_directed_layout;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::matcher_client::{
-    NativeMatcherHandle, SharedMatcherLog, default_base_url, new_matcher_log,
-    start_native_network_request, start_native_search_request,
-};
 use crate::metadata::{LoadedLotusMetadata, TaxonomicRank, short_inchikey};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::metadata::{NativeLotusLoadHandle, NativeLotusLoadMessage, start_native_lotus_load};
 use crate::network::{ComponentSelection, SpectralNetwork};
+use crate::pie_palette::PiePalette;
 use crate::render::{GraphViewState, draw_network};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::search_exports::{
-    MergedSearchExportTable, SearchExportJobInput, SearchExportTable, default_search_export_alias,
-    merge_search_exports, parse_search_export_tsv,
-};
-use spectral_matcher::{NetworkArtifact, NetworkRequest, SearchArtifact, SearchRequest};
+use spectral_matcher::{NetworkArtifact, SearchArtifact};
+use spectral_matcher::{SearchArtifactResult, SearchQueryKey, SimilarityMetric};
 
-#[cfg(target_arch = "wasm32")]
-struct NativeMatcherHandle<T>(std::marker::PhantomData<T>);
-
-#[cfg(target_arch = "wasm32")]
-impl<T> NativeMatcherHandle<T> {
-    fn cancel(&self) {}
-
-    fn try_recv(&self) -> Option<Result<T, String>> {
-        None
-    }
-
-    fn progress(&self) -> Option<(f32, String)> {
-        None
-    }
-
-    fn status_text(&self) -> String {
-        "matcher unavailable on wasm".to_string()
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-const MIN_PEAKS: usize = 5;
-#[cfg(not(target_arch = "wasm32"))]
-const MAX_PEAKS: usize = 1000;
 const LAYOUT_STOP_EPSILON: f32 = 0.0015;
 const LAYOUT_STOP_STREAK: usize = 15;
 #[cfg(not(target_arch = "wasm32"))]
-const DEFAULT_MGF_PATH: &str = "fixtures/mapp_batch_00231.mgf";
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResultManifest {
+    network: String,
+    search: String,
+    lotus_csv: Option<String>,
+    feature_quant_csv: Option<String>,
+    sample_metadata_csv: Option<String>,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
-const DEFAULT_LIBRARY_PATH: &str = "";
+fn artifact_path(directory: &Path, filename: &str) -> Result<PathBuf, String> {
+    let relative = Path::new(filename);
+    if filename.trim().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "artifact path must be relative to result directory: {filename:?}"
+        ));
+    }
+    Ok(directory.join(relative))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
-const DEFAULT_LOTUS_PATH: &str = "";
+fn read_result_artifact<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|err| format!("Cannot read {}: {err}", path.display()))?;
+    serde_json::from_str(&content).map_err(|err| format!("Invalid JSON {}: {err}", path.display()))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NodeAttrMatchField {
@@ -98,23 +87,6 @@ impl NodeAttrMatchField {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NodeAttrPanelDock {
-    Bottom,
-    Right,
-    Detached,
-}
-
-impl NodeAttrPanelDock {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Bottom => "Bottom split",
-            Self::Right => "Right split",
-            Self::Detached => "Detached window",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StructurePanelMode {
     SelectedNode,
     SelectedSet,
@@ -130,8 +102,31 @@ impl StructurePanelMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeAttrSearchMode {
+    FeatureId,
+    AllAttributes,
+}
+
+impl NodeAttrSearchMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::FeatureId => "Feature ID",
+            Self::AllAttributes => "All attributes",
+        }
+    }
+
+    fn toggle(self) -> Self {
+        match self {
+            Self::FeatureId => Self::AllAttributes,
+            Self::AllAttributes => Self::FeatureId,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NodeAttrSortColumn {
     NodeId,
+    FeatureId,
     TableColumn(usize),
 }
 
@@ -154,18 +149,6 @@ impl PeakToleranceUnit {
 enum SpectrumZoomContext {
     Single(usize),
     Mirror { node_a: usize, node_b: usize },
-}
-
-struct NodeColoring {
-    fills: HashMap<usize, egui::Color32>,
-    mode: NodeColorMode,
-}
-
-enum NodeColorMode {
-    Categorical {
-        legend: Vec<(String, egui::Color32)>,
-    },
-    Continuous,
 }
 
 struct DepictFetchResult {
@@ -192,7 +175,6 @@ struct SelectedStructureEntry {
     preferred_compound_label: Option<String>,
     compound_qid: Option<String>,
     short_inchikey: Option<String>,
-    library_hits: Vec<StructureLibraryHit>,
     matched_taxonomic_organism_name: Option<String>,
     matched_taxonomic_organism_qid: Option<String>,
     taxonomic_reranked: bool,
@@ -232,53 +214,6 @@ struct StructureDisplayGroup<'a> {
     entries: Vec<&'a SelectedStructureEntry>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct StructureLibraryHit {
-    alias: String,
-    prefix: String,
-    rank: Option<usize>,
-    present: bool,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-struct LoadedSearchExportJob {
-    alias: String,
-    max_rank: usize,
-    table: SearchExportTable,
-}
-
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-struct ActiveMergedSearchExportInfo {
-    source_label: String,
-    row_count: usize,
-    library_aliases: Vec<String>,
-    library_prefixes: Vec<String>,
-    library_rank_maxima: Vec<usize>,
-    inferred_query_key: Option<SearchQueryKey>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StructureSourceFilter {
-    Any,
-    OnlyFirst,
-    OnlySecond,
-    BothFirstSecond,
-}
-
-impl StructureSourceFilter {
-    fn label(self, aliases: Option<(&str, &str)>) -> String {
-        match (self, aliases) {
-            (Self::Any, _) => "any source".to_string(),
-            (Self::OnlyFirst, Some((first, _))) => format!("only {first}"),
-            (Self::OnlySecond, Some((_, second))) => format!("only {second}"),
-            (Self::BothFirstSecond, Some((first, second))) => format!("both {first} + {second}"),
-            (Self::OnlyFirst, None) => "only first".to_string(),
-            (Self::OnlySecond, None) => "only second".to_string(),
-            (Self::BothFirstSecond, None) => "both first + second".to_string(),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StructureTaxonomyFilter {
     All,
@@ -316,54 +251,22 @@ struct MirrorSpectrumData<'a> {
 }
 
 pub struct SpectralApp {
-    #[cfg(not(target_arch = "wasm32"))]
-    mgf_path: String,
-    #[cfg(not(target_arch = "wasm32"))]
-    library_mgf_path: String,
-    #[cfg(not(target_arch = "wasm32"))]
-    lotus_csv_path: String,
-    #[cfg(not(target_arch = "wasm32"))]
-    matcher_base_url: String,
-    #[cfg(not(target_arch = "wasm32"))]
-    matcher_log: SharedMatcherLog,
-    #[cfg(not(target_arch = "wasm32"))]
-    loaded_search_export_jobs: Vec<LoadedSearchExportJob>,
-    #[cfg(not(target_arch = "wasm32"))]
-    native_lotus_load: Option<NativeLotusLoadHandle>,
-    active_merged_search_export: Option<ActiveMergedSearchExportInfo>,
-    source_label: Option<String>,
-    parse_stats: Option<ParseStats>,
+    result_directory: Option<String>,
+    search_query_node_ids: Vec<usize>,
+    hits_by_node: HashMap<usize, Vec<usize>>,
     spectra: Vec<SpectrumRecord>,
-    library_source_label: Option<String>,
-    library_parse_stats: Option<ParseStats>,
     library_spectra: Vec<SpectrumRecord>,
     lotus_metadata: Option<LoadedLotusMetadata>,
+    #[cfg(not(target_arch = "wasm32"))]
+    lotus_load: Option<Receiver<Result<LoadedLotusMetadata, String>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    egui_ctx: egui::Context,
 
-    tolerance_input: String,
-    mz_power_input: String,
-    intensity_power_input: String,
     selected_metric: SimilarityMetric,
-    show_build_setup: bool,
-    pending_metric: SimilarityMetric,
-    pending_top_k: usize,
-    pending_top_n_peaks_per_spectrum: usize,
-    pending_hide_singletons: bool,
-    build_top_n_peaks_per_spectrum: usize,
-    search_metric: SimilarityMetric,
-    search_top_n_peaks_per_spectrum: usize,
-    search_parent_mass_tolerance: f64,
-    search_min_matched_peaks: usize,
-    search_min_similarity_threshold: f64,
-    search_top_n: usize,
-    search_query_key: SearchQueryKey,
-    search_enable_taxonomic_reranking: bool,
-    search_taxonomic_query: String,
     show_left_panel: bool,
     show_right_panel: bool,
     selected_node_panel_width: f32,
 
-    threshold: f64,
-    top_k: usize,
     hide_singletons: bool,
     node_force: f32,
     edge_force: f32,
@@ -381,29 +284,31 @@ pub struct SpectralApp {
     selected_node_id: Option<usize>,
     secondary_selected_node_id: Option<usize>,
 
-    native_compute: Option<NativeMatcherHandle<NetworkArtifact>>,
-    native_search: Option<NativeMatcherHandle<SearchArtifact>>,
-
     status_message: Option<String>,
     error_message: Option<String>,
-    search_results: Option<SearchResult>,
-    last_search_tsv: Option<String>,
+    search_results: Option<SearchArtifactResult>,
 
     node_attributes: Option<LoadedAttributeTable>,
-    edge_attributes: Option<LoadedAttributeTable>,
+    pie_axes: Vec<GroupAxis>,
+    pie_axis: Option<usize>,
+    pie_values: HashMap<usize, Vec<Vec<f64>>>,
+    pie_palettes: Vec<PiePalette>,
     node_attr_match_field: NodeAttrMatchField,
     depict_smiles_column: Option<usize>,
     color_nodes_by_attribute: bool,
     node_color_attr_column: usize,
-    show_categorical_legend: bool,
+    node_size_attr_column: Option<usize>,
+    node_size_min_radius: f32,
+    node_size_max_radius: f32,
+    node_size_pivot: f32,
     show_node_attributes_panel: bool,
     node_attr_search_query: String,
-    node_attr_panel_dock: NodeAttrPanelDock,
+    node_attr_search_mode: NodeAttrSearchMode,
     node_attr_sort_column: NodeAttrSortColumn,
     node_attr_sort_ascending: bool,
     node_attr_bottom_height: f32,
-    node_attr_right_width: f32,
     pending_center_node_id: Option<usize>,
+    pending_center_node_zoom: bool,
     table_node_filter: Option<HashSet<usize>>,
     depict_cache: HashMap<String, DepictImageState>,
     depict_tx: std::sync::mpsc::Sender<DepictFetchResult>,
@@ -415,8 +320,6 @@ pub struct SpectralApp {
     selection_structures_taxonomy_filter: StructureTaxonomyFilter,
     selection_structures_collapse_identical_hits: bool,
     selection_structures_show_lotus_metadata: bool,
-    selection_structures_source_filter: StructureSourceFilter,
-    selection_structures_library_rank_limits: Vec<usize>,
     structure_caption_columns: Vec<usize>,
     selected_spectrum_peak: Option<(usize, f64, f64)>,
     spectrum_zoom_context: Option<SpectrumZoomContext>,
@@ -436,57 +339,22 @@ impl SpectralApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let (depict_tx, depict_rx) = mpsc::channel();
-        #[cfg(not(target_arch = "wasm32"))]
-        let matcher_log = new_matcher_log();
-        #[allow(unused_mut)]
-        let mut app = Self {
-            #[cfg(not(target_arch = "wasm32"))]
-            mgf_path: DEFAULT_MGF_PATH.to_string(),
-            #[cfg(not(target_arch = "wasm32"))]
-            library_mgf_path: DEFAULT_LIBRARY_PATH.to_string(),
-            #[cfg(not(target_arch = "wasm32"))]
-            lotus_csv_path: DEFAULT_LOTUS_PATH.to_string(),
-            #[cfg(not(target_arch = "wasm32"))]
-            matcher_base_url: default_base_url().to_string(),
-            #[cfg(not(target_arch = "wasm32"))]
-            matcher_log,
-            #[cfg(not(target_arch = "wasm32"))]
-            loaded_search_export_jobs: Vec::new(),
-            #[cfg(not(target_arch = "wasm32"))]
-            native_lotus_load: None,
-            active_merged_search_export: None,
-            source_label: None,
-            parse_stats: None,
+        Self {
+            result_directory: None,
+            search_query_node_ids: Vec::new(),
+            hits_by_node: HashMap::new(),
             spectra: Vec::new(),
-            library_source_label: None,
-            library_parse_stats: None,
             library_spectra: Vec::new(),
             lotus_metadata: None,
-            tolerance_input: "0.02".to_string(),
-            mz_power_input: "0".to_string(),
-            intensity_power_input: "1".to_string(),
+            #[cfg(not(target_arch = "wasm32"))]
+            lotus_load: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            egui_ctx: cc.egui_ctx.clone(),
             selected_metric: SimilarityMetric::default(),
-            show_build_setup: false,
-            pending_metric: SimilarityMetric::default(),
-            pending_top_k: 10,
-            pending_top_n_peaks_per_spectrum: 0,
-            pending_hide_singletons: true,
-            build_top_n_peaks_per_spectrum: 0,
-            search_metric: SimilarityMetric::default(),
-            search_top_n_peaks_per_spectrum: 0,
-            search_parent_mass_tolerance: 0.05,
-            search_min_matched_peaks: 6,
-            search_min_similarity_threshold: 0.7,
-            search_top_n: 10,
-            search_query_key: SearchQueryKey::FeatureId,
-            search_enable_taxonomic_reranking: false,
-            search_taxonomic_query: String::new(),
             show_left_panel: true,
             show_right_panel: true,
-            selected_node_panel_width: 360.0,
-            threshold: 0.2,
-            top_k: 10,
-            hide_singletons: true,
+            selected_node_panel_width: 460.0,
+            hide_singletons: false,
             node_force: 1.0,
             edge_force: 1.0,
             layout_running: false,
@@ -507,27 +375,30 @@ impl SpectralApp {
             hovered_node_id: None,
             selected_node_id: None,
             secondary_selected_node_id: None,
-            native_compute: None,
-            native_search: None,
             status_message: None,
             error_message: None,
             search_results: None,
-            last_search_tsv: None,
             node_attributes: None,
-            edge_attributes: None,
+            pie_axes: Vec::new(),
+            pie_axis: None,
+            pie_values: HashMap::new(),
+            pie_palettes: Vec::new(),
             node_attr_match_field: NodeAttrMatchField::NodeId,
             depict_smiles_column: None,
             color_nodes_by_attribute: false,
             node_color_attr_column: 0,
-            show_categorical_legend: true,
+            node_size_attr_column: None,
+            node_size_min_radius: 3.0,
+            node_size_max_radius: 14.0,
+            node_size_pivot: 0.5,
             show_node_attributes_panel: true,
             node_attr_search_query: String::new(),
-            node_attr_panel_dock: NodeAttrPanelDock::Bottom,
+            node_attr_search_mode: NodeAttrSearchMode::FeatureId,
             node_attr_sort_column: NodeAttrSortColumn::NodeId,
             node_attr_sort_ascending: true,
             node_attr_bottom_height: 260.0,
-            node_attr_right_width: 560.0,
             pending_center_node_id: None,
+            pending_center_node_zoom: false,
             table_node_filter: None,
             depict_cache: HashMap::new(),
             depict_tx,
@@ -539,8 +410,6 @@ impl SpectralApp {
             selection_structures_taxonomy_filter: StructureTaxonomyFilter::All,
             selection_structures_collapse_identical_hits: true,
             selection_structures_show_lotus_metadata: true,
-            selection_structures_source_filter: StructureSourceFilter::Any,
-            selection_structures_library_rank_limits: Vec::new(),
             structure_caption_columns: Vec::new(),
             selected_spectrum_peak: None,
             spectrum_zoom_context: None,
@@ -554,155 +423,395 @@ impl SpectralApp {
             peak_filter_tolerance: 0.02,
             peak_filter_tolerance_unit: PeakToleranceUnit::Da,
             peak_filtered_node_ids: None,
-        };
-        #[cfg(not(target_arch = "wasm32"))]
-        app.apply_startup_config();
-        app
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn apply_startup_config(&mut self) {
-        match load_default_config() {
-            Ok(Some(config)) => {
-                if let Some(path) = config.lotus_metadata_path {
-                    self.lotus_csv_path = path.display().to_string();
-                    if config.auto_load_lotus_metadata {
-                        self.start_lotus_metadata_load();
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(err) => {
-                self.error_message = Some(format!("Config load failed: {err}"));
-            }
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn start_lotus_metadata_load(&mut self) {
-        let path_text = self.lotus_csv_path.trim();
-        if path_text.is_empty() {
-            self.error_message = Some("LOTUS metadata path is empty".to_string());
-            return;
-        }
-        match start_native_lotus_load(std::path::Path::new(path_text)) {
-            Ok(handle) => {
-                self.native_lotus_load = Some(handle);
-                self.status_message = Some(format!("Loading LOTUS metadata from {path_text}"));
-                self.error_message = None;
+    fn load_result_directory(&mut self, directory: &Path) {
+        let loaded = (|| -> Result<_, String> {
+            let manifest_path = directory.join("result.toml");
+            let text = std::fs::read_to_string(&manifest_path)
+                .map_err(|err| format!("Cannot read {}: {err}", manifest_path.display()))?;
+            let manifest: ResultManifest = toml::from_str(&text)
+                .map_err(|err| format!("Invalid {}: {err}", manifest_path.display()))?;
+            let network: NetworkArtifact =
+                read_result_artifact(&artifact_path(directory, &manifest.network)?)?;
+            let search: SearchArtifact =
+                read_result_artifact(&artifact_path(directory, &manifest.search)?)?;
+            if search.taxonomy.is_some() && manifest.lotus_csv.is_none() {
+                return Err("result.toml must include lotus_csv for taxonomic results".to_string());
             }
-            Err(err) => {
-                self.native_lotus_load = None;
-                self.error_message = Some(err);
-            }
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn clear_lotus_metadata(&mut self) {
-        self.native_lotus_load = None;
-        self.lotus_metadata = None;
-        self.status_message = Some("Cleared LOTUS metadata".to_string());
-        self.error_message = None;
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn poll_lotus_metadata(&mut self, ctx: &egui::Context) {
-        let Some(message) = self
-            .native_lotus_load
-            .as_ref()
-            .and_then(|handle| handle.try_recv())
-        else {
-            return;
-        };
-        self.native_lotus_load = None;
-        match message {
-            NativeLotusLoadMessage::Finished(loaded) => {
-                let source_label = loaded.source_label.clone();
-                let stats = loaded.stats.clone();
-                self.lotus_csv_path = source_label.clone();
-                self.lotus_metadata = Some(loaded);
-                self.status_message = Some(format!(
-                    "Loaded LOTUS metadata: {} rows, {} structures, {} biosources",
-                    stats.rows, stats.indexed_structures, stats.indexed_biosources
-                ));
-                self.error_message = None;
-            }
-            NativeLotusLoadMessage::Failed(err) => {
-                self.error_message = Some(err);
-            }
-        }
-        ctx.request_repaint();
-    }
-
-    fn draw_lotus_metadata_panel(&mut self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.label("LOTUS metadata");
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                ui.label("LOTUS CSV path");
-                ui.text_edit_singleline(&mut self.lotus_csv_path);
-                ui.horizontal(|ui| {
-                    if ui.button("📁 Pick LOTUS").clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("CSV", &["csv"])
-                            .pick_file()
-                    {
-                        self.lotus_csv_path = path.display().to_string();
-                    }
-                    let load_label = if self.lotus_metadata.is_some() {
-                        "↻ Reload"
-                    } else {
-                        "Load"
-                    };
-                    if ui.button(load_label).clicked() {
-                        self.start_lotus_metadata_load();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.lotus_metadata.is_some() || self.native_lotus_load.is_some(),
-                            egui::Button::new("Clear"),
-                        )
-                        .clicked()
-                    {
-                        self.clear_lotus_metadata();
-                    }
-                });
-                if self.native_lotus_load.is_some() {
-                    ui.small("LOTUS metadata is loading in the background...");
-                } else if let Some(loaded) = &self.lotus_metadata {
-                    ui.small(format!(
-                        "{} | rows={} | structures={} | biosources={} | queryable organisms={}",
-                        loaded.source_label,
-                        loaded.stats.rows,
-                        loaded.stats.indexed_structures,
-                        loaded.stats.indexed_biosources,
-                        loaded.stats.queryable_organisms
+            let lotus = if let Some(source) = manifest.lotus_csv {
+                let path = PathBuf::from(&source);
+                if !path.is_absolute() || !path.is_file() {
+                    return Err(format!(
+                        "lotus_csv must name an existing absolute CSV file: {source}"
                     ));
-                } else {
-                    ui.small("No LOTUS metadata loaded.");
+                }
+                Some(path)
+            } else {
+                None
+            };
+            let grouped = match (manifest.feature_quant_csv, manifest.sample_metadata_csv) {
+                (Some(quant), Some(metadata)) => {
+                    let quant_path = Path::new(&quant);
+                    let metadata_path = Path::new(&metadata);
+                    for (name, path) in [
+                        ("feature_quant_csv", quant_path),
+                        ("sample_metadata_csv", metadata_path),
+                    ] {
+                        if !path.is_absolute() || !path.is_file() {
+                            return Err(format!(
+                                "{name} must name an existing absolute CSV file: {}",
+                                path.display()
+                            ));
+                        }
+                    }
+                    let quant_file = std::fs::File::open(quant_path)
+                        .map_err(|err| format!("cannot read {}: {err}", quant_path.display()))?;
+                    let metadata_file = std::fs::File::open(metadata_path)
+                        .map_err(|err| format!("cannot read {}: {err}", metadata_path.display()))?;
+                    Some(aggregate_grouped_attributes(quant_file, metadata_file)?)
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(
+                        "result.toml must provide both feature_quant_csv and sample_metadata_csv"
+                            .to_string(),
+                    );
+                }
+            };
+            let spectra_by_id: HashMap<_, _> = network
+                .spectra
+                .iter()
+                .map(|spectrum| (spectrum.meta.id, &spectrum.meta))
+                .collect();
+            if spectra_by_id.len() != network.spectra.len() {
+                return Err("Network contains duplicate spectrum IDs".to_string());
+            }
+            for node in &network.network.nodes {
+                let meta = spectra_by_id
+                    .get(&node.id)
+                    .ok_or_else(|| format!("Network node {} has no spectrum", node.id))?;
+                if meta.spectrum_id != node.spectrum_id || meta.raw_name != node.raw_name {
+                    return Err(format!(
+                        "Network node {} does not match its spectrum",
+                        node.id
+                    ));
                 }
             }
-
-            #[cfg(target_arch = "wasm32")]
+            let spectra = network
+                .spectra
+                .iter()
+                .map(|spectrum| spectrum_record_from_parts(spectrum.meta.clone(), &spectrum.peaks))
+                .collect::<Result<Vec<_>, _>>()?;
+            let library_spectra = search
+                .library_spectra
+                .iter()
+                .cloned()
+                .map(spectrum_record_from_metadata)
+                .collect::<Result<Vec<_>, _>>()?;
+            let search_table = AttributeTable::parse_tsv(&search.tsv)
+                .map_err(|err| format!("Invalid embedded search TSV: {err}"))?;
+            if !search_table
+                .columns
+                .iter()
+                .any(|column| column == "query_export_key")
+                || !search_table
+                    .columns
+                    .iter()
+                    .any(|column| column == "hit_rank")
             {
-                ui.small("LOTUS metadata loading is currently native-only.");
+                return Err(
+                    "Embedded search TSV is missing query_export_key or hit_rank".to_string(),
+                );
             }
-        });
+            let query_key = search.query_key;
+            let key_of_query = |meta: &crate::io::SpectrumMeta| -> Option<String> {
+                match query_key {
+                    SearchQueryKey::FeatureId => meta.feature_id.clone(),
+                    SearchQueryKey::SpectrumId => Some(meta.spectrum_id.clone()),
+                    SearchQueryKey::FeaturelistFeatureId => meta.featurelist_feature_id.clone(),
+                    SearchQueryKey::Scans => meta.scans.clone(),
+                    SearchQueryKey::RawName => Some(meta.raw_name.clone()),
+                    SearchQueryKey::Label => Some(meta.label.clone()),
+                    SearchQueryKey::NodeId => Some(meta.id.to_string()),
+                }
+            };
+            let mut nodes_by_key = HashMap::new();
+            for node in &network.network.nodes {
+                let key = match query_key {
+                    SearchQueryKey::FeatureId => node.feature_id.clone(),
+                    SearchQueryKey::SpectrumId => Some(node.spectrum_id.clone()),
+                    SearchQueryKey::FeaturelistFeatureId => node.featurelist_feature_id.clone(),
+                    SearchQueryKey::Scans => node.scans.clone(),
+                    SearchQueryKey::RawName => Some(node.raw_name.clone()),
+                    SearchQueryKey::Label => Some(node.label.clone()),
+                    SearchQueryKey::NodeId => Some(node.id.to_string()),
+                }
+                .ok_or_else(|| format!("Network node {} has no {:?} key", node.id, query_key))?;
+                if nodes_by_key.insert(key.clone(), node).is_some() {
+                    return Err(format!("Ambiguous network {:?} key: {key}", query_key));
+                }
+            }
+            let mut query_node_ids = Vec::with_capacity(search.query_spectra.len());
+            for query in &search.query_spectra {
+                let key = key_of_query(query).ok_or_else(|| {
+                    format!("Search query {} has no {:?} key", query.id, query_key)
+                })?;
+                let node = nodes_by_key.get(&key).ok_or_else(|| {
+                    format!(
+                        "Search query {:?} key {key:?} is absent from network",
+                        query_key
+                    )
+                })?;
+                if node.raw_name != query.raw_name
+                    || (node.precursor_mz - query.precursor_mz).abs() > 1e-6
+                {
+                    return Err(format!(
+                        "Search query {key:?} does not match network spectrum metadata"
+                    ));
+                }
+                query_node_ids.push(node.id);
+            }
+            if query_node_ids.len() != network.network.nodes.len()
+                || query_node_ids.iter().copied().collect::<HashSet<_>>().len()
+                    != query_node_ids.len()
+            {
+                return Err("Search query identities do not match the complete network".to_string());
+            }
+            if search.result.query_count != search.query_spectra.len()
+                || search.result.library_count != search.library_spectra.len()
+            {
+                return Err("Search artifact result counts do not match its spectra".to_string());
+            }
+            if search.result.hits.iter().any(|hit| {
+                hit.query_index >= query_node_ids.len()
+                    || hit.library_index >= search.library_spectra.len()
+            }) {
+                return Err("Search hit references a missing query or library spectrum".to_string());
+            }
+            // Search TSV has one row per hit. Project its best-ranked row onto
+            // every network query so features without a hit remain navigable.
+            let mut search_table = search_table;
+            let key_col = search_table
+                .columns
+                .iter()
+                .position(|name| name == "query_export_key")
+                .expect("validated search export key");
+            let rank_col = search_table
+                .columns
+                .iter()
+                .position(|name| name == "hit_rank")
+                .expect("validated search rank");
+            let node_col = search_table
+                .columns
+                .iter()
+                .position(|name| name == "query_node_id");
+            let feature_col = search_table
+                .columns
+                .iter()
+                .position(|name| name == "query_feature_id");
+            let mut best_by_key: HashMap<&str, (&Vec<String>, usize)> = HashMap::new();
+            for row in &search_table.rows {
+                let key = row[key_col].trim();
+                let rank = row[rank_col].parse::<usize>().unwrap_or(usize::MAX);
+                let entry = best_by_key.entry(key).or_insert((row, rank));
+                if rank < entry.1 {
+                    *entry = (row, rank);
+                }
+            }
+            let mut rows = Vec::with_capacity(search.query_spectra.len());
+            for (query, &node_id) in search.query_spectra.iter().zip(&query_node_ids) {
+                let key = key_of_query(query).expect("query identity validated");
+                let mut row = best_by_key.get(key.as_str()).map_or_else(
+                    || vec![String::new(); search_table.columns.len()],
+                    |(row, _)| (*row).clone(),
+                );
+                row[key_col] = key;
+                if let Some(index) = node_col {
+                    row[index] = node_id.to_string();
+                }
+                if let (Some(index), Some(feature)) = (feature_col, query.feature_id.as_ref()) {
+                    row[index] = feature.clone();
+                }
+                rows.push(row);
+            }
+            let mut pie_axes = Vec::new();
+            let mut pie_values = HashMap::new();
+            if let Some(grouped) = grouped {
+                for name in &grouped.columns {
+                    if search_table.columns.iter().any(|column| column == name) {
+                        return Err(format!(
+                            "grouped attribute collides with search column '{name}'"
+                        ));
+                    }
+                }
+                let new_width = search_table.columns.len() + grouped.columns.len();
+                for ((query, &node_id), row) in search
+                    .query_spectra
+                    .iter()
+                    .zip(&query_node_ids)
+                    .zip(&mut rows)
+                {
+                    if let Some(values) = query
+                        .feature_id
+                        .as_deref()
+                        .and_then(|feature| grouped.by_feature.get(feature.trim()))
+                    {
+                        row.extend(
+                            values.iter().map(|value| {
+                                value.map_or_else(String::new, |mean| mean.to_string())
+                            }),
+                        );
+                        let axes: Vec<Vec<f64>> = grouped
+                            .axes
+                            .iter()
+                            .map(|axis| {
+                                axis.column_indices
+                                    .iter()
+                                    .map(|&index| values[index].unwrap_or(0.0))
+                                    .collect()
+                            })
+                            .collect();
+                        if axes.iter().flatten().any(|&mean| mean > 0.0) {
+                            pie_values.insert(node_id, axes);
+                        }
+                    } else {
+                        row.resize(new_width, String::new());
+                    }
+                }
+                pie_axes = grouped.axes;
+                search_table.columns.extend(grouped.columns);
+            }
+            search_table.rows = rows;
+            Ok((
+                network,
+                search,
+                lotus,
+                search_table,
+                pie_axes,
+                pie_values,
+                query_key,
+                query_node_ids,
+                spectra,
+                library_spectra,
+            ))
+        })();
+        match loaded {
+            Ok((
+                network,
+                search,
+                lotus,
+                search_table,
+                pie_axes,
+                pie_values,
+                query_key,
+                query_node_ids,
+                spectra,
+                library_spectra,
+            )) => {
+                let mut hits_by_node: HashMap<usize, Vec<usize>> = HashMap::new();
+                for (index, hit) in search.result.hits.iter().enumerate() {
+                    hits_by_node
+                        .entry(query_node_ids[hit.query_index])
+                        .or_default()
+                        .push(index);
+                }
+                for indices in hits_by_node.values_mut() {
+                    indices.sort_unstable_by_key(|&index| search.result.hits[index].rank);
+                }
+                self.clear_loaded_result();
+                self.pie_axis = if pie_axes.is_empty() { None } else { Some(0) };
+                self.pie_palettes = vec![PiePalette::default(); pie_axes.len()];
+                self.pie_axes = pie_axes;
+                self.pie_values = pie_values;
+                if let Some(path) = lotus {
+                    let (sender, receiver) = mpsc::channel();
+                    let ctx = self.egui_ctx.clone();
+                    std::thread::spawn(move || {
+                        let result = crate::metadata::load_lotus_path(&path);
+                        let _ = sender.send(result);
+                        ctx.request_repaint();
+                    });
+                    self.lotus_load = Some(receiver);
+                }
+                self.apply_network_artifact(network, spectra);
+                self.apply_search_artifact(search, library_spectra);
+                self.search_query_node_ids = query_node_ids;
+                self.hits_by_node = hits_by_node;
+                let mapping = preferred_node_attribute_mapping_for_search_query_key(query_key);
+                let table = LoadedAttributeTable::new(
+                    "Embedded search attributes".to_string(),
+                    search_table,
+                );
+                self.set_node_attributes_table(
+                    table,
+                    mapping.map(|(name, _)| name),
+                    mapping.map(|(_, field)| field),
+                );
+                self.result_directory = Some(directory.display().to_string());
+                self.show_node_attributes_panel = true;
+                self.status_message = Some(if self.lotus_load.is_some() {
+                    format!(
+                        "Loaded result directory {}; LOTUS metadata loading in background",
+                        directory.display()
+                    )
+                } else {
+                    format!("Loaded result directory {}", directory.display())
+                });
+                self.error_message = None;
+            }
+            Err(err) => {
+                self.clear_loaded_result();
+                self.error_message = Some(err);
+            }
+        }
     }
-
     #[cfg(not(target_arch = "wasm32"))]
-    fn lotus_metadata_loading(&self) -> bool {
-        self.native_lotus_load.is_some()
+    fn poll_lotus_load(&mut self) {
+        let Some(receiver) = &self.lotus_load else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(metadata)) => {
+                self.lotus_metadata = Some(metadata);
+                self.lotus_load = None;
+                self.status_message =
+                    Some("Result directory and LOTUS metadata loaded".to_string());
+            }
+            Ok(Err(err)) => {
+                self.lotus_load = None;
+                self.error_message = Some(format!("LOTUS metadata could not be loaded: {err}"));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.lotus_load = None;
+                self.error_message = Some("LOTUS metadata loader stopped unexpectedly".to_string());
+            }
+            Err(TryRecvError::Empty) => {}
+        }
     }
 
-    #[cfg(target_arch = "wasm32")]
-    fn lotus_metadata_loading(&self) -> bool {
-        false
-    }
-
-    fn clear_compute_outputs(&mut self) {
+    fn clear_loaded_result(&mut self) {
         self.network = None;
+        self.spectra.clear();
+        self.search_results = None;
+        self.library_spectra.clear();
+        self.node_attributes = None;
+        self.pie_axes.clear();
+        self.pie_axis = None;
+        self.pie_values.clear();
+        self.pie_palettes.clear();
+        self.lotus_metadata = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.lotus_load = None;
+        }
+        self.search_query_node_ids.clear();
+        self.hits_by_node.clear();
+        self.result_directory = None;
+        self.status_message = None;
+        self.error_message = None;
         self.positions.clear();
         self.hovered_node_id = None;
         self.selected_node_id = None;
@@ -716,16 +825,11 @@ impl SpectralApp {
         self.view_state.box_select_start = None;
         self.view_state.box_select_current = None;
         self.pending_center_node_id = None;
+        self.pending_center_node_zoom = false;
         self.table_node_filter = None;
         self.clear_spectrum_view_state();
         self.spectrum_similarity_cache = None;
         self.peak_filtered_node_ids = None;
-    }
-
-    fn clear_search_outputs(&mut self) {
-        self.search_results = None;
-        self.last_search_tsv = None;
-        self.native_search = None;
     }
 
     fn clear_spectrum_view_state(&mut self) {
@@ -740,6 +844,7 @@ impl SpectralApp {
     fn set_single_selected_node(&mut self, node_id: usize, center: bool) {
         self.selected_node_id = Some(node_id);
         self.secondary_selected_node_id = None;
+        self.pending_center_node_zoom = false;
         if center {
             self.pending_center_node_id = Some(node_id);
         }
@@ -920,134 +1025,9 @@ impl SpectralApp {
         self.status_message = Some("Peak filter cleared".to_string());
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    fn matcher_network_request(&self) -> Result<NetworkRequest, String> {
-        let path = self.mgf_path.trim();
-        if path.is_empty() {
-            return Err("MGF path is empty".to_string());
-        }
-        let compute = self.parse_compute_params_for(
-            self.pending_metric,
-            Some(self.pending_top_n_peaks_per_spectrum),
-        )?;
-        Ok(NetworkRequest {
-            source_label: path.to_string(),
-            mgf_text: None,
-            mgf_path: Some(path.to_string()),
-            parse: spectral_matcher::ParseConfig {
-                min_peaks: MIN_PEAKS,
-                max_peaks: MAX_PEAKS,
-                ..Default::default()
-            },
-            build: spectral_matcher::NetworkBuildParams {
-                compute,
-                threshold: self.threshold.clamp(0.0, 1.0),
-                min_matched_peaks: 1,
-                top_k: self.pending_top_k.max(1),
-            },
-        })
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn matcher_network_request(&self) -> Result<NetworkRequest, String> {
-        Err("Matcher-driven build submission is currently unavailable on wasm".to_string())
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn matcher_search_request(&self) -> Result<SearchRequest, String> {
-        let query_path = self.mgf_path.trim();
-        if query_path.is_empty() {
-            return Err("MGF path is empty".to_string());
-        }
-        let library_path = self.library_mgf_path.trim();
-        if library_path.is_empty() {
-            return Err("Library MGF path is empty".to_string());
-        }
-        let search = spectral_matcher::LibrarySearchParams {
-            compute: self.parse_compute_params_for(
-                self.search_metric,
-                Some(self.search_top_n_peaks_per_spectrum),
-            )?,
-            precursor_mz_tolerance: self.search_parent_mass_tolerance.max(0.0),
-            min_matched_peaks: self.search_min_matched_peaks.max(1),
-            min_similarity_threshold: self.search_min_similarity_threshold.clamp(0.0, 1.0),
-            top_n: self.search_top_n.max(1),
-        };
-        let taxonomy = if self.search_enable_taxonomic_reranking {
-            let lotus_path = self.lotus_csv_path.trim();
-            if lotus_path.is_empty() {
-                return Err("Load a LOTUS CSV path before enabling taxonomic reranking".to_string());
-            }
-            let query_text = self.search_taxonomic_query.trim();
-            if query_text.is_empty() {
-                return Err(
-                    "Enter a biosource query before running taxonomic reranking".to_string()
-                );
-            }
-            Some(spectral_matcher::SearchTaxonomyRequest {
-                query_text: query_text.to_string(),
-                lotus_source_label: lotus_path.to_string(),
-                lotus_csv_text: None,
-                lotus_csv_path: Some(lotus_path.to_string()),
-            })
-        } else {
-            None
-        };
-        Ok(SearchRequest {
-            query_source_label: query_path.to_string(),
-            query_mgf_text: None,
-            query_mgf_path: Some(query_path.to_string()),
-            library_source_label: library_path.to_string(),
-            library_mgf_text: None,
-            library_mgf_path: Some(library_path.to_string()),
-            parse: spectral_matcher::ParseConfig {
-                min_peaks: MIN_PEAKS,
-                max_peaks: MAX_PEAKS,
-                ..Default::default()
-            },
-            search,
-            taxonomy,
-            query_key: Some(match self.search_query_key {
-                SearchQueryKey::FeatureId => spectral_matcher::SearchQueryKey::FeatureId,
-                SearchQueryKey::SpectrumId => spectral_matcher::SearchQueryKey::SpectrumId,
-                SearchQueryKey::FeaturelistFeatureId => {
-                    spectral_matcher::SearchQueryKey::FeaturelistFeatureId
-                }
-                SearchQueryKey::Scans => spectral_matcher::SearchQueryKey::Scans,
-                SearchQueryKey::RawName => spectral_matcher::SearchQueryKey::RawName,
-                SearchQueryKey::Label => spectral_matcher::SearchQueryKey::Label,
-                SearchQueryKey::NodeId => spectral_matcher::SearchQueryKey::NodeId,
-            }),
-        })
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn matcher_search_request(&self) -> Result<SearchRequest, String> {
-        Err("Matcher-driven spectral search is currently unavailable on wasm".to_string())
-    }
-
-    fn apply_network_artifact(&mut self, artifact: NetworkArtifact) {
-        let mut spectra = Vec::with_capacity(artifact.spectra.len());
-        for spectrum in &artifact.spectra {
-            match spectrum_record_from_parts(spectrum.meta.clone(), &spectrum.peaks) {
-                Ok(record) => spectra.push(record),
-                Err(err) => {
-                    self.error_message = Some(err);
-                    return;
-                }
-            }
-        }
-
-        self.source_label = Some(artifact.source_label.clone());
-        self.parse_stats = Some(artifact.parse_stats);
+    fn apply_network_artifact(&mut self, artifact: NetworkArtifact, spectra: Vec<SpectrumRecord>) {
         self.spectra = spectra;
         self.selected_metric = artifact.build.compute.metric;
-        self.pending_metric = artifact.build.compute.metric;
-        self.build_top_n_peaks_per_spectrum = artifact.build.compute.top_n_peaks.unwrap_or(0);
-        self.pending_top_n_peaks_per_spectrum = self.build_top_n_peaks_per_spectrum;
-        self.threshold = artifact.build.threshold.clamp(0.0, 1.0);
-        self.top_k = artifact.build.top_k.max(1);
-        self.pending_top_k = self.top_k;
         self.network = Some(SpectralNetwork {
             nodes: artifact
                 .network
@@ -1109,91 +1089,25 @@ impl SpectralApp {
             }
             self.layout_mean_displacement = layout.mean_displacement;
         }
-        self.status_message = Some(format!(
-            "Loaded spectral network: {} nodes, {} edges from {}",
-            self.network
-                .as_ref()
-                .map(|network| network.nodes.len())
-                .unwrap_or(0),
-            self.network
-                .as_ref()
-                .map(|network| network.edges.len())
-                .unwrap_or(0),
-            artifact.source_label
-        ));
         self.error_message = None;
     }
 
-    fn apply_search_artifact(&mut self, artifact: SearchArtifact) {
-        self.last_search_tsv = Some(artifact.tsv.clone());
-        let query_records = artifact
-            .query_spectra
-            .iter()
-            .cloned()
-            .map(spectrum_record_from_metadata)
-            .collect::<Result<Vec<_>, _>>();
-        let library_records = artifact
-            .library_spectra
-            .iter()
-            .cloned()
-            .map(spectrum_record_from_metadata)
-            .collect::<Result<Vec<_>, _>>();
-        let (Ok(query_records), Ok(library_records)) = (query_records, library_records) else {
-            self.error_message = Some(
-                "Failed to rebuild metadata-only spectra from matcher search artifact".to_string(),
-            );
-            return;
-        };
-
-        self.search_results = Some(SearchResult {
-            hits: artifact
-                .result
-                .hits
-                .iter()
-                .cloned()
-                .map(|hit| SearchHit {
-                    query_index: hit.query_index,
-                    library_index: hit.library_index,
-                    rank: hit.rank,
-                    spectral_score: hit.spectral_score,
-                    taxonomic_score: hit.taxonomic_score,
-                    combined_score: hit.combined_score,
-                    matches: hit.matches,
-                    matched_organism_name: hit.matched_organism_name,
-                    matched_organism_wikidata: hit.matched_organism_wikidata,
-                    matched_shared_rank: hit.matched_shared_rank,
-                    matched_short_inchikey: hit.matched_short_inchikey,
-                })
-                .collect(),
-            taxonomic_reranking_applied: artifact.result.taxonomic_reranking_applied,
-            taxonomic_query: artifact.result.taxonomic_query.clone(),
-        });
-        self.source_label = Some(artifact.query_source_label.clone());
-        self.library_source_label = Some(artifact.library_source_label.clone());
-        self.parse_stats = Some(artifact.query_stats);
-        self.library_parse_stats = Some(artifact.library_stats);
-        self.spectra = query_records;
-        self.library_spectra = library_records;
-        self.status_message = Some(format!(
-            "Spectral search finished: {} hit(s) across {} query spectrum/spectra",
-            self.search_results
-                .as_ref()
-                .map(|result| result.hits.len())
-                .unwrap_or(0),
-            artifact.result.query_count
-        ));
-        self.error_message = None;
+    fn apply_search_artifact(
+        &mut self,
+        artifact: SearchArtifact,
+        library_spectra: Vec<SpectrumRecord>,
+    ) {
+        self.library_spectra = library_spectra;
+        self.search_results = Some(artifact.result);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn reset_node_attribute_table_state(&mut self, columns: &[String]) {
         let table_columns = columns.len();
+        self.node_size_attr_column = None;
         self.node_attr_search_query.clear();
-        self.node_attr_sort_column = if table_columns > 0 {
-            NodeAttrSortColumn::TableColumn(0)
-        } else {
-            NodeAttrSortColumn::NodeId
-        };
+        self.node_attr_search_mode = NodeAttrSearchMode::FeatureId;
+        self.node_attr_sort_column = NodeAttrSortColumn::FeatureId;
         self.node_attr_sort_ascending = true;
         self.depict_smiles_column = columns.iter().enumerate().find_map(|(idx, col)| {
             let normalized = normalized_column_name(col);
@@ -1269,485 +1183,6 @@ impl SpectralApp {
             .filter_map(|node| Self::node_attribute_key_for_field(node, field))
             .filter(|key| table.find_row_index(key).is_some())
             .count()
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn load_attributes_from_tsv(&mut self, source_label: String, text: &str, is_node: bool) {
-        match AttributeTable::parse_tsv(text) {
-            Ok(table) => {
-                let loaded = LoadedAttributeTable::new(source_label.clone(), table);
-                let rows = loaded.table.rows.len();
-                let cols = loaded.table.columns.len();
-                if is_node {
-                    self.active_merged_search_export = None;
-                    self.selection_structures_library_rank_limits.clear();
-                    self.set_node_attributes_table(loaded, None, None);
-                } else {
-                    self.edge_attributes = Some(loaded);
-                }
-                self.status_message = Some(format!(
-                    "Loaded {} attribute table: {} rows, {} columns from {}",
-                    if is_node { "node" } else { "edge" },
-                    rows,
-                    cols,
-                    source_label
-                ));
-                self.error_message = None;
-            }
-            Err(err) => {
-                self.error_message = Some(format!(
-                    "Failed to parse {} attributes: {err}",
-                    if is_node { "node" } else { "edge" }
-                ));
-            }
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn load_search_export_from_tsv(&mut self, source_label: String, text: &str) {
-        match parse_search_export_tsv(&source_label, text) {
-            Ok(table) => {
-                let max_rank = table
-                    .rows
-                    .iter()
-                    .map(|row| row.hit_rank)
-                    .max()
-                    .unwrap_or(1)
-                    .max(1);
-                let alias = default_search_export_alias(&source_label);
-                let row_count = table.rows.len();
-                let inferred = table
-                    .inferred_query_key
-                    .map(SearchQueryKey::label)
-                    .unwrap_or("unknown");
-                self.loaded_search_export_jobs.push(LoadedSearchExportJob {
-                    alias: alias.clone(),
-                    max_rank,
-                    table,
-                });
-                self.status_message = Some(format!(
-                    "Loaded search export TSV: {row_count} rows from {source_label} (alias={alias}, query key={inferred})"
-                ));
-                self.error_message = None;
-            }
-            Err(err) => {
-                self.error_message = Some(err);
-            }
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn pick_and_load_network_artifact(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("JSON", &["json"])
-            .pick_file()
-        else {
-            return;
-        };
-
-        match std::fs::read_to_string(&path) {
-            Ok(content) => match serde_json::from_str::<NetworkArtifact>(&content) {
-                Ok(artifact) => self.apply_network_artifact(artifact),
-                Err(err) => {
-                    self.error_message = Some(format!(
-                        "Failed to parse matcher network JSON {}: {err}",
-                        path.display()
-                    ));
-                }
-            },
-            Err(err) => {
-                self.error_message = Some(format!(
-                    "Failed to read matcher network JSON {}: {err}",
-                    path.display()
-                ));
-            }
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn pick_and_load_search_artifact(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("JSON", &["json"])
-            .pick_file()
-        else {
-            return;
-        };
-
-        match std::fs::read_to_string(&path) {
-            Ok(content) => match serde_json::from_str::<SearchArtifact>(&content) {
-                Ok(artifact) => self.apply_search_artifact(artifact),
-                Err(err) => {
-                    self.error_message = Some(format!(
-                        "Failed to parse matcher search JSON {}: {err}",
-                        path.display()
-                    ));
-                }
-            },
-            Err(err) => {
-                self.error_message = Some(format!(
-                    "Failed to read matcher search JSON {}: {err}",
-                    path.display()
-                ));
-            }
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn pick_and_load_search_export(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("TSV", &["tsv", "txt"])
-            .pick_file()
-        else {
-            return;
-        };
-
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                self.load_search_export_from_tsv(path.display().to_string(), &content);
-            }
-            Err(err) => {
-                self.error_message = Some(format!(
-                    "Failed to read search export TSV {}: {err}",
-                    path.display()
-                ));
-            }
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn apply_merged_search_exports_to_node_attributes(&mut self) {
-        let job_inputs = self
-            .loaded_search_export_jobs
-            .iter()
-            .map(|job| SearchExportJobInput {
-                alias: job.alias.as_str(),
-                max_rank: job.max_rank,
-                table: &job.table,
-            })
-            .collect::<Vec<_>>();
-        let merged = match merge_search_exports(&job_inputs) {
-            Ok(merged) => merged,
-            Err(err) => {
-                self.error_message = Some(err);
-                return;
-            }
-        };
-        self.activate_merged_search_export_table(merged);
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn activate_merged_search_export_table(&mut self, merged: MergedSearchExportTable) {
-        let preferred = merged
-            .inferred_query_key
-            .and_then(preferred_node_attribute_mapping_for_search_query_key);
-        let source_label = format!(
-            "merged_search_exports__{}",
-            merged.library_aliases.join("__")
-        );
-        let row_count = merged.table.rows.len();
-        let library_rank_maxima =
-            merged_table_library_rank_maxima(&merged.table, &merged.library_prefixes);
-        let loaded = LoadedAttributeTable::new(source_label.clone(), merged.table);
-        self.set_node_attributes_table(
-            loaded,
-            preferred.map(|(column, _)| column),
-            preferred.map(|(_, field)| field),
-        );
-        self.selection_structures_source_filter = StructureSourceFilter::Any;
-        self.selection_structures_library_rank_limits = library_rank_maxima.clone();
-        self.active_merged_search_export = Some(ActiveMergedSearchExportInfo {
-            source_label: source_label.clone(),
-            row_count,
-            library_aliases: merged.library_aliases.clone(),
-            library_prefixes: merged.library_prefixes.clone(),
-            library_rank_maxima,
-            inferred_query_key: merged.inferred_query_key,
-        });
-        self.show_node_attributes_panel = true;
-        self.status_message = Some(format!(
-            "Applied merged search exports: {row_count} consistent row(s) across {}",
-            merged.library_aliases.join(", ")
-        ));
-        self.error_message = None;
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn pick_and_load_attributes(&mut self, is_node: bool) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("TSV", &["tsv", "txt"])
-            .pick_file()
-        else {
-            return;
-        };
-
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                self.load_attributes_from_tsv(path.display().to_string(), &content, is_node);
-            }
-            Err(err) => {
-                self.error_message = Some(format!(
-                    "Failed to read attribute TSV {}: {err}",
-                    path.display()
-                ));
-            }
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn parse_compute_params_for(
-        &self,
-        metric: SimilarityMetric,
-        top_n_peaks: Option<usize>,
-    ) -> Result<ComputeParams, String> {
-        let tolerance = self
-            .tolerance_input
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| "Invalid tolerance".to_string())?;
-        let mz_power = self
-            .mz_power_input
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| "Invalid mz_power".to_string())?;
-        let intensity_power = self
-            .intensity_power_input
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| "Invalid intensity_power".to_string())?;
-
-        Ok(ComputeParams {
-            metric,
-            fragment_mz_tolerance: tolerance,
-            mz_power,
-            intensity_power,
-            top_n_peaks: top_n_peaks.filter(|limit| *limit > 0),
-        })
-    }
-
-    fn run_build_network(&mut self) {
-        if self.is_computing() {
-            return;
-        }
-
-        self.selected_metric = self.pending_metric;
-        self.top_k = self.pending_top_k.max(1);
-        self.build_top_n_peaks_per_spectrum = self.pending_top_n_peaks_per_spectrum;
-        self.hide_singletons = self.pending_hide_singletons;
-        self.show_build_setup = false;
-        self.start_compute();
-    }
-
-    fn start_compute(&mut self) {
-        self.clear_compute_outputs();
-        self.error_message = None;
-        self.status_message =
-            Some("Submitting spectral network job to spectral-matcher...".to_string());
-
-        match self.matcher_network_request() {
-            Ok(request) => {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    self.native_compute = Some(start_native_network_request(
-                        self.matcher_base_url.clone(),
-                        request,
-                        self.matcher_log.clone(),
-                    ));
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    let _ = request;
-                    self.error_message = Some(
-                        "Matcher-driven build submission is currently unavailable on wasm"
-                            .to_string(),
-                    );
-                    self.status_message = None;
-                }
-            }
-            Err(err) => {
-                self.error_message = Some(err);
-                self.status_message = None;
-            }
-        }
-    }
-
-    fn start_search(&mut self) {
-        if self.is_computing() {
-            return;
-        }
-
-        self.clear_search_outputs();
-        self.error_message = None;
-
-        match self.matcher_search_request() {
-            Ok(request) => {
-                self.status_message =
-                    Some("Submitting spectral search job to spectral-matcher...".to_string());
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    self.native_search = Some(start_native_search_request(
-                        self.matcher_base_url.clone(),
-                        request,
-                        self.matcher_log.clone(),
-                    ));
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    let _ = request;
-                    self.error_message = Some(
-                        "Matcher-driven search submission is currently unavailable on wasm"
-                            .to_string(),
-                    );
-                    self.status_message = None;
-                }
-            }
-            Err(err) => {
-                self.error_message = Some(err);
-                self.status_message = None;
-            }
-        }
-    }
-
-    fn cancel_compute(&mut self) {
-        if let Some(handle) = &self.native_compute {
-            handle.cancel();
-        }
-        self.native_compute = None;
-        if let Some(handle) = &self.native_search {
-            handle.cancel();
-        }
-        self.native_search = None;
-        self.status_message = Some(
-            "Cancellation requested. The GUI released the current job; the matcher should stop it shortly."
-                .to_string(),
-        );
-    }
-
-    fn export_search_results(&mut self) {
-        let Some(results) = &self.search_results else {
-            self.error_message = Some("Run a spectral search before exporting TSV".to_string());
-            return;
-        };
-        #[cfg(not(target_arch = "wasm32"))]
-        let tsv = if let Some(tsv) = &self.last_search_tsv {
-            tsv.clone()
-        } else {
-            export_search_tsv(
-                results,
-                &self.spectra,
-                &self.library_spectra,
-                self.search_query_key,
-            )
-        };
-        #[cfg(target_arch = "wasm32")]
-        let tsv = export_search_tsv(
-            results,
-            &self.spectra,
-            &self.library_spectra,
-            self.search_query_key,
-        );
-        let default_filename = default_search_export_filename(
-            self.source_label.as_deref(),
-            self.library_source_label.as_deref(),
-        );
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("TSV", &["tsv"])
-                .set_file_name(&default_filename)
-                .save_file()
-            {
-                match save_tsv_to_path(&path, &tsv) {
-                    Ok(()) => {
-                        self.status_message = Some(format!(
-                            "Exported spectral search TSV to {}",
-                            path.display()
-                        ));
-                        self.error_message = None;
-                    }
-                    Err(err) => {
-                        self.error_message = Some(err);
-                    }
-                }
-            }
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            match download_tsv_file(&default_filename, &tsv) {
-                Ok(()) => {
-                    self.status_message = Some(format!(
-                        "Triggered spectral search TSV download: {default_filename}"
-                    ));
-                    self.error_message = None;
-                }
-                Err(err) => {
-                    self.error_message = Some(err);
-                }
-            }
-        }
-    }
-
-    fn poll_compute(&mut self, ctx: &egui::Context) {
-        if let Some(handle) = &self.native_compute {
-            if let Some(result) = handle.try_recv() {
-                self.native_compute = None;
-                match result {
-                    Ok(artifact) => self.apply_network_artifact(artifact),
-                    Err(err) if err == "matcher request cancelled" => {
-                        self.status_message = Some("Network job cancelled".to_string());
-                    }
-                    Err(err) => {
-                        self.error_message = Some(err);
-                        self.status_message = None;
-                    }
-                }
-            } else {
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
-            }
-        }
-    }
-
-    fn poll_search(&mut self, ctx: &egui::Context) {
-        if let Some(handle) = &self.native_search {
-            if let Some(result) = handle.try_recv() {
-                self.native_search = None;
-                match result {
-                    Ok(artifact) => self.apply_search_artifact(artifact),
-                    Err(err) if err == "matcher request cancelled" => {
-                        self.status_message = Some("Spectral search cancelled".to_string());
-                    }
-                    Err(err) => {
-                        self.error_message = Some(err);
-                        self.status_message = None;
-                    }
-                }
-            } else {
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
-            }
-        }
-    }
-
-    fn active_progress(&self) -> Option<(f32, String)> {
-        if let Some(handle) = &self.native_compute {
-            return Some(
-                handle
-                    .progress()
-                    .unwrap_or_else(|| (0.0, handle.status_text())),
-            );
-        }
-        if let Some(handle) = &self.native_search {
-            return Some(
-                handle
-                    .progress()
-                    .unwrap_or_else(|| (0.0, handle.status_text())),
-            );
-        }
-        None
-    }
-
-    fn is_computing(&self) -> bool {
-        self.native_compute.is_some() || self.native_search.is_some()
     }
 
     fn relayout_visible(&mut self, iterations: usize) -> Option<f32> {
@@ -1906,6 +1341,13 @@ impl SpectralApp {
         true
     }
 
+    fn node_navigation_id(node: &crate::network::NetworkNode) -> &str {
+        node.feature_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or(&node.spectrum_id)
+    }
+
     fn node_attribute_key_for_node(&self, node: &crate::network::NetworkNode) -> Option<String> {
         Self::node_attribute_key_for_field(node, self.node_attr_match_field)
     }
@@ -1957,11 +1399,11 @@ impl SpectralApp {
         network.nodes.iter().find(|n| n.id == node_id).cloned()
     }
 
-    fn spectrum_peaks_for_node(&self, node_id: usize) -> Option<Vec<(f64, f64)>> {
+    fn spectrum_peaks_for_node(&self, node_id: usize) -> Option<std::sync::Arc<Vec<(f64, f64)>>> {
         self.spectra
             .iter()
             .find(|record| record.meta.id == node_id)
-            .map(|record| record.peaks.as_ref().clone())
+            .map(|record| std::sync::Arc::clone(&record.peaks))
     }
 
     fn similarity_for_pair(&mut self, node_a: usize, node_b: usize) -> Option<f64> {
@@ -2329,7 +1771,7 @@ impl SpectralApp {
         painter.rect_stroke(
             plot_rect,
             0.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(130)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(130)),
             egui::StrokeKind::Outside,
         );
 
@@ -2340,14 +1782,14 @@ impl SpectralApp {
                 egui::pos2(plot_rect.left(), plot_rect.bottom()),
                 egui::pos2(plot_rect.right(), plot_rect.bottom()),
             ],
-            egui::Stroke::new(1.0, axis_color),
+            egui::Stroke::new(1.0_f32, axis_color),
         );
         painter.line_segment(
             [
                 egui::pos2(plot_rect.left(), plot_rect.bottom()),
                 egui::pos2(plot_rect.left(), plot_rect.top()),
             ],
-            egui::Stroke::new(1.0, axis_color),
+            egui::Stroke::new(1.0_f32, axis_color),
         );
 
         for (mz, intensity) in peaks.iter().take(8000) {
@@ -2362,7 +1804,7 @@ impl SpectralApp {
             let base = egui::pos2(x, plot_rect.bottom());
             painter.line_segment(
                 [base, top],
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 120, 210)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(45, 120, 210)),
             );
             drawn_peaks.push((*mz, *intensity, top, base));
         }
@@ -2431,7 +1873,7 @@ impl SpectralApp {
                 painter.rect_stroke(
                     selection_rect,
                     0.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 120, 220)),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 120, 220)),
                     egui::StrokeKind::Outside,
                 );
             }
@@ -2622,7 +2064,7 @@ impl SpectralApp {
         painter.rect_stroke(
             plot_rect,
             0.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(130)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(130)),
             egui::StrokeKind::Outside,
         );
 
@@ -2632,14 +2074,14 @@ impl SpectralApp {
                 egui::pos2(plot_rect.left(), center_y),
                 egui::pos2(plot_rect.right(), center_y),
             ],
-            egui::Stroke::new(1.0, axis_color),
+            egui::Stroke::new(1.0_f32, axis_color),
         );
         painter.line_segment(
             [
                 egui::pos2(plot_rect.left(), plot_rect.top()),
                 egui::pos2(plot_rect.left(), plot_rect.bottom()),
             ],
-            egui::Stroke::new(1.0, axis_color),
+            egui::Stroke::new(1.0_f32, axis_color),
         );
 
         let mut drawn_top = Vec::with_capacity(top_peaks.len().min(8000));
@@ -2654,7 +2096,7 @@ impl SpectralApp {
             let base = egui::pos2(x, center_y);
             painter.line_segment(
                 [base, tip],
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 120, 210)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(45, 120, 210)),
             );
             drawn_top.push((*mz, *intensity, tip, base));
         }
@@ -2671,7 +2113,7 @@ impl SpectralApp {
             let base = egui::pos2(x, center_y);
             painter.line_segment(
                 [base, tip],
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(210, 95, 60)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(210, 95, 60)),
             );
             drawn_bottom.push((*mz, *intensity, tip, base));
         }
@@ -2737,7 +2179,7 @@ impl SpectralApp {
                 painter.rect_stroke(
                     selection_rect,
                     0.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 120, 220)),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 120, 220)),
                     egui::StrokeKind::Outside,
                 );
             }
@@ -2917,8 +2359,6 @@ impl SpectralApp {
 
     fn draw_peak_filter_panel(&mut self, ui: &mut egui::Ui) {
         ui.push_id("peak_filter_panel", |ui| {
-            ui.separator();
-            ui.label("Peak Filter");
             ui.small("Right-click a spectrum peak to add its m/z to this filter list.");
 
             if self.peak_mz_filters.is_empty() {
@@ -3067,11 +2507,6 @@ impl SpectralApp {
                 }
             })
             .collect();
-        let library_hits = selected_structure_library_hits(
-            &table.table.columns,
-            row,
-            self.active_merged_search_export.as_ref(),
-        );
         let taxonomic_metadata = selected_structure_taxonomic_metadata(&table.table.columns, row);
         let matched_taxonomic_organism_name =
             selected_structure_matched_taxonomic_organism_name(&table.table.columns, row);
@@ -3092,7 +2527,6 @@ impl SpectralApp {
             preferred_compound_label: preferred_compound_label_from_row(&table.table.columns, row),
             compound_qid: compound_qid_from_row(&table.table.columns, row),
             short_inchikey,
-            library_hits,
             matched_taxonomic_organism_name,
             matched_taxonomic_organism_qid,
             taxonomic_reranked: taxonomic_metadata.reranked,
@@ -3120,14 +2554,6 @@ impl SpectralApp {
         entries: &'a [&'a SelectedStructureEntry],
     ) -> Vec<StructureDisplayGroup<'a>> {
         build_structure_display_groups(entries, self.selection_structures_collapse_identical_hits)
-    }
-
-    fn merged_source_alias_pair(&self) -> Option<(&str, &str)> {
-        let active = self.active_merged_search_export.as_ref()?;
-        if active.library_aliases.len() < 2 {
-            return None;
-        }
-        Some((&active.library_aliases[0], &active.library_aliases[1]))
     }
 
     fn lotus_occurrence_summary_for_entry(
@@ -3185,80 +2611,17 @@ impl SpectralApp {
                     &mut self.selection_structures_collapse_identical_hits,
                     "Collapse identical hits",
                 );
-                let merged_source_alias_pair = self
-                    .merged_source_alias_pair()
-                    .map(|(first, second)| (first.to_string(), second.to_string()));
-                if merged_source_alias_pair.is_some() {
-                    egui::ComboBox::from_id_salt(("selection_structures_source_filter", id_suffix))
-                        .selected_text(
-                            self.selection_structures_source_filter
-                                .label(
-                                    merged_source_alias_pair
-                                        .as_ref()
-                                        .map(|(first, second)| {
-                                            (first.as_str(), second.as_str())
-                                        }),
-                                ),
-                        )
-                        .show_ui(ui, |ui| {
-                            for filter in [
-                                StructureSourceFilter::Any,
-                                StructureSourceFilter::OnlyFirst,
-                                StructureSourceFilter::OnlySecond,
-                                StructureSourceFilter::BothFirstSecond,
-                            ] {
-                                ui.selectable_value(
-                                    &mut self.selection_structures_source_filter,
-                                    filter,
-                                    filter.label(
-                                        merged_source_alias_pair
-                                            .as_ref()
-                                            .map(|(first, second)| {
-                                                (first.as_str(), second.as_str())
-                                            }),
-                                    ),
-                                );
-                            }
-                        });
-                }
             });
-            if let Some(rank_controls) = self.active_merged_search_export.as_ref().map(|active| {
-                active
-                    .library_aliases
-                    .iter()
-                    .cloned()
-                    .zip(active.library_rank_maxima.iter().copied())
-                    .collect::<Vec<_>>()
-            }) {
-                if self.selection_structures_library_rank_limits.len() != rank_controls.len() {
-                    self.selection_structures_library_rank_limits =
-                        rank_controls.iter().map(|(_, max_rank)| *max_rank).collect();
-                }
-                ui.horizontal_wrapped(|ui| {
-                    ui.small("Per-library max displayed rank:");
-                    for (idx, (alias, max_rank)) in rank_controls.iter().enumerate() {
-                        if let Some(limit) = self.selection_structures_library_rank_limits.get_mut(idx)
-                        {
-                            ui.label(alias);
-                            ui.add(egui::Slider::new(limit, 1..=*max_rank).text("topN"));
-                        }
-                    }
-                });
-            }
             if self.table_node_filter.is_none() {
                 ui.small("Use rectangle selection on the graph to choose nodes.");
                 return;
             }
             if self.depict_smiles_column.is_none() {
-                ui.small("Select a SMILES column in the left panel.");
+                ui.small("No SMILES annotation in the embedded search attributes.");
                 return;
             }
             if self.selection_structures_show_lotus_metadata && self.lotus_metadata.is_none() {
-                if self.lotus_metadata_loading() {
-                    ui.small("LOTUS metadata is loading in the background...");
-                } else {
-                    ui.small("Load LOTUS metadata to display LOTUS occurrence summaries.");
-                }
+                ui.small("No LOTUS CSV was included in the result manifest.");
             }
 
             let selected_structures = self.selected_structures_from_node_selection();
@@ -3279,41 +2642,18 @@ impl SpectralApp {
                 return;
             }
 
-            let grouped_structures = self.structure_display_groups(&taxonomy_filtered_structures);
-            let filtered_groups: Vec<(&StructureDisplayGroup<'_>, Vec<StructureLibraryHit>)> =
-                grouped_structures
-                    .iter()
-                    .filter_map(|group| {
-                        let library_hits = merged_structure_library_hits(&group.entries);
-                        structure_matches_source_filter(
-                            &library_hits,
-                            &self.selection_structures_library_rank_limits,
-                            self.selection_structures_source_filter,
-                            self.active_merged_search_export.as_ref(),
-                        )
-                        .then_some((group, library_hits))
-                    })
-                    .collect();
-            if filtered_groups.is_empty() {
-                ui.small(format!(
-                    "No structures matched the '{}' taxonomic filter and '{}' source filter.",
-                    self.selection_structures_taxonomy_filter.label(),
-                    self.selection_structures_source_filter
-                        .label(self.merged_source_alias_pair())
-                ));
-                return;
-            }
+            let groups = self.structure_display_groups(&taxonomy_filtered_structures);
 
             let max_items = self.selection_structures_limit.max(1);
-            let groups = filtered_groups.iter().take(max_items).collect::<Vec<_>>();
-            if filtered_groups.len() > groups.len() {
+            let shown_groups = groups.iter().take(max_items).collect::<Vec<_>>();
+            if groups.len() > shown_groups.len() {
                 ui.small(format!(
                     "Showing {} / {} structure groups (increase Max structures to show more).",
-                    groups.len(),
-                    filtered_groups.len()
+                    shown_groups.len(),
+                    groups.len()
                 ));
             } else {
-                ui.small(format!("Showing {} structure groups.", groups.len()));
+                ui.small(format!("Showing {} structure groups.", shown_groups.len()));
             }
 
             let gallery_height = ui.available_height().max(260.0);
@@ -3321,7 +2661,7 @@ impl SpectralApp {
                 .id_salt(("selected_structures_gallery_scroll", id_suffix))
                 .max_height(gallery_height)
                 .show(ui, |ui| {
-                    for (group, library_hits) in groups {
+                    for group in shown_groups {
                         let entry = group.representative;
                         ui.push_id(entry.node_id, |ui| {
                             ui.group(|ui| {
@@ -3339,7 +2679,6 @@ impl SpectralApp {
                                 if ui.link(&entry.display_label).clicked() {
                                     self.set_single_selected_node(entry.node_id, true);
                                 }
-                                draw_structure_library_hits(ui, &library_hits);
                                 if self.selection_structures_collapse_identical_hits {
                                     ui.horizontal_wrapped(|ui| {
                                         ui.small("Feature IDs:");
@@ -3403,8 +2742,6 @@ impl SpectralApp {
                                         self.lotus_occurrence_summary_for_entry(entry)
                                     {
                                         render_lotus_occurrence_summary(ui, &summary);
-                                    } else if self.lotus_metadata_loading() {
-                                        ui.small("LOTUS metadata is loading in the background...");
                                     } else {
                                         ui.small(
                                             "No LOTUS occurrence metadata found for this structure.",
@@ -3423,7 +2760,7 @@ impl SpectralApp {
         &self,
         network: &SpectralNetwork,
         visible: &HashSet<usize>,
-    ) -> Option<NodeColoring> {
+    ) -> Option<HashMap<usize, egui::Color32>> {
         if !self.color_nodes_by_attribute {
             return None;
         }
@@ -3466,10 +2803,7 @@ impl SpectralApp {
         }
 
         if values.is_empty() {
-            return Some(NodeColoring {
-                fills: colors,
-                mode: NodeColorMode::Categorical { legend: Vec::new() },
-            });
+            return Some(colors);
         }
 
         let mut numeric_values: Vec<(usize, f64)> = Vec::with_capacity(values.len());
@@ -3502,20 +2836,12 @@ impl SpectralApp {
                     colors.insert(node_id, diverging_color(t));
                 }
             }
-            return Some(NodeColoring {
-                fills: colors,
-                mode: NodeColorMode::Continuous,
-            });
+            return Some(colors);
         }
 
         let mut categories: Vec<String> = values.iter().map(|(_, value)| value.clone()).collect();
         categories.sort();
         categories.dedup();
-        let legend = categories
-            .iter()
-            .enumerate()
-            .map(|(idx, category)| (category.clone(), categorical_color(idx)))
-            .collect::<Vec<_>>();
         let category_to_index: HashMap<String, usize> = categories
             .into_iter()
             .enumerate()
@@ -3528,114 +2854,56 @@ impl SpectralApp {
             }
         }
 
-        Some(NodeColoring {
-            fills: colors,
-            mode: NodeColorMode::Categorical { legend },
-        })
+        Some(colors)
     }
 
-    fn draw_attribute_table_setup(
-        ui: &mut egui::Ui,
-        title: &str,
-        table: &mut Option<LoadedAttributeTable>,
-        show_match_field: bool,
-        node_attr_match_field: &mut NodeAttrMatchField,
-    ) {
-        ui.group(|ui| {
-            ui.label(title);
-            if let Some(loaded) = table.as_mut() {
-                ui.small(format!(
-                    "{} | rows={} cols={}",
-                    loaded.source_label,
-                    loaded.table.rows.len(),
-                    loaded.table.columns.len()
-                ));
-                let inferred_mapping = inferred_node_attribute_mapping_for_table(&loaded.table);
-                if show_match_field {
-                    if let Some((results_key_column, match_field)) = inferred_mapping {
-                        ui.small(format!(
-                            "Detected spectral-search mapping: results `{results_key_column}` -> {}",
-                            match_field.ui_label()
-                        ));
-                    } else {
-                        ui.small(
-                            "Pick the identifier column in the loaded results table, then choose which network key it should match.",
-                        );
-                    }
-                }
-                let mut key_col = loaded.key_column();
-                egui::ComboBox::from_label("Results TSV key column")
-                    .selected_text(
-                        loaded
-                            .table
-                            .columns
-                            .get(key_col)
-                            .cloned()
-                            .unwrap_or_else(|| "<invalid>".to_string()),
-                    )
-                    .show_ui(ui, |ui| {
-                        for (idx, col) in loaded.table.columns.iter().enumerate() {
-                            ui.selectable_value(&mut key_col, idx, col);
-                        }
-                    });
-                if key_col != loaded.key_column() {
-                    loaded.set_key_column(key_col);
-                }
-
-                if show_match_field {
-                    egui::ComboBox::from_label("Network node key")
-                        .selected_text(node_attr_match_field.ui_label())
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                node_attr_match_field,
-                                NodeAttrMatchField::NodeId,
-                                NodeAttrMatchField::NodeId.ui_label(),
-                            );
-                            ui.selectable_value(
-                                node_attr_match_field,
-                                NodeAttrMatchField::SpectrumId,
-                                NodeAttrMatchField::SpectrumId.ui_label(),
-                            );
-                            ui.selectable_value(
-                                node_attr_match_field,
-                                NodeAttrMatchField::FeatureId,
-                                NodeAttrMatchField::FeatureId.ui_label(),
-                            );
-                            ui.selectable_value(
-                                node_attr_match_field,
-                                NodeAttrMatchField::FeaturelistFeatureId,
-                                NodeAttrMatchField::FeaturelistFeatureId.ui_label(),
-                            );
-                            ui.selectable_value(
-                                node_attr_match_field,
-                                NodeAttrMatchField::Scans,
-                                NodeAttrMatchField::Scans.ui_label(),
-                            );
-                            ui.selectable_value(
-                                node_attr_match_field,
-                                NodeAttrMatchField::RawName,
-                                NodeAttrMatchField::RawName.ui_label(),
-                            );
-                            ui.selectable_value(
-                                node_attr_match_field,
-                                NodeAttrMatchField::Label,
-                                NodeAttrMatchField::Label.ui_label(),
-                            );
-                        });
-                    ui.small(format!(
-                        "Current mapping: results `{}` -> {}",
-                        loaded
-                            .table
-                            .columns
-                            .get(loaded.key_column())
-                            .map_or("<none>", String::as_str),
-                        node_attr_match_field.ui_label()
-                    ));
-                }
-            } else {
-                ui.small("No table loaded");
+    fn node_attribute_sizing(
+        &self,
+        network: &SpectralNetwork,
+        visible: &HashSet<usize>,
+    ) -> Option<HashMap<usize, f32>> {
+        let column = self.node_size_attr_column?;
+        let table = self.node_attributes.as_ref()?;
+        let value_for_node = |node: &crate::network::NetworkNode| {
+            let key = self.node_attribute_key_for_node(node)?;
+            table
+                .find_row(&key)?
+                .get(column)?
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+        };
+        let mut min_value = f64::INFINITY;
+        let mut max_value = f64::NEG_INFINITY;
+        for node in &network.nodes {
+            if let Some(value) = value_for_node(node) {
+                min_value = min_value.min(value);
+                max_value = max_value.max(value);
             }
-        });
+        }
+        if !min_value.is_finite() {
+            return None;
+        }
+        let mut radii = HashMap::with_capacity(visible.len());
+        for node in &network.nodes {
+            if visible.contains(&node.id)
+                && let Some(value) = value_for_node(node)
+            {
+                radii.insert(
+                    node.id,
+                    node_radius_for_value(
+                        value,
+                        min_value,
+                        max_value,
+                        self.node_size_min_radius,
+                        self.node_size_max_radius,
+                        self.node_size_pivot,
+                    ),
+                );
+            }
+        }
+        Some(radii)
     }
 
     fn draw_node_attributes_panel(&mut self, ui: &mut egui::Ui, panel_id_suffix: &str) {
@@ -3650,7 +2918,7 @@ impl SpectralApp {
             }
             if let Some(table) = &self.node_attributes {
                 ui.small(format!(
-                    "Node TSV: {} rows | results key={} | network key={}",
+                    "Embedded search attributes: {} rows | results key={} | network key={}",
                     table.table.rows.len(),
                     table
                         .table
@@ -3660,7 +2928,7 @@ impl SpectralApp {
                     self.node_attr_match_field.ui_label()
                 ));
             } else {
-                ui.small("Load a node attributes TSV from the left panel.");
+                ui.small("Open a result directory to view embedded search attributes.");
             }
         });
 
@@ -3694,30 +2962,53 @@ impl SpectralApp {
         );
         let node_by_id: HashMap<usize, &crate::network::NetworkNode> =
             network.nodes.iter().map(|n| (n.id, n)).collect();
-        let feature_to_node_id: HashMap<String, usize> = network
-            .nodes
-            .iter()
-            .filter_map(|n| {
-                n.feature_id.as_deref().and_then(|fid| {
-                    let trimmed = fid.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some((trimmed.to_string(), n.id))
-                    }
-                })
-            })
-            .collect();
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button(format!(
+                    "Search mode: {}",
+                    self.node_attr_search_mode.label()
+                ))
+                .clicked()
+            {
+                self.node_attr_search_mode = self.node_attr_search_mode.toggle();
+            }
+            ui.add_sized(
+                [ui.available_width().max(120.0), 0.0],
+                egui::TextEdit::singleline(&mut self.node_attr_search_query).hint_text(match self
+                    .node_attr_search_mode
+                {
+                    NodeAttrSearchMode::FeatureId => "Search feature IDs across the network...",
+                    NodeAttrSearchMode::AllAttributes => "Filter visible rows by any attribute...",
+                }),
+            );
+            if ui.button("Clear search").clicked() {
+                self.node_attr_search_query.clear();
+            }
+        });
+
+        let query = self.node_attr_search_query.trim().to_ascii_lowercase();
+        let search_all_nodes =
+            self.node_attr_search_mode == NodeAttrSearchMode::FeatureId && !query.is_empty();
+        let all_ids: Vec<usize> = if search_all_nodes {
+            network.nodes.iter().map(|node| node.id).collect()
+        } else {
+            Vec::new()
+        };
+        let candidate_ids = if search_all_nodes {
+            &all_ids
+        } else {
+            &visible_ids
+        };
         let mut matched_rows: Vec<(usize, usize)> = Vec::new();
-        for node_id in &visible_ids {
+        for node_id in candidate_ids {
             let Some(node) = node_by_id.get(node_id) else {
                 continue;
             };
-            if self.hide_singletons && node.degree == 0 {
-                continue;
-            }
-            if let Some(filter) = &self.table_node_filter
-                && !filter.contains(node_id)
+            if !search_all_nodes
+                && self
+                    .table_node_filter
+                    .as_ref()
+                    .is_some_and(|filter| !filter.contains(node_id))
             {
                 continue;
             }
@@ -3729,38 +3020,28 @@ impl SpectralApp {
             }
         }
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Search");
-            ui.add_sized(
-                [ui.available_width().max(120.0), 0.0],
-                egui::TextEdit::singleline(&mut self.node_attr_search_query)
-                    .hint_text("Filter matched rows..."),
-            );
-            if ui.button("Clear search").clicked() {
-                self.node_attr_search_query.clear();
-            }
-        });
-
-        let query = self.node_attr_search_query.trim().to_ascii_lowercase();
         let matched_count = matched_rows.len();
         let mut filtered_rows: Vec<(usize, usize)> = matched_rows
             .iter()
             .copied()
             .filter(|(node_id, row_idx)| {
-                let node_id_text = node_id.to_string();
-                let node_id_lower = node_id_text.to_ascii_lowercase();
-                let Some(row) = table.row(*row_idx) else {
-                    return false;
-                };
-
                 if query.is_empty() {
                     return true;
                 }
-                if node_id_lower.contains(&query) {
-                    return true;
+                if self.node_attr_search_mode == NodeAttrSearchMode::FeatureId {
+                    return node_by_id.get(node_id).is_some_and(|node| {
+                        Self::node_navigation_id(node)
+                            .to_ascii_lowercase()
+                            .contains(&query)
+                    });
                 }
-                row.iter()
-                    .any(|value| value.to_ascii_lowercase().contains(&query))
+                let Some(row) = table.row(*row_idx) else {
+                    return false;
+                };
+                node_id.to_string().contains(&query)
+                    || row
+                        .iter()
+                        .any(|value| value.to_ascii_lowercase().contains(&query))
             })
             .collect();
 
@@ -3768,6 +3049,10 @@ impl SpectralApp {
             |(left_node_id, left_row_idx), (right_node_id, right_row_idx)| {
                 let ordering = match self.node_attr_sort_column {
                     NodeAttrSortColumn::NodeId => left_node_id.cmp(right_node_id),
+                    NodeAttrSortColumn::FeatureId => compare_node_attr_values(
+                        Self::node_navigation_id(node_by_id[left_node_id]),
+                        Self::node_navigation_id(node_by_id[right_node_id]),
+                    ),
                     NodeAttrSortColumn::TableColumn(col_idx) => {
                         let left_value = table
                             .row(*left_row_idx)
@@ -3790,9 +3075,14 @@ impl SpectralApp {
         );
 
         ui.small(format!(
-            "Matched rows for visible nodes: {} / {} (shown: {})",
+            "Matched rows {}: {} / {} (shown: {})",
+            if search_all_nodes {
+                "across network"
+            } else {
+                "for visible nodes"
+            },
             matched_count,
-            visible_ids.len(),
+            candidate_ids.len(),
             filtered_rows.len()
         ));
 
@@ -3820,20 +3110,16 @@ impl SpectralApp {
             });
         }
 
-        ui.separator();
         if filtered_rows.is_empty() {
-            ui.label("No visible node matched the current key/match-field selection.");
+            ui.label("No nodes matched this search and table mapping.");
         }
 
         let table_height = (ui.available_height() * 0.58).clamp(120.0, 420.0);
         let text_height = ui.text_style_height(&egui::TextStyle::Body).max(18.0);
         let sort_column = self.node_attr_sort_column;
         let sort_ascending = self.node_attr_sort_ascending;
-        let feature_id_column_idx = column_names
-            .iter()
-            .position(|name| normalized_column_name(name) == "featureid");
         let mut clicked_sort: Option<NodeAttrSortColumn> = None;
-        let mut clicked_feature_id: Option<String> = None;
+        let mut clicked_node_id: Option<usize> = None;
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), table_height),
             egui::Layout::top_down(egui::Align::Min),
@@ -3850,6 +3136,12 @@ impl SpectralApp {
                             .max_scroll_height(table_height)
                             .vscroll(true);
 
+                        table_builder = table_builder.column(
+                            Column::initial(140.0)
+                                .at_least(72.0)
+                                .clip(true)
+                                .resizable(true),
+                        );
                         for _ in &table.table.columns {
                             table_builder = table_builder.column(
                                 Column::initial(120.0)
@@ -3861,6 +3153,28 @@ impl SpectralApp {
 
                         table_builder
                             .header(text_height + 4.0, |mut header| {
+                                header.col(|ui| {
+                                    let sort_col = NodeAttrSortColumn::FeatureId;
+                                    let label = sort_header_label(
+                                        sort_column,
+                                        sort_ascending,
+                                        sort_col,
+                                        "Feature ID",
+                                    );
+                                    if ui
+                                        .add(
+                                            egui::Label::new(label)
+                                                .truncate()
+                                                .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text(
+                                            "Network feature ID (spectrum ID when absent)",
+                                        )
+                                        .clicked()
+                                    {
+                                        clicked_sort = Some(sort_col);
+                                    }
+                                });
                                 for (col_idx, col_name) in column_names.iter().enumerate() {
                                     header.col(|ui| {
                                         let sort_col = NodeAttrSortColumn::TableColumn(col_idx);
@@ -3890,18 +3204,23 @@ impl SpectralApp {
                                     let maybe_row = table.row(row_idx);
                                     let is_selected = Some(node_id) == self.selected_node_id;
 
+                                    row.col(|ui| {
+                                        if let Some(node) = node_by_id.get(&node_id) {
+                                            if ui
+                                                .link(Self::node_navigation_id(node))
+                                                .on_hover_text("Select and zoom to this node")
+                                                .clicked()
+                                            {
+                                                clicked_node_id = Some(node_id);
+                                            }
+                                        }
+                                    });
                                     for col_idx in 0..column_names.len() {
                                         row.col(|ui| {
                                             let value = maybe_row
                                                 .and_then(|r| r.get(col_idx))
                                                 .map_or("", String::as_str);
-                                            if Some(col_idx) == feature_id_column_idx {
-                                                if !value.trim().is_empty()
-                                                    && ui.link(value).clicked()
-                                                {
-                                                    clicked_feature_id = Some(value.to_string());
-                                                }
-                                            } else if is_selected {
+                                            if is_selected {
                                                 ui.colored_label(
                                                     egui::Color32::from_rgb(220, 180, 80),
                                                     value,
@@ -3927,765 +3246,87 @@ impl SpectralApp {
             ui.ctx().request_repaint();
         }
 
-        if let Some(feature_id) = clicked_feature_id {
-            let feature_id = feature_id.trim().to_string();
-            if !feature_id.is_empty() {
-                let maybe_node_id = feature_to_node_id.get(&feature_id).copied();
-                if let Some(node_id) = maybe_node_id {
-                    self.set_single_selected_node(node_id, true);
-                    self.structure_panel_mode = StructurePanelMode::SelectedNode;
-                    self.status_message =
-                        Some(format!("Selected feature_id={feature_id} (node {node_id})"));
-                    self.error_message = None;
-                } else {
-                    self.error_message =
-                        Some(format!("Feature ID not found in network: {feature_id}"));
-                }
-                ui.ctx().request_repaint();
-            }
+        if let Some(node_id) = clicked_node_id {
+            let status_message = format!(
+                "Focused node {} (feature ID: {})",
+                node_id,
+                Self::node_navigation_id(node_by_id[&node_id])
+            );
+            self.component_selection = ComponentSelection::All;
+            self.hide_singletons = false;
+            self.peak_filtered_node_ids = None;
+            self.table_node_filter = None;
+            self.request_fit_view = true;
+            self.set_single_selected_node(node_id, true);
+            self.pending_center_node_zoom = true;
+            self.structure_panel_mode = StructurePanelMode::SelectedNode;
+            self.status_message = Some(status_message);
+            self.error_message = None;
+            ui.ctx().request_repaint();
         }
     }
 
     fn draw_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("Spectral Network");
-        let (node_count, edge_count) = self
-            .network
-            .as_ref()
-            .map(|network| (network.nodes.len(), network.edges.len()))
-            .unwrap_or((0, 0));
-        ui.horizontal(|ui| {
-            ui.small(format!("[N] nodes: {}", node_count));
-            ui.separator();
-            ui.small(format!("[E] edges: {}", edge_count));
-        });
-        ui.separator();
-
-        ui.collapsing("Input", |ui| {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                ui.label("Local spectral-matcher URL");
-                ui.text_edit_singleline(&mut self.matcher_base_url);
-                ui.horizontal(|ui| {
-                    if ui.button("Load matcher network JSON").clicked() {
-                        self.pick_and_load_network_artifact();
-                    }
-                });
-                ui.separator();
-                ui.label("Query MGF path passed to spectral-matcher");
-                ui.text_edit_singleline(&mut self.mgf_path);
-                ui.horizontal(|ui| {
-                    if ui.button("📁 Pick file").clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("MGF", &["mgf"])
-                            .pick_file()
-                    {
-                        self.mgf_path = path.display().to_string();
-                    }
-                });
-                ui.small("The GUI no longer parses MGF locally; the matcher handles query loading.");
-            }
-
-            #[cfg(target_arch = "wasm32")]
-            {
-                ui.small("Matcher job submission is currently native-only.");
-            }
-
-            if let Some(source) = &self.source_label {
-                ui.label(format!("Query source: {source}"));
-            }
-            ui.label(format!("Parsed query spectra: {}", self.spectra.len()));
-            if let Some(stats) = self.parse_stats {
-                ui.label(format!(
-                    "Accepted={} / Blocks={} / MissingName={} / MissingPrecursor={} / TooFew={} / TooMany={} / DuplicateMz={}",
-                    stats.accepted,
-                    stats.ions_blocks,
-                    stats.dropped_missing_name,
-                    stats.dropped_missing_precursor_mz,
-                    stats.dropped_too_few_peaks,
-                    stats.dropped_too_many_peaks,
-                    stats.dropped_duplicate_mz,
-                ));
-            }
-        });
-
-        ui.separator();
-        ui.collapsing("Spectral Search", |ui| {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                if ui.button("Load matcher search JSON").clicked() {
-                    self.pick_and_load_search_artifact();
-                }
-                ui.separator();
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                ui.label("Library MGF path passed to spectral-matcher");
-                ui.text_edit_singleline(&mut self.library_mgf_path);
-                ui.horizontal(|ui| {
-                    if ui.button("📁 Pick library").clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("MGF", &["mgf"])
-                            .pick_file()
-                    {
-                        self.library_mgf_path = path.display().to_string();
-                    }
-                });
-                ui.small("The GUI no longer parses library MGF locally; the matcher handles it.");
-            }
-
-            #[cfg(target_arch = "wasm32")]
-            {
-                ui.small("Matcher spectral search submission is currently native-only.");
-            }
-
-            if let Some(source) = &self.library_source_label {
-                ui.label(format!("Library source: {source}"));
-            }
-            ui.label(format!(
-                "Loaded library spectra: {}",
-                self.library_spectra.len()
-            ));
-            if let Some(stats) = self.library_parse_stats {
-                ui.label(format!(
-                    "Accepted={} / Blocks={} / MissingName={} / MissingPrecursor={} / TooFew={} / TooMany={} / DuplicateMz={}",
-                    stats.accepted,
-                    stats.ions_blocks,
-                    stats.dropped_missing_name,
-                    stats.dropped_missing_precursor_mz,
-                    stats.dropped_too_few_peaks,
-                    stats.dropped_too_many_peaks,
-                    stats.dropped_duplicate_mz,
-                ));
-            }
-
-            ui.separator();
-            ui.collapsing("LOTUS Taxonomic Reranking", |ui| {
-                ui.small(
-                    "Taxonomic reranking is executed by spectral-matcher using the configured LOTUS CSV path.",
-                );
+        egui::CollapsingHeader::new("Input")
+            .default_open(true)
+            .show(ui, |ui| {
                 #[cfg(not(target_arch = "wasm32"))]
+                if ui.button("Open result directory…").clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_folder()
                 {
-                    if self.lotus_csv_path.trim().is_empty() {
-                        ui.small("Configure a LOTUS metadata path in the LOTUS metadata panel.");
-                    } else {
-                        ui.small(format!("LOTUS CSV path: {}", self.lotus_csv_path));
-                    }
+                    self.load_result_directory(&path);
                 }
                 #[cfg(target_arch = "wasm32")]
-                {
-                    ui.small("Taxonomic reranking is unavailable in the browser build.");
+                ui.small("Directory selection requires the native application.");
+                if let Some(path) = &self.result_directory {
+                    ui.small(path);
                 }
-
-                ui.checkbox(
-                    &mut self.search_enable_taxonomic_reranking,
-                    "Enable taxonomic reranking",
-                );
-                ui.add_enabled_ui(self.search_enable_taxonomic_reranking, |ui| {
-                    ui.label("Biosource query (Wikidata QID or exact LOTUS organism name)");
-                    ui.text_edit_singleline(&mut self.search_taxonomic_query);
-                });
-            });
-
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        !self.is_computing(),
-                        egui::Button::new("▶ Run search"),
-                    )
-                    .clicked()
-                {
-                    self.start_search();
-                }
-                if ui
-                    .add_enabled(self.search_results.is_some(), egui::Button::new("⇩ Export TSV"))
-                    .clicked()
-                {
-                    self.export_search_results();
-                }
-            });
-
-            egui::ComboBox::from_label("Query export key")
-                .selected_text(self.search_query_key.label())
-                .show_ui(ui, |ui| {
-                    for key in SearchQueryKey::ALL {
-                        ui.selectable_value(&mut self.search_query_key, key, key.label());
-                    }
-                });
-
-            if let Some(results) = &self.search_results {
-                let matched_queries = results
-                    .hits
-                    .iter()
-                    .map(|hit| hit.query_index)
-                    .collect::<HashSet<_>>()
-                    .len();
-                ui.small(format!(
-                    "Last search: {} hit(s) across {} query spectrum/spectra{}",
-                    results.hits.len(),
-                    matched_queries,
-                    if results.taxonomic_reranking_applied {
-                        results
-                            .taxonomic_query
-                            .as_deref()
-                            .map(|query| format!(" with taxonomic reranking ({query})"))
-                            .unwrap_or_else(|| " with taxonomic reranking".to_string())
-                    } else {
-                        String::new()
-                    }
-                ));
-            }
-
-            ui.collapsing("Advanced settings", |ui| {
-                egui::ComboBox::from_label("Spectral similarity")
-                    .selected_text(self.search_metric.label())
-                    .show_ui(ui, |ui| {
-                        for metric in SimilarityMetric::ALL {
-                            ui.selectable_value(&mut self.search_metric, metric, metric.label());
-                        }
-                    });
-                ui.horizontal(|ui| {
-                    ui.label("Precursor m/z tolerance (Da)");
-                    ui.add(
-                        egui::DragValue::new(&mut self.search_parent_mass_tolerance)
-                            .range(0.0..=1000.0)
-                            .speed(0.01),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Min matched peaks");
-                    ui.add(
-                        egui::DragValue::new(&mut self.search_min_matched_peaks)
-                            .range(1..=500)
-                            .speed(1.0),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Min similarity threshold");
-                    ui.add(
-                        egui::DragValue::new(&mut self.search_min_similarity_threshold)
-                            .range(0.0..=1.0)
-                            .speed(0.01),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("TopN hits to report");
-                    ui.add(
-                        egui::DragValue::new(&mut self.search_top_n)
-                            .range(1..=500)
-                            .speed(1.0),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Top peaks / spectrum");
-                    ui.add(
-                        egui::DragValue::new(&mut self.search_top_n_peaks_per_spectrum)
-                            .range(0..=10_000)
-                            .speed(1.0),
-                    );
-                    ui.small("0 = all peaks");
-                });
-            });
-        });
-
-        ui.separator();
-        ui.collapsing("Attributes TSV", |ui| {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                ui.horizontal(|ui| {
-                    if ui.button("Load node attributes TSV").clicked() {
-                        self.pick_and_load_attributes(true);
-                    }
-                    if ui.button("Load edge attributes TSV").clicked() {
-                        self.pick_and_load_attributes(false);
-                    }
-                });
-
-                ui.separator();
-                ui.group(|ui| {
-                    ui.label("Merged Search TSV");
-                    ui.horizontal(|ui| {
-                        if ui.button("Load search export TSV").clicked() {
-                            self.pick_and_load_search_export();
-                        }
-                        if ui
-                            .add_enabled(
-                                self.loaded_search_export_jobs.len() >= 2,
-                                egui::Button::new("Apply merged table"),
-                            )
-                            .clicked()
-                        {
-                            self.apply_merged_search_exports_to_node_attributes();
-                        }
-                        if ui
-                            .add_enabled(
-                                !self.loaded_search_export_jobs.is_empty(),
-                                egui::Button::new("Clear loaded exports"),
-                            )
-                            .clicked()
-                        {
-                            self.loaded_search_export_jobs.clear();
-                            self.active_merged_search_export = None;
-                            self.selection_structures_library_rank_limits.clear();
-                        }
-                    });
-
-                    if self.loaded_search_export_jobs.is_empty() {
-                        ui.small("No search export TSVs loaded.");
-                    } else {
-                        let mut remove_idx: Option<usize> = None;
-                        for (idx, job) in self.loaded_search_export_jobs.iter_mut().enumerate() {
-                            ui.push_id(("search_export_job", idx), |ui| {
-                                ui.separator();
-                                ui.horizontal(|ui| {
-                                    ui.label("Alias");
-                                    ui.text_edit_singleline(&mut job.alias);
-                                    ui.label("Max rank");
-                                    ui.add(
-                                        egui::DragValue::new(&mut job.max_rank)
-                                            .range(1..=500)
-                                            .speed(1.0),
-                                    );
-                                    if ui.button("Remove").clicked() {
-                                        remove_idx = Some(idx);
-                                    }
-                                });
-                                ui.small(format!(
-                                    "{} | rows={} | inferred query key={}",
-                                    job.table.source_label,
-                                    job.table.rows.len(),
-                                    job.table
-                                        .inferred_query_key
-                                        .map(SearchQueryKey::label)
-                                        .unwrap_or("unknown")
-                                ));
-                            });
-                        }
-                        if let Some(idx) = remove_idx {
-                            self.loaded_search_export_jobs.remove(idx);
-                        }
-                    }
-
-                    if let Some(active) = &self.active_merged_search_export {
-                        ui.separator();
+                if let Some(network) = &self.network {
+                    ui.label(format!(
+                        "{} nodes · {} edges · {} ranked hits",
+                        network.nodes.len(),
+                        network.edges.len(),
+                        self.search_results
+                            .as_ref()
+                            .map_or(0, |results| results.hits.len())
+                    ));
+                    ui.small(format!(
+                        "Query spectra: {} · library spectra: {}",
+                        self.spectra.len(),
+                        self.library_spectra.len()
+                    ));
+                    ui.small(format!(
+                        "Node mapping: {}",
+                        self.node_attr_match_field.ui_label()
+                    ));
+                    if let Some(table) = &self.node_attributes {
                         ui.small(format!(
-                            "Active merged table: {} rows across {} | source={} | query key={}",
-                            active.row_count,
-                            active.library_aliases.join(", "),
-                            active.source_label,
-                            active
-                                .inferred_query_key
-                                .map(SearchQueryKey::label)
-                                .unwrap_or("unknown")
+                            "Embedded search attributes: {} rows · {} columns",
+                            table.table.rows.len(),
+                            table.table.columns.len()
                         ));
                     }
-                });
-            }
-
-            #[cfg(target_arch = "wasm32")]
-            {
-                ui.small("TSV attribute loading is currently native-only.");
-            }
-
-            Self::draw_attribute_table_setup(
-                ui,
-                "Node attributes",
-                &mut self.node_attributes,
-                true,
-                &mut self.node_attr_match_field,
-            );
-            Self::draw_attribute_table_setup(
-                ui,
-                "Edge attributes",
-                &mut self.edge_attributes,
-                false,
-                &mut self.node_attr_match_field,
-            );
-
-            ui.separator();
-            self.draw_lotus_metadata_panel(ui);
-
-            ui.group(|ui| {
-                ui.label("Structure depiction");
-                egui::ComboBox::from_label("Structure view mode")
-                    .selected_text(self.structure_panel_mode.label())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.structure_panel_mode,
-                            StructurePanelMode::SelectedNode,
-                            StructurePanelMode::SelectedNode.label(),
-                        );
-                        ui.selectable_value(
-                            &mut self.structure_panel_mode,
-                            StructurePanelMode::SelectedSet,
-                            StructurePanelMode::SelectedSet.label(),
-                        );
-                    });
-                if let Some(table) = &self.node_attributes {
-                    let selected_text = self
-                        .depict_smiles_column
-                        .and_then(|idx| table.table.columns.get(idx))
-                        .cloned()
-                        .unwrap_or_else(|| "<none>".to_string());
-                    egui::ComboBox::from_label("SMILES column")
-                        .selected_text(selected_text)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.depict_smiles_column, None, "<none>");
-                            for (idx, col) in table.table.columns.iter().enumerate() {
-                                ui.selectable_value(&mut self.depict_smiles_column, Some(idx), col);
-                            }
-                        });
-                    self.structure_caption_columns
-                        .retain(|idx| *idx < table.table.columns.len());
-                    ui.separator();
-                    ui.label("Text columns shown under each depicted structure");
-                    egui::ScrollArea::vertical()
-                        .id_salt("structure_caption_columns_scroll")
-                        .max_height(140.0)
-                        .show(ui, |ui| {
-                            for (idx, col) in table.table.columns.iter().enumerate() {
-                                if Some(idx) == self.depict_smiles_column {
-                                    continue;
-                                }
-                                ui.push_id(idx, |ui| {
-                                    let mut selected =
-                                        self.structure_caption_columns.contains(&idx);
-                                    if ui.checkbox(&mut selected, col).changed() {
-                                        if selected {
-                                            if !self.structure_caption_columns.contains(&idx) {
-                                                self.structure_caption_columns.push(idx);
-                                            }
-                                        } else {
-                                            self.structure_caption_columns
-                                                .retain(|existing| *existing != idx);
-                                        }
-                                    }
-                                });
-                            }
-                        });
-                    self.structure_caption_columns.sort_unstable();
-                    ui.small(
-                        "Selected SMILES values are rendered in the right panel via api.naturalproducts.net.",
-                    );
-                } else {
-                    ui.small("Load a node attributes TSV to choose a SMILES column.");
-                }
-                ui.small(
-                    "Modes are exclusive: either depict one selected node or depict structures from rectangle-selected nodes.",
-                );
-            });
-
-            ui.separator();
-            ui.checkbox(
-                &mut self.show_node_attributes_panel,
-                "Show node attributes table panel",
-            );
-            egui::ComboBox::from_label("Table docking")
-                .selected_text(self.node_attr_panel_dock.label())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.node_attr_panel_dock,
-                        NodeAttrPanelDock::Bottom,
-                        NodeAttrPanelDock::Bottom.label(),
-                    );
-                    ui.selectable_value(
-                        &mut self.node_attr_panel_dock,
-                        NodeAttrPanelDock::Right,
-                        NodeAttrPanelDock::Right.label(),
-                    );
-                    ui.selectable_value(
-                        &mut self.node_attr_panel_dock,
-                        NodeAttrPanelDock::Detached,
-                        NodeAttrPanelDock::Detached.label(),
-                    );
-                });
-            match self.node_attr_panel_dock {
-                NodeAttrPanelDock::Bottom => {
-                    ui.horizontal(|ui| {
-                        ui.label("Bottom panel height");
-                        ui.add(
-                            egui::DragValue::new(&mut self.node_attr_bottom_height)
-                                .range(140.0..=1200.0)
-                                .speed(1.0),
-                        );
-                    });
-                }
-                NodeAttrPanelDock::Right => {
-                    ui.horizontal(|ui| {
-                        ui.label("Right panel width");
-                        ui.add(
-                            egui::DragValue::new(&mut self.node_attr_right_width)
-                                .range(220.0..=1800.0)
-                                .speed(1.0),
-                        );
-                    });
-                }
-                NodeAttrPanelDock::Detached => {}
-            }
-        });
-
-        let style_preview = self.network.as_ref().and_then(|network| {
-            let visible = self.effective_visible_node_set(
-                network,
-                self.component_selection,
-                self.hide_singletons,
-            );
-            self.node_attribute_coloring(network, &visible)
-        });
-
-        ui.separator();
-        ui.collapsing("Style", |ui| {
-            ui.checkbox(
-                &mut self.color_nodes_by_attribute,
-                "Color nodes from node attribute column",
-            );
-            if self.color_nodes_by_attribute {
-                if let Some(table) = &self.node_attributes {
-                    if table.table.columns.is_empty() {
-                        ui.small("Loaded node table has no columns.");
-                    } else {
-                        if self.node_color_attr_column >= table.table.columns.len() {
-                            self.node_color_attr_column = 0;
-                        }
-                        let selected_column = table
-                            .table
-                            .columns
-                            .get(self.node_color_attr_column)
-                            .cloned()
-                            .unwrap_or_else(|| "<invalid>".to_string());
-                        egui::ComboBox::from_label("Color column")
-                            .selected_text(selected_column)
-                            .show_ui(ui, |ui| {
-                                for (idx, col_name) in table.table.columns.iter().enumerate() {
-                                    ui.selectable_value(&mut self.node_color_attr_column, idx, col_name);
-                                }
-                            });
-                        ui.small(
-                            "Categorical values use a qualitative palette; numeric values use a divergent gradient.",
-                        );
-
-                        if let Some(preview) = style_preview.as_ref() {
-                            match &preview.mode {
-                                NodeColorMode::Categorical { legend } => {
-                                    ui.checkbox(
-                                        &mut self.show_categorical_legend,
-                                        "Show categorical legend",
-                                    );
-                                    if self.show_categorical_legend {
-                                        if legend.is_empty() {
-                                            ui.small("No category values found in visible nodes.");
-                                        } else {
-                                            ui.separator();
-                                            ui.small("Legend");
-                                            egui::ScrollArea::vertical()
-                                                .id_salt("categorical_legend_scroll")
-                                                .max_height(180.0)
-                                                .show(ui, |ui| {
-                                                    for (idx, (category, color)) in
-                                                        legend.iter().enumerate()
-                                                    {
-                                                        ui.push_id(idx, |ui| {
-                                                            ui.horizontal(|ui| {
-                                                                ui.colored_label(*color, "■");
-                                                                ui.label(category);
-                                                            });
-                                                        });
-                                                    }
-                                                });
-                                        }
-                                    }
-                                }
-                                NodeColorMode::Continuous => {
-                                    ui.small("Selected column is numeric; continuous palette applied.");
-                                }
-                            }
-                        }
+                    if let Some(lotus) = &self.lotus_metadata {
+                        ui.small(format!("LOTUS: {}", lotus.source_label));
                     }
-                } else {
-                    ui.small("Load a node attributes TSV to enable attribute-based colors.");
-                }
-            }
-        });
-
-        ui.separator();
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.is_computing() && !self.show_build_setup,
-                    egui::Button::new("⚙ Build network"),
-                )
-                .clicked()
-            {
-                self.show_build_setup = true;
-                self.pending_metric = self.selected_metric;
-                self.pending_top_k = self.top_k;
-                self.pending_top_n_peaks_per_spectrum = self.build_top_n_peaks_per_spectrum;
-                self.pending_hide_singletons = self.hide_singletons;
-            }
-            if self.show_build_setup {
-                ui.small("Build setup open");
-            }
-            if self.is_computing() && ui.button("✖ Cancel").clicked() {
-                self.cancel_compute();
-            }
-        });
-
-        if self.show_build_setup {
-            ui.group(|ui| {
-                egui::ComboBox::from_label("Metric")
-                    .selected_text(self.pending_metric.label())
-                    .show_ui(ui, |ui| {
-                        for metric in SimilarityMetric::ALL {
-                            ui.selectable_value(&mut self.pending_metric, metric, metric.label());
-                        }
-                    });
-                ui.add(
-                    egui::DragValue::new(&mut self.pending_top_k)
-                        .range(1..=500)
-                        .prefix("top-k "),
-                );
-                ui.horizontal(|ui| {
-                    ui.label("Top peaks / spectrum");
-                    ui.add(
-                        egui::DragValue::new(&mut self.pending_top_n_peaks_per_spectrum)
-                            .range(0..=10_000)
-                            .speed(1.0),
-                    );
-                    ui.small("0 = all peaks");
-                });
-                ui.checkbox(&mut self.pending_hide_singletons, "Hide singleton nodes");
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(!self.is_computing(), egui::Button::new("▶ Run build"))
-                        .clicked()
-                    {
-                        self.run_build_network();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.lotus_load.is_some() {
+                        ui.small("LOTUS metadata loading in background…");
                     }
-                    if ui.button("Close setup").clicked() {
-                        self.show_build_setup = false;
-                    }
-                });
-            });
-        } else {
-            ui.small(format!(
-                "Active build config: metric={} | top-k={} | top-peaks={} | hide singletons={}",
-                self.selected_metric.label(),
-                self.top_k,
-                if self.build_top_n_peaks_per_spectrum == 0 {
-                    "all".to_string()
-                } else {
-                    self.build_top_n_peaks_per_spectrum.to_string()
-                },
-                self.hide_singletons
-            ));
-            #[cfg(not(target_arch = "wasm32"))]
-            ui.small("Threshold, top-k, and top-peaks are applied by spectral-matcher when you run the next build.");
-        }
-
-        ui.collapsing("Similarity Params (required)", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("tolerance");
-                ui.text_edit_singleline(&mut self.tolerance_input);
-            });
-            ui.horizontal(|ui| {
-                ui.label("mz_power");
-                ui.text_edit_singleline(&mut self.mz_power_input);
-            });
-            ui.horizontal(|ui| {
-                ui.label("intensity_power");
-                ui.text_edit_singleline(&mut self.intensity_power_input);
-            });
-        });
-
-        if self.is_computing()
-            && let Some((frac, text)) = self.active_progress()
-        {
-            ui.add(egui::ProgressBar::new(frac).text(text));
-        }
-
-        ui.separator();
-        ui.label("Network Controls");
-        let mut layout_changed = false;
-        ui.small(format!(
-            "Loaded matcher build: threshold={:.3} | top-k={} | similarity={}",
-            self.threshold,
-            self.top_k,
-            self.selected_metric.label()
-        ));
-        layout_changed |= ui
-            .add(egui::Slider::new(&mut self.node_force, 0.1..=5.0).text("Node force"))
-            .changed();
-        layout_changed |= ui
-            .add(egui::Slider::new(&mut self.edge_force, 0.1..=5.0).text("Edge force"))
-            .changed();
-
-        if layout_changed {
-            let _ = self.relayout_visible(50);
-        }
-
-        ui.horizontal(|ui| {
-            let run_label = if self.layout_running {
-                "Pause layout"
-            } else {
-                "Run layout"
-            };
-            if ui.button(run_label).clicked() {
-                self.layout_running = !self.layout_running;
-                self.layout_low_motion_streak = 0;
-                if self.layout_running {
-                    ctx.request_repaint();
                 }
-            }
-            if ui.button("Stabilize").clicked() {
-                let _ = self.relayout_visible(self.stabilize_iterations);
-                self.layout_running = false;
-                self.layout_low_motion_streak = 0;
-            }
-            ui.add(
-                egui::DragValue::new(&mut self.stabilize_iterations)
-                    .range(10..=800)
-                    .prefix("iters "),
-            );
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Fit full network").clicked() {
-                self.layout_running = false;
-                self.component_selection = ComponentSelection::All;
-                self.request_fit_view = true;
-            }
-        });
-        ui.small(format!(
-            "Layout: {} | mean displacement: {:.5}",
-            if self.layout_running {
-                "running"
-            } else {
-                "paused"
-            },
-            self.layout_mean_displacement
-        ));
-
-        if self.layout_running {
-            ctx.request_repaint();
+            });
+        if let Some(err) = &self.error_message {
+            ui.colored_label(egui::Color32::from_rgb(190, 50, 50), err);
+        }
+        if let Some(status) = &self.status_message {
+            ui.small(status);
         }
         if let Some(network) = &self.network {
-            let visible_now = self.effective_visible_node_set(
-                network,
-                self.component_selection,
-                self.hide_singletons,
-            );
-            ui.small(format!(
-                "Active threshold: {:.3} | active edges: {}",
-                self.threshold,
-                network
-                    .edges
-                    .iter()
-                    .filter(|e| visible_now.contains(&e.source) && visible_now.contains(&e.target))
-                    .count()
-            ));
-        }
-
-        if let Some(network) = &self.network {
+            ui.separator();
+            ui.checkbox(&mut self.hide_singletons, "Hide singletons");
             let mut selection = self.component_selection;
-            egui::ComboBox::from_label("Component scope")
+            egui::ComboBox::from_label("Component")
                 .selected_text(selection_label(network, selection))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut selection, ComponentSelection::All, "Full network");
@@ -4702,115 +3343,150 @@ impl SpectralApp {
                         );
                     }
                 });
-
             if selection != self.component_selection {
                 self.component_selection = selection;
-                let visible = self.effective_visible_node_set(
-                    network,
-                    self.component_selection,
-                    self.hide_singletons,
-                );
-                self.clamp_selection_to_visible_set(&visible);
-                self.layout_running = false;
                 self.request_fit_view = true;
             }
-        }
-
-        ui.separator();
-        ui.collapsing("Export", |ui| {
-            let can_export = self.network.is_some();
-            if ui
-                .add_enabled(can_export, egui::Button::new("Export nodes/edges CSV"))
-                .clicked()
-                && let Some(network) = &self.network
-            {
-                let (nodes_csv, edges_csv) = export_csv_strings(network, self.component_selection);
-
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        match crate::export::save_csvs_to_directory(&dir, &nodes_csv, &edges_csv) {
-                            Ok(()) => {
-                                self.status_message = Some(format!(
-                                    "Exported nodes.csv and edges.csv into {}",
-                                    dir.display()
-                                ));
-                            }
-                            Err(err) => {
-                                self.error_message = Some(err);
-                            }
-                        }
-                    }
-                }
-
-                #[cfg(target_arch = "wasm32")]
-                {
-                    if let Err(err) = crate::export::download_csv_files(&nodes_csv, &edges_csv) {
-                        self.error_message = Some(err);
-                    } else {
-                        self.status_message = Some("Triggered CSV download".to_string());
-                    }
-                }
-            }
-        });
-
-        #[cfg(not(target_arch = "wasm32"))]
-        ui.collapsing("Matcher Log", |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Clear").clicked() {
-                    self.matcher_log.clear();
+                if ui.button("Fit graph").clicked() {
+                    self.request_fit_view = true;
                 }
-                if ui.button("Copy").clicked() {
-                    let text = self.matcher_log.snapshot().join("\n");
-                    ui.ctx().copy_text(text);
-                    self.status_message = Some("Copied matcher log to clipboard".to_string());
+                if ui.button("Stabilize layout").clicked() {
+                    self.relayout_visible(self.stabilize_iterations);
                 }
             });
-
-            let entries = self.matcher_log.snapshot();
-            if entries.is_empty() {
-                ui.small("No matcher log entries yet.");
-                return;
+            if ui
+                .button(if self.layout_running {
+                    "Pause layout"
+                } else {
+                    "Run layout"
+                })
+                .clicked()
+            {
+                self.layout_running = !self.layout_running;
+                ctx.request_repaint();
             }
-
-            ui.small(format!("Showing last {} matcher events.", entries.len()));
-            egui::ScrollArea::vertical()
-                .id_salt("matcher_log_scroll")
-                .max_height(220.0)
+            ui.checkbox(
+                &mut self.show_node_attributes_panel,
+                "Show attributes table",
+            );
+            egui::CollapsingHeader::new("Style")
+                .default_open(true)
                 .show(ui, |ui| {
-                    for (idx, entry) in entries.iter().enumerate() {
-                        ui.push_id(("matcher_log", idx), |ui| {
-                            ui.monospace(entry);
-                        });
+                    ui.checkbox(&mut self.color_nodes_by_attribute, "Color by attribute");
+                    if let Some(table) = &self.node_attributes {
+                        if self.color_nodes_by_attribute {
+                            egui::ComboBox::from_label("Color column")
+                                .selected_text(
+                                    table
+                                        .table
+                                        .columns
+                                        .get(self.node_color_attr_column)
+                                        .map(String::as_str)
+                                        .unwrap_or("<none>"),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (idx, column) in table.table.columns.iter().enumerate() {
+                                        ui.selectable_value(&mut self.node_color_attr_column, idx, column);
+                                    }
+                                });
+                        }
+                        egui::ComboBox::from_label("Node size column")
+                            .selected_text(
+                                self.node_size_attr_column
+                                    .and_then(|idx| table.table.columns.get(idx))
+                                    .map_or("Degree (default)", String::as_str),
+                            )
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.node_size_attr_column,
+                                    None,
+                                    "Degree (default)",
+                                );
+                                for (idx, column) in table.table.columns.iter().enumerate() {
+                                    ui.selectable_value(
+                                        &mut self.node_size_attr_column,
+                                        Some(idx),
+                                        column,
+                                    );
+                                }
+                            });
+                        if self.node_size_attr_column.is_some() {
+                            ui.horizontal(|ui| {
+                                ui.label("Min radius");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.node_size_min_radius)
+                                        .range(1.0..=self.node_size_max_radius)
+                                        .suffix(" px"),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Max radius");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.node_size_max_radius)
+                                        .range(self.node_size_min_radius..=80.0)
+                                        .suffix(" px"),
+                                );
+                            });
+                            ui.add(
+                                egui::Slider::new(&mut self.node_size_pivot, 0.01..=0.99)
+                                    .text("Intensity pivot"),
+                            )
+                            .on_hover_text("Fraction of the observed value range mapped to the midpoint radius; 0.5 is linear.");
+                            ui.small("Choose a numeric height or area column. Missing values keep the default node size.");
+                        }
+                    }
+                    if !self.pie_axes.is_empty() {
+                        egui::ComboBox::from_label("Pie grouping")
+                            .selected_text(
+                                self.pie_axis
+                                    .and_then(|axis| self.pie_axes.get(axis))
+                                    .map_or("Off", |axis| axis.name.as_str()),
+                            )
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.pie_axis, None, "Off");
+                                for (index, axis) in self.pie_axes.iter().enumerate() {
+                                    ui.selectable_value(&mut self.pie_axis, Some(index), &axis.name);
+                                }
+                            });
+                        if let Some(axis_index) = self.pie_axis {
+                            egui::ComboBox::from_label("Pie palette")
+                                .selected_text(self.pie_palettes[axis_index].label())
+                                .show_ui(ui, |ui| {
+                                    for palette in [
+                                        PiePalette::Contrasting,
+                                        PiePalette::Sequential,
+                                        PiePalette::Diverging,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.pie_palettes[axis_index],
+                                            palette,
+                                            palette.label(),
+                                        );
+                                    }
+                                });
+                        }
+                        if let Some(axis_index) = self.pie_axis {
+                            let axis = &self.pie_axes[axis_index];
+                            let palette = self.pie_palettes[axis_index];
+                            ui.horizontal_wrapped(|ui| {
+                                for (index, category) in axis.categories.iter().enumerate() {
+                                    ui.label(
+                                        egui::RichText::new(format!("● {category}"))
+                                            .color(palette.color(index, axis.categories.len())),
+                                    );
+                                }
+                            });
+                        }
                     }
                 });
-        });
-
-        if let Some(status) = &self.status_message {
-            ui.separator();
-            ui.label(status);
-        }
-
-        if self.is_computing()
-            && let Some((frac, text)) = self.active_progress()
-        {
-            ui.add(
-                egui::ProgressBar::new(frac)
-                    .desired_width(ui.available_width())
-                    .text(text),
-            );
-        }
-
-        if let Some(err) = &self.error_message {
-            ui.separator();
-            ui.colored_label(egui::Color32::from_rgb(190, 50, 50), err);
         }
     }
 
     fn draw_canvas(&mut self, ui: &mut egui::Ui) {
         if self.network.is_none() {
             ui.centered_and_justified(|ui| {
-                ui.label("Load spectra and run a matcher build, or load a matcher network JSON.");
+                ui.label("Open a matcher result directory using Input.");
             });
             return;
         }
@@ -4851,30 +3527,42 @@ impl SpectralApp {
             self.fit_view_to_visible_nodes(canvas_size, &visible);
             self.request_fit_view = false;
         }
-        if let Some(node_id) = self.pending_center_node_id.take()
-            && visible_set.contains(&node_id)
-        {
-            let component_members = self.network.as_ref().and_then(|net| {
-                let component_id = net
-                    .nodes
-                    .iter()
-                    .find(|n| n.id == node_id)
-                    .map(|n| n.component_id)?;
-                net.components.get(component_id).cloned()
-            });
-            let focused = if let Some(component_members) = component_members {
-                self.focus_view_on_node_set(canvas_size, &component_members, node_id)
+        if let Some(node_id) = self.pending_center_node_id.take() {
+            if visible_set.contains(&node_id) {
+                let component_members = self.network.as_ref().and_then(|net| {
+                    let component_id = net
+                        .nodes
+                        .iter()
+                        .find(|n| n.id == node_id)
+                        .map(|n| n.component_id)?;
+                    net.components.get(component_id).cloned()
+                });
+                let focused = if let Some(component_members) = component_members {
+                    self.focus_view_on_node_set(canvas_size, &component_members, node_id)
+                } else {
+                    self.center_view_on_node(canvas_size, node_id)
+                };
+                if focused {
+                    if self.pending_center_node_zoom {
+                        self.view_state.zoom = self.view_state.zoom.max(2.0);
+                        self.center_view_on_node(canvas_size, node_id);
+                    }
+                    self.pending_center_node_zoom = false;
+                } else {
+                    self.pending_center_node_id = Some(node_id);
+                }
             } else {
-                self.center_view_on_node(canvas_size, node_id)
-            };
-            if !focused {
-                self.pending_center_node_id = Some(node_id);
+                self.pending_center_node_zoom = false;
             }
         }
 
         let node_coloring = {
             let network = self.network.as_ref().expect("network presence checked");
             self.node_attribute_coloring(network, &visible_set)
+        };
+        let node_radii = {
+            let network = self.network.as_ref().expect("network presence checked");
+            self.node_attribute_sizing(network, &visible_set)
         };
         let selected_ring_ids = {
             let mut ids = Vec::with_capacity(2);
@@ -4895,7 +3583,16 @@ impl SpectralApp {
                 network,
                 &self.positions,
                 &visible_set,
-                node_coloring.as_ref().map(|coloring| &coloring.fills),
+                node_coloring.as_ref(),
+                node_radii.as_ref(),
+                self.pie_axis.map(|axis| {
+                    (
+                        &self.pie_values,
+                        axis,
+                        self.pie_palettes[axis],
+                        self.pie_axes[axis].categories.len(),
+                    )
+                }),
                 &mut self.view_state,
                 selected_ring_ids.as_slice(),
             )
@@ -5039,6 +3736,73 @@ impl SpectralApp {
         }
     }
 
+    fn draw_ranked_hits(&self, ui: &mut egui::Ui, node_id: usize) {
+        let Some(results) = &self.search_results else {
+            return;
+        };
+        let indices = self
+            .hits_by_node
+            .get(&node_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        ui.small(format!("{} hits for selected node", indices.len()));
+        for &index in indices {
+            let hit = &results.hits[index];
+            let Some(library) = self.library_spectra.get(hit.library_index) else {
+                continue;
+            };
+            let headers = &library.meta.headers;
+            let field = |names: &[&str]| -> Option<&str> {
+                names
+                    .iter()
+                    .find_map(|name| {
+                        headers
+                            .iter()
+                            .find(|(key, _)| {
+                                normalized_column_name(key) == normalized_column_name(name)
+                            })
+                            .map(|(_, value)| value.as_str())
+                    })
+                    .filter(|value| !value.trim().is_empty())
+            };
+            let compound = field(&["NAME", "COMPOUND_NAME", "nameTraditional", "COMPOUND"])
+                .unwrap_or(&library.meta.raw_name);
+            let smiles = field(&["SMILES", "CANONICAL_SMILES", "ISOMERIC_SMILES"]);
+            ui.collapsing(format!("#{} · {:.4} · {}", hit.rank, hit.combined_score, compound), |ui| {
+                ui.monospace(format!("Rank: {} · spectral score: {:.4} · combined score: {:.4} · matched peaks: {} · MS1 deviation: {:.3} ppm",
+                    hit.rank, hit.spectral_score, hit.combined_score, hit.matches, hit.ms1_deviation_ppm));
+                ui.label(format!("Compound: {compound}"));
+                if let Some(smiles) = smiles {
+                    ui.label(format!("SMILES: {smiles}"));
+                }
+                if results.taxonomic_reranking_applied {
+                    ui.label(format!("Taxonomic score: {:.4}", hit.taxonomic_score));
+                }
+                if let Some(original_rank) = hit.rank_before_taxonomy {
+                    ui.label(format!("Spectral rank before taxonomy: {original_rank}"));
+                }
+                if let Some(organism) = &hit.matched_organism_name {
+                    ui.label(format!("Matched organism: {organism}"));
+                }
+                if let Some(rank) = &hit.matched_shared_rank {
+                    ui.label(format!("Shared taxonomy rank: {rank}"));
+                }
+                if let Some(key) = &hit.matched_short_inchikey {
+                    ui.label(format!("InChIKey: {key}"));
+                }
+                if let Some(qid) = &hit.matched_organism_wikidata {
+                    ui.hyperlink_to(format!("Organism: {qid}"), wikidata_entity_url(qid));
+                }
+                ui.collapsing("Library metadata", |ui| {
+                    ui.label(format!("Library spectrum: {} · precursor m/z {:.6}", library.meta.label, library.meta.precursor_mz));
+                    for (key, value) in headers {
+                        ui.label(format!("{key}: {value}"));
+                    }
+                });
+            });
+        }
+    }
+
     fn draw_selected_node_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Node Properties");
         ui.separator();
@@ -5055,131 +3819,265 @@ impl SpectralApp {
             let bottom = self.visible_node_by_id(network, bottom_id)?;
             Some((top, bottom))
         });
-        if let Some(node) = selected_node.as_ref() {
-            ui.monospace(format!("Node index: {}", node.id));
-            ui.horizontal(|ui| {
-                ui.monospace("Feature ID:");
-                if let Some(feature_id) = node.feature_id.as_deref() {
-                    if ui.link(feature_id).clicked() {
-                        self.pending_center_node_id = Some(node.id);
-                    }
-                } else {
-                    ui.monospace("n/a");
+        egui::CollapsingHeader::new("Top-ranked structure")
+            .default_open(true)
+            .show(ui, |ui| {
+                if self.node_attributes.is_none() {
+                    ui.small("No node attributes table loaded.");
+                    return;
                 }
-            });
-            ui.monospace(format!("Display label: {}", node.label));
-            ui.monospace(format!("Raw name: {}", node.raw_name));
-            ui.monospace(format!(
-                "Parent mass (precursor m/z): {:.6}",
-                node.precursor_mz
-            ));
-            ui.monospace(format!("Peak count: {}", node.num_peaks));
-            ui.monospace(format!("Degree: {}", node.degree));
-            ui.monospace(format!("Component: {}", node.component_id));
-            ui.monospace(format!("Scans: {}", node.scans.as_deref().unwrap_or("n/a")));
-            ui.monospace(format!(
-                "Filename: {}",
-                node.filename.as_deref().unwrap_or("n/a")
-            ));
-            ui.monospace(format!(
-                "Source scan USI: {}",
-                node.source_scan_usi.as_deref().unwrap_or("n/a")
-            ));
-            ui.monospace(format!(
-                "Featurelist feature ID: {}",
-                node.featurelist_feature_id.as_deref().unwrap_or("n/a")
-            ));
+                let Some(smiles_col_idx) = self.depict_smiles_column else {
+                    ui.small("No SMILES annotation in the embedded search attributes.");
+                    return;
+                };
+                let Some(col_name) = self
+                    .node_attributes
+                    .as_ref()
+                    .and_then(|table| table.table.columns.get(smiles_col_idx))
+                    .cloned()
+                else {
+                    ui.small("Selected SMILES column is out of range.");
+                    return;
+                };
 
-            ui.separator();
-            ui.label("Spectrum");
-            if let Some((top_node, bottom_node)) = mirror_nodes {
-                let similarity_score = self.similarity_for_pair(top_node.id, bottom_node.id);
-                if let Some(score) = similarity_score {
-                    ui.small(format!(
-                        "{} similarity: {:.2}",
-                        self.selected_metric.label(),
-                        score
-                    ));
-                } else {
-                    ui.small(format!("{} similarity: n/a", self.selected_metric.label()));
-                }
-                ui.small(format!(
-                    "Mirror comparison: node {} vs node {}",
-                    top_node.id, bottom_node.id
-                ));
-                let top_peaks = self.spectrum_peaks_for_node(top_node.id);
-                let bottom_peaks = self.spectrum_peaks_for_node(bottom_node.id);
-                if let (Some(top_peaks), Some(bottom_peaks)) = (top_peaks, bottom_peaks) {
-                    let top_label = format!("{} [{}]", top_node.label, top_node.id);
-                    let bottom_label = format!("{} [{}]", bottom_node.label, bottom_node.id);
-                    self.draw_mirror_spectrum_plot(
-                        ui,
-                        MirrorSpectrumData {
-                            top_node_id: top_node.id,
-                            top_label: &top_label,
-                            top_peaks: top_peaks.as_slice(),
-                            bottom_node_id: bottom_node.id,
-                            bottom_label: &bottom_label,
-                            bottom_peaks: bottom_peaks.as_slice(),
-                        },
-                    );
-                } else {
-                    ui.small("No spectrum data found for one of the selected nodes.");
-                }
-            } else {
-                ui.small(format!("{} similarity: n/a", self.selected_metric.label()));
-                if let Some(peaks) = self.spectrum_peaks_for_node(node.id) {
-                    self.draw_spectrum_plot(ui, node.id, peaks.as_slice());
-                } else {
-                    ui.small("No spectrum data found for this node.");
-                }
-                let microbemasst_url = self.microbemasst_url_for_node(node.id);
-                let fasstsearch_url = self.fasstsearch_url_for_node(node.id);
-                if microbemasst_url.is_some() || fasstsearch_url.is_some() {
-                    ui.horizontal_wrapped(|ui| {
-                        if let Some(url) = microbemasst_url {
-                            ui.hyperlink_to("Search microbeMASST", url);
-                        }
-                        if let Some(url) = fasstsearch_url {
-                            ui.hyperlink_to("Search fastsearch", url);
-                        }
-                    });
-                }
-                ui.checkbox(&mut self.show_single_spectrum_mgf, "Toggle MGF");
-                if self.show_single_spectrum_mgf {
-                    if let Some((default_filename, mgf_text)) = self.mgf_payload_for_node(node) {
-                        ui.horizontal(|ui| {
-                            if ui.button("⎘ Copy MGF").clicked() {
-                                ui.ctx().copy_text(mgf_text.clone());
-                                self.status_message = Some("Copied MGF to clipboard".to_string());
-                                self.error_message = None;
+                ui.horizontal(|ui| {
+                    ui.label("Mode:");
+                    egui::ComboBox::from_id_salt("structure_mode_right_panel")
+                        .selected_text(self.structure_panel_mode.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.structure_panel_mode,
+                                StructurePanelMode::SelectedNode,
+                                StructurePanelMode::SelectedNode.label(),
+                            );
+                            ui.selectable_value(
+                                &mut self.structure_panel_mode,
+                                StructurePanelMode::SelectedSet,
+                                StructurePanelMode::SelectedSet.label(),
+                            );
+                        });
+                });
+
+                match self.structure_panel_mode {
+                    StructurePanelMode::SelectedNode => {
+                        self.show_selection_structures_detached = false;
+                        let Some(node) = selected_node.as_ref() else {
+                            ui.small("Select a visible node to depict its structure.");
+                            return;
+                        };
+                        let Some(entry) = self.selected_structure_entry_for_node(node) else {
+                            ui.small(format!(
+                                "No SMILES found for this node using column '{col_name}'."
+                            ));
+                            return;
+                        };
+
+                        ui.small(format!("SMILES column: {col_name}"));
+                        ui.small(format!("SMILES: {}", entry.smiles));
+                        let img_width = ui.available_width().clamp(180.0, 480.0);
+                        let img_height = (img_width * 0.7).clamp(120.0, 360.0);
+                        let depict_key = depict_cache_key(&entry.smiles);
+                        self.ensure_depiction_request(
+                            depict_key.clone(),
+                            depict_fetch_uri(&entry.smiles),
+                        );
+                        self.draw_depiction_widget(
+                            ui,
+                            &depict_key,
+                            egui::vec2(img_width, img_height),
+                        );
+                        if entry.annotations.is_empty() {
+                            ui.small("No additional structure metadata selected.");
+                        } else {
+                            for (column, value) in &entry.annotations {
+                                ui.add(egui::Label::new(format!("{column}: {value}")).wrap());
                             }
-                            if ui.button("⇩ Save .mgf").clicked() {
-                                self.save_mgf_content(&default_filename, &mgf_text);
+                        }
+                        if self.selection_structures_show_lotus_metadata {
+                            if let Some(summary) = self.lotus_occurrence_summary_for_entry(&entry) {
+                                render_lotus_occurrence_summary(ui, &summary);
+                            } else {
+                                ui.small("No LOTUS occurrence metadata found for this structure.");
+                            }
+                        } else if entry.taxonomic_reranked {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.small("Taxonomic links:");
+                                if let Some(link) = &entry.taxonomic_links.compound {
+                                    ui.small("compound");
+                                    ui.hyperlink_to(&link.label, &link.url);
+                                }
+                                if let Some(link) = &entry.taxonomic_links.organism {
+                                    ui.small("organism");
+                                    ui.hyperlink_to(&link.label, &link.url);
+                                }
+                            });
+                            if let Some(rank) = entry.taxonomic_shared_rank {
+                                ui.small(format!(
+                                    "Taxonomic reranking matched at {} level.",
+                                    rank.label()
+                                ));
+                            }
+                        }
+                        ui.hyperlink_to(
+                            "Open structure in browser",
+                            naturalproducts_depict_uri(
+                                &entry.smiles,
+                                img_width as u32,
+                                img_height as u32,
+                            ),
+                        );
+                    }
+                    StructurePanelMode::SelectedSet => {
+                        ui.horizontal(|ui| {
+                            ui.small(format!("SMILES column: {col_name}"));
+                            if ui.button("Open in window").clicked() {
+                                self.show_selection_structures_detached = true;
                             }
                         });
-                        ui.small(format!("Default filename: {default_filename}"));
-                        let mgf_box_max_height =
-                            (ui.ctx().screen_rect().height() * 0.35).clamp(140.0, 460.0);
-                        egui::ScrollArea::vertical()
-                            .id_salt(format!("single_node_mgf_scroll_{}", node.id))
-                            .max_height(mgf_box_max_height)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                let mut mgf_display = mgf_text;
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut mgf_display)
-                                        .desired_rows(1)
-                                        .font(egui::TextStyle::Monospace)
-                                        .interactive(false)
-                                        .desired_width(f32::INFINITY),
-                                );
-                            });
-                    } else {
-                        ui.small("No spectrum record found to generate MGF block.");
+                        if let Some(filter_len) = self.table_node_filter.as_ref().map(HashSet::len)
+                        {
+                            ui.small(format!("Rectangle-selected nodes: {filter_len}"));
+                        }
+                        ui.add_space(4.0);
+                        self.draw_selected_structures_gallery(ui, "selected_node_panel");
                     }
                 }
-            }
+            });
+        ui.separator();
+        if let Some(node) = selected_node.as_ref() {
+            ui.collapsing("Node details", |ui| {
+                ui.monospace(format!("Node index: {}", node.id));
+                ui.horizontal(|ui| {
+                    ui.monospace("Feature ID:");
+                    if let Some(feature_id) = node.feature_id.as_deref() {
+                        if ui.link(feature_id).clicked() {
+                            self.pending_center_node_id = Some(node.id);
+                        }
+                    } else {
+                        ui.monospace("n/a");
+                    }
+                });
+                ui.monospace(format!("Display label: {}", node.label));
+                ui.monospace(format!("Raw name: {}", node.raw_name));
+                ui.monospace(format!(
+                    "Parent mass (precursor m/z): {:.6}",
+                    node.precursor_mz
+                ));
+                ui.monospace(format!("Peak count: {}", node.num_peaks));
+                ui.monospace(format!("Degree: {}", node.degree));
+                ui.monospace(format!("Component: {}", node.component_id));
+                ui.monospace(format!("Scans: {}", node.scans.as_deref().unwrap_or("n/a")));
+                ui.monospace(format!(
+                    "Filename: {}",
+                    node.filename.as_deref().unwrap_or("n/a")
+                ));
+                ui.monospace(format!(
+                    "Source scan USI: {}",
+                    node.source_scan_usi.as_deref().unwrap_or("n/a")
+                ));
+                ui.monospace(format!(
+                    "Featurelist feature ID: {}",
+                    node.featurelist_feature_id.as_deref().unwrap_or("n/a")
+                ));
+            });
+            ui.collapsing("Ranked library hits", |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(("ranked_hits", node.id))
+                    .max_height(280.0)
+                    .show(ui, |ui| self.draw_ranked_hits(ui, node.id));
+            });
+            ui.collapsing("Spectrum", |ui| {
+                if let Some((top_node, bottom_node)) = mirror_nodes {
+                    let similarity_score = self.similarity_for_pair(top_node.id, bottom_node.id);
+                    if let Some(score) = similarity_score {
+                        ui.small(format!(
+                            "{} similarity: {:.2}",
+                            self.selected_metric.label(),
+                            score
+                        ));
+                    } else {
+                        ui.small(format!("{} similarity: n/a", self.selected_metric.label()));
+                    }
+                    ui.small(format!(
+                        "Mirror comparison: node {} vs node {}",
+                        top_node.id, bottom_node.id
+                    ));
+                    let top_peaks = self.spectrum_peaks_for_node(top_node.id);
+                    let bottom_peaks = self.spectrum_peaks_for_node(bottom_node.id);
+                    if let (Some(top_peaks), Some(bottom_peaks)) = (top_peaks, bottom_peaks) {
+                        let top_label = format!("{} [{}]", top_node.label, top_node.id);
+                        let bottom_label = format!("{} [{}]", bottom_node.label, bottom_node.id);
+                        self.draw_mirror_spectrum_plot(
+                            ui,
+                            MirrorSpectrumData {
+                                top_node_id: top_node.id,
+                                top_label: &top_label,
+                                top_peaks: top_peaks.as_slice(),
+                                bottom_node_id: bottom_node.id,
+                                bottom_label: &bottom_label,
+                                bottom_peaks: bottom_peaks.as_slice(),
+                            },
+                        );
+                    } else {
+                        ui.small("No spectrum data found for one of the selected nodes.");
+                    }
+                } else {
+                    ui.small(format!("{} similarity: n/a", self.selected_metric.label()));
+                    if let Some(peaks) = self.spectrum_peaks_for_node(node.id) {
+                        self.draw_spectrum_plot(ui, node.id, peaks.as_slice());
+                    } else {
+                        ui.small("No spectrum data found for this node.");
+                    }
+                    let microbemasst_url = self.microbemasst_url_for_node(node.id);
+                    let fasstsearch_url = self.fasstsearch_url_for_node(node.id);
+                    if microbemasst_url.is_some() || fasstsearch_url.is_some() {
+                        ui.horizontal_wrapped(|ui| {
+                            if let Some(url) = microbemasst_url {
+                                ui.hyperlink_to("Search microbeMASST", url);
+                            }
+                            if let Some(url) = fasstsearch_url {
+                                ui.hyperlink_to("Search fastsearch", url);
+                            }
+                        });
+                    }
+                    ui.checkbox(&mut self.show_single_spectrum_mgf, "Toggle MGF");
+                    if self.show_single_spectrum_mgf {
+                        if let Some((default_filename, mgf_text)) = self.mgf_payload_for_node(node)
+                        {
+                            ui.horizontal(|ui| {
+                                if ui.button("⎘ Copy MGF").clicked() {
+                                    ui.ctx().copy_text(mgf_text.clone());
+                                    self.status_message =
+                                        Some("Copied MGF to clipboard".to_string());
+                                    self.error_message = None;
+                                }
+                                if ui.button("⇩ Save .mgf").clicked() {
+                                    self.save_mgf_content(&default_filename, &mgf_text);
+                                }
+                            });
+                            ui.small(format!("Default filename: {default_filename}"));
+                            let mgf_box_max_height =
+                                (ui.ctx().screen_rect().height() * 0.35).clamp(140.0, 460.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt(format!("single_node_mgf_scroll_{}", node.id))
+                                .max_height(mgf_box_max_height)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    let mut mgf_display = mgf_text;
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut mgf_display)
+                                            .desired_rows(1)
+                                            .font(egui::TextStyle::Monospace)
+                                            .interactive(false)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                });
+                        } else {
+                            ui.small("No spectrum record found to generate MGF block.");
+                        }
+                    }
+                }
+            });
         } else if self.selected_node_id.is_some() {
             self.clear_spectrum_view_state();
             ui.label("Selected node is not visible in current scope.");
@@ -5188,122 +4086,29 @@ impl SpectralApp {
             ui.label("Select a node in the graph.");
         }
 
-        self.draw_peak_filter_panel(ui);
-
-        ui.separator();
-        ui.label("Structure");
-        if self.node_attributes.is_none() {
-            ui.small("No node attributes table loaded.");
-            return;
-        }
-        let Some(smiles_col_idx) = self.depict_smiles_column else {
-            ui.small("Select a SMILES column in the left panel.");
-            return;
-        };
-        let Some(col_name) = self
-            .node_attributes
-            .as_ref()
-            .and_then(|table| table.table.columns.get(smiles_col_idx))
-            .cloned()
-        else {
-            ui.small("Selected SMILES column is out of range.");
-            return;
-        };
-
-        ui.horizontal(|ui| {
-            ui.label("Mode:");
-            egui::ComboBox::from_id_salt("structure_mode_right_panel")
-                .selected_text(self.structure_panel_mode.label())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.structure_panel_mode,
-                        StructurePanelMode::SelectedNode,
-                        StructurePanelMode::SelectedNode.label(),
-                    );
-                    ui.selectable_value(
-                        &mut self.structure_panel_mode,
-                        StructurePanelMode::SelectedSet,
-                        StructurePanelMode::SelectedSet.label(),
-                    );
-                });
-        });
-
-        match self.structure_panel_mode {
-            StructurePanelMode::SelectedNode => {
-                self.show_selection_structures_detached = false;
-                let Some(node) = selected_node.as_ref() else {
-                    ui.small("Select a visible node to depict its structure.");
-                    return;
-                };
-                let Some(entry) = self.selected_structure_entry_for_node(node) else {
-                    ui.small(format!(
-                        "No SMILES found for this node using column '{col_name}'."
-                    ));
-                    return;
-                };
-
-                ui.small(format!("SMILES column: {col_name}"));
-                ui.small(format!("SMILES: {}", entry.smiles));
-                let img_width = ui.available_width().clamp(180.0, 480.0);
-                let img_height = (img_width * 0.7).clamp(120.0, 360.0);
-                let depict_key = depict_cache_key(&entry.smiles);
-                self.ensure_depiction_request(depict_key.clone(), depict_fetch_uri(&entry.smiles));
-                self.draw_depiction_widget(ui, &depict_key, egui::vec2(img_width, img_height));
-                draw_structure_library_hits(ui, &entry.library_hits);
-                if entry.annotations.is_empty() {
-                    ui.small("No additional structure metadata selected.");
-                } else {
-                    for (column, value) in &entry.annotations {
-                        ui.add(egui::Label::new(format!("{column}: {value}")).wrap());
-                    }
-                }
-                if self.selection_structures_show_lotus_metadata {
-                    if let Some(summary) = self.lotus_occurrence_summary_for_entry(&entry) {
-                        render_lotus_occurrence_summary(ui, &summary);
-                    } else if self.lotus_metadata_loading() {
-                        ui.small("LOTUS metadata is loading in the background...");
-                    } else {
-                        ui.small("No LOTUS occurrence metadata found for this structure.");
-                    }
-                } else if entry.taxonomic_reranked {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.small("Taxonomic links:");
-                        if let Some(link) = &entry.taxonomic_links.compound {
-                            ui.small("compound");
-                            ui.hyperlink_to(&link.label, &link.url);
-                        }
-                        if let Some(link) = &entry.taxonomic_links.organism {
-                            ui.small("organism");
-                            ui.hyperlink_to(&link.label, &link.url);
-                        }
-                    });
-                    if let Some(rank) = entry.taxonomic_shared_rank {
-                        ui.small(format!(
-                            "Taxonomic reranking matched at {} level.",
-                            rank.label()
-                        ));
-                    }
-                }
-                ui.hyperlink_to(
-                    "Open structure in browser",
-                    naturalproducts_depict_uri(&entry.smiles, img_width as u32, img_height as u32),
-                );
-            }
-            StructurePanelMode::SelectedSet => {
-                ui.horizontal(|ui| {
-                    ui.small(format!("SMILES column: {col_name}"));
-                    if ui.button("Open in window").clicked() {
-                        self.show_selection_structures_detached = true;
-                    }
-                });
-                if let Some(filter_len) = self.table_node_filter.as_ref().map(HashSet::len) {
-                    ui.small(format!("Rectangle-selected nodes: {filter_len}"));
-                }
-                ui.add_space(4.0);
-                self.draw_selected_structures_gallery(ui, "selected_node_panel");
-            }
-        }
+        ui.collapsing("Peak Filter", |ui| self.draw_peak_filter_panel(ui));
     }
+}
+
+fn node_radius_for_value(
+    value: f64,
+    min_value: f64,
+    max_value: f64,
+    min_radius: f32,
+    max_radius: f32,
+    pivot: f32,
+) -> f32 {
+    if max_value <= min_value {
+        return (min_radius + max_radius) * 0.5;
+    }
+    let t = ((value - min_value) / (max_value - min_value)).clamp(0.0, 1.0) as f32;
+    let pivot = pivot.clamp(0.01, 0.99);
+    let curved = if t <= pivot {
+        0.5 * t / pivot
+    } else {
+        0.5 + 0.5 * (t - pivot) / (1.0 - pivot)
+    };
+    min_radius + (max_radius - min_radius) * curved
 }
 
 fn categorical_color(index: usize) -> egui::Color32 {
@@ -5535,19 +4340,6 @@ fn sanitize_filename_fragment(raw: &str) -> String {
     }
 }
 
-fn default_search_export_filename(
-    query_source: Option<&str>,
-    library_source: Option<&str>,
-) -> String {
-    let query = query_source
-        .map(sanitize_filename_fragment)
-        .unwrap_or_else(|| "queries".to_string());
-    let library = library_source
-        .map(sanitize_filename_fragment)
-        .unwrap_or_else(|| "library".to_string());
-    format!("{query}__vs__{library}__spectral_search.tsv")
-}
-
 fn json_escape(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() + 16);
     for ch in raw.chars() {
@@ -5735,167 +4527,6 @@ fn occurrence_matches_reranked_taxon(
         }
     }
     false
-}
-
-fn selected_structure_library_hits(
-    columns: &[String],
-    row: &[String],
-    active_merged: Option<&ActiveMergedSearchExportInfo>,
-) -> Vec<StructureLibraryHit> {
-    let Some(active_merged) = active_merged else {
-        return Vec::new();
-    };
-    active_merged
-        .library_aliases
-        .iter()
-        .zip(active_merged.library_prefixes.iter())
-        .map(|(alias, prefix)| {
-            let present = find_row_value(columns, row, |normalized| {
-                normalized == format!("{prefix}present")
-            })
-            .is_some_and(|value| value == "1");
-            let rank = find_row_value(columns, row, |normalized| {
-                normalized == format!("{prefix}rank")
-            })
-            .and_then(|value| value.parse::<usize>().ok());
-            StructureLibraryHit {
-                alias: alias.clone(),
-                prefix: prefix.clone(),
-                rank,
-                present,
-            }
-        })
-        .collect()
-}
-
-fn merged_structure_library_hits(entries: &[&SelectedStructureEntry]) -> Vec<StructureLibraryHit> {
-    let Some(first_entry) = entries.first() else {
-        return Vec::new();
-    };
-
-    let mut merged_hits = first_entry.library_hits.clone();
-    let mut hit_index_by_prefix: HashMap<String, usize> = merged_hits
-        .iter()
-        .enumerate()
-        .map(|(idx, hit)| (hit.prefix.clone(), idx))
-        .collect();
-
-    for hit in &mut merged_hits {
-        if !hit.present {
-            hit.rank = None;
-        }
-    }
-
-    for entry in entries.iter().skip(1) {
-        for hit in &entry.library_hits {
-            if let Some(existing_idx) = hit_index_by_prefix.get(&hit.prefix).copied() {
-                let existing = &mut merged_hits[existing_idx];
-                existing.present |= hit.present;
-                existing.rank = match (existing.rank, hit.rank) {
-                    (Some(current), Some(candidate)) => Some(current.min(candidate)),
-                    (None, Some(candidate)) => Some(candidate),
-                    (current, None) => current,
-                };
-            } else {
-                let mut cloned = hit.clone();
-                if !cloned.present {
-                    cloned.rank = None;
-                }
-                hit_index_by_prefix.insert(cloned.prefix.clone(), merged_hits.len());
-                merged_hits.push(cloned);
-            }
-        }
-    }
-
-    merged_hits
-}
-
-fn structure_matches_source_filter(
-    library_hits: &[StructureLibraryHit],
-    library_rank_limits: &[usize],
-    filter: StructureSourceFilter,
-    active_merged: Option<&ActiveMergedSearchExportInfo>,
-) -> bool {
-    let Some(active_merged) = active_merged else {
-        return true;
-    };
-    let visible_hits = library_hits
-        .iter()
-        .enumerate()
-        .map(|(idx, hit)| {
-            structure_library_hit_passes_rank_limit(hit, library_rank_limits.get(idx).copied())
-        })
-        .collect::<Vec<_>>();
-    if filter == StructureSourceFilter::Any {
-        return visible_hits.iter().any(|present| *present);
-    }
-    if active_merged.library_aliases.len() < 2 {
-        return visible_hits.iter().any(|present| *present);
-    }
-    let first = visible_hits.first().copied().unwrap_or(false);
-    let second = visible_hits.get(1).copied().unwrap_or(false);
-    match filter {
-        StructureSourceFilter::Any => true,
-        StructureSourceFilter::OnlyFirst => first && !second,
-        StructureSourceFilter::OnlySecond => !first && second,
-        StructureSourceFilter::BothFirstSecond => first && second,
-    }
-}
-
-fn draw_structure_library_hits(ui: &mut egui::Ui, library_hits: &[StructureLibraryHit]) {
-    if library_hits.is_empty() {
-        return;
-    }
-
-    ui.horizontal_wrapped(|ui| {
-        ui.small("Library ranks:");
-        for hit in library_hits {
-            let value = match hit.rank {
-                Some(rank) => format!("#{rank}"),
-                None if hit.present => "hit".to_string(),
-                None => "no hit".to_string(),
-            };
-            ui.small(format!("{}: {value}", hit.alias));
-        }
-    });
-}
-
-fn structure_library_hit_passes_rank_limit(
-    hit: &StructureLibraryHit,
-    rank_limit: Option<usize>,
-) -> bool {
-    if !hit.present {
-        return false;
-    }
-    match (hit.rank, rank_limit) {
-        (Some(rank), Some(limit)) => rank <= limit,
-        _ => true,
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn merged_table_library_rank_maxima(table: &AttributeTable, prefixes: &[String]) -> Vec<usize> {
-    prefixes
-        .iter()
-        .map(|prefix| {
-            let column_name = format!("{prefix}__rank");
-            let Some(column_idx) = table
-                .columns
-                .iter()
-                .position(|column| column == &column_name)
-            else {
-                return 1;
-            };
-            table
-                .rows
-                .iter()
-                .filter_map(|row| row.get(column_idx))
-                .filter_map(|value| value.trim().parse::<usize>().ok())
-                .max()
-                .unwrap_or(1)
-                .max(1)
-        })
-        .collect()
 }
 
 fn build_structure_display_groups<'a>(
@@ -6364,16 +4995,14 @@ fn default_structure_caption_columns(columns: &[String], smiles_col: Option<usiz
 
 impl eframe::App for SpectralApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_compute(ctx);
-        self.poll_search(ctx);
         self.poll_depiction(ctx);
         #[cfg(not(target_arch = "wasm32"))]
-        self.poll_lotus_metadata(ctx);
+        self.poll_lotus_load();
 
         if self.show_left_panel {
             egui::SidePanel::left("controls_panel")
                 .resizable(true)
-                .default_width(360.0)
+                .default_width(300.0)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         if ui.button("<<").clicked() {
@@ -6412,7 +5041,11 @@ impl eframe::App for SpectralApp {
                         }
                     });
                     ui.separator();
-                    self.draw_selected_node_panel(ui);
+                    egui::ScrollArea::vertical()
+                        .id_salt("selected_node_scroll")
+                        .show(ui, |ui| {
+                            self.draw_selected_node_panel(ui);
+                        });
                 });
             self.selected_node_panel_width = panel.response.rect.width().clamp(240.0, 960.0);
         } else {
@@ -6429,61 +5062,14 @@ impl eframe::App for SpectralApp {
                 });
         }
 
-        if self.node_attr_panel_dock == NodeAttrPanelDock::Right {
-            let panel = egui::SidePanel::right("node_attributes_side_panel")
-                .resizable(self.show_node_attributes_panel)
-                .default_width(if self.show_node_attributes_panel {
-                    self.node_attr_right_width
-                } else {
-                    58.0
-                })
-                .min_width(if self.show_node_attributes_panel {
-                    220.0
-                } else {
-                    58.0
-                })
-                .max_width(if self.show_node_attributes_panel {
-                    1800.0
-                } else {
-                    58.0
-                })
-                .show(ctx, |ui| {
-                    self.draw_node_attributes_panel(ui, "right");
-                });
-            if self.show_node_attributes_panel {
-                self.node_attr_right_width = panel.response.rect.width().clamp(220.0, 1800.0);
-            }
-        }
-
-        if self.node_attr_panel_dock == NodeAttrPanelDock::Bottom {
-            egui::TopBottomPanel::bottom("node_attributes_bottom_panel")
-                .resizable(false)
-                .exact_height(if self.show_node_attributes_panel {
-                    self.node_attr_bottom_height
-                } else {
-                    34.0
-                })
-                .show(ctx, |ui| {
-                    self.draw_node_attributes_panel(ui, "bottom");
-                });
-        }
-
-        if self.node_attr_panel_dock == NodeAttrPanelDock::Detached
-            && self.show_node_attributes_panel
-        {
-            let mut open = true;
-            egui::Window::new("Node Attributes Table")
-                .id(egui::Id::new("node_attributes_detached_window"))
-                .resizable(true)
-                .default_size(egui::vec2(980.0, 340.0))
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    self.draw_node_attributes_panel(ui, "detached");
-                });
-            if !open {
-                self.show_node_attributes_panel = false;
-            }
-        }
+        egui::TopBottomPanel::bottom("node_attributes_bottom_panel")
+            .resizable(false)
+            .exact_height(if self.show_node_attributes_panel {
+                self.node_attr_bottom_height
+            } else {
+                34.0
+            })
+            .show(ctx, |ui| self.draw_node_attributes_panel(ui, "bottom"));
 
         if self.show_selection_structures_detached
             && self.structure_panel_mode == StructurePanelMode::SelectedSet
@@ -6604,20 +5190,17 @@ fn visible_node_ids_for_view(
 #[cfg(test)]
 mod tests {
     use crate::attributes::AttributeTable;
-    use crate::export::SearchQueryKey;
     use crate::network::{ComponentSelection, NetworkEdge, NetworkNode, SpectralNetwork};
+    use spectral_matcher::SearchQueryKey;
 
     use super::{
-        ActiveMergedSearchExportInfo, NodeAttrMatchField, SelectedStructureEntry,
-        SelectedStructureTaxonomicMetadata, StructureLibraryHit, StructureSourceFilter,
+        NodeAttrMatchField, SelectedStructureEntry, SelectedStructureTaxonomicMetadata,
         StructureTaxonomicLinks, StructureTaxonomyFilter, build_lotus_occurrence_summary,
-        build_structure_display_groups, default_search_export_filename,
-        default_structure_caption_columns, depict_cache_key, infer_single_search_query_key_mode,
-        inferred_node_attribute_mapping_for_table, keep_selected_if_visible,
-        merged_structure_library_hits, occurrence_matches_reranked_taxon, parse_taxonomic_rank,
+        build_structure_display_groups, default_structure_caption_columns, depict_cache_key,
+        infer_single_search_query_key_mode, inferred_node_attribute_mapping_for_table,
+        keep_selected_if_visible, occurrence_matches_reranked_taxon, parse_taxonomic_rank,
         preferred_compound_label_from_row, selected_structure_short_inchikey,
-        selected_structure_taxonomic_metadata, structure_matches_source_filter,
-        visible_node_ids_for_view,
+        selected_structure_taxonomic_metadata, visible_node_ids_for_view,
     };
     use crate::metadata::{LotusBiosource, TaxonomicRank, TaxonomyLineage};
 
@@ -6681,20 +5264,6 @@ mod tests {
         }
     }
 
-    fn library_hit(
-        alias: &str,
-        prefix: &str,
-        rank: Option<usize>,
-        present: bool,
-    ) -> StructureLibraryHit {
-        StructureLibraryHit {
-            alias: alias.to_string(),
-            prefix: prefix.to_string(),
-            rank,
-            present,
-        }
-    }
-
     fn selected_structure_entry(
         node_id: usize,
         feature_id: Option<&str>,
@@ -6709,7 +5278,6 @@ mod tests {
             preferred_compound_label: None,
             compound_qid: None,
             short_inchikey: None,
-            library_hits: Vec::new(),
             matched_taxonomic_organism_name: None,
             matched_taxonomic_organism_qid: None,
             taxonomic_reranked: false,
@@ -6756,15 +5324,6 @@ mod tests {
 
         let visible = visible_node_ids_for_view(&network, ComponentSelection::Largest, true);
         assert_eq!(visible, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn search_export_filename_uses_both_sources() {
-        let filename = default_search_export_filename(Some("queries.mgf"), Some("lib/test.mgf"));
-        assert_eq!(
-            filename,
-            "queries.mgf__vs__lib_test.mgf__spectral_search.tsv"
-        );
     }
 
     #[test]
@@ -7132,114 +5691,6 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_structure_library_hits_keep_best_rank_per_library() {
-        let first = SelectedStructureEntry {
-            short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
-            library_hits: vec![
-                library_hit("libA", "liba", Some(4), true),
-                library_hit("libB", "libb", None, false),
-            ],
-            ..selected_structure_entry(1, Some("f1"), "CCO")
-        };
-        let second = SelectedStructureEntry {
-            short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
-            library_hits: vec![
-                library_hit("libA", "liba", Some(2), true),
-                library_hit("libB", "libb", Some(7), true),
-            ],
-            ..selected_structure_entry(2, Some("f2"), "CCO")
-        };
-
-        let merged = merged_structure_library_hits(&[&first, &second]);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0], library_hit("libA", "liba", Some(2), true));
-        assert_eq!(merged[1], library_hit("libB", "libb", Some(7), true));
-    }
-
-    #[test]
-    fn source_filter_uses_aggregated_card_level_hits() {
-        let active = ActiveMergedSearchExportInfo {
-            source_label: "merged".to_string(),
-            row_count: 2,
-            library_aliases: vec!["libA".to_string(), "libB".to_string()],
-            library_prefixes: vec!["liba".to_string(), "libb".to_string()],
-            library_rank_maxima: vec![10, 10],
-            inferred_query_key: None,
-        };
-        let first = SelectedStructureEntry {
-            short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
-            library_hits: vec![
-                library_hit("libA", "liba", Some(4), true),
-                library_hit("libB", "libb", None, false),
-            ],
-            ..selected_structure_entry(1, Some("f1"), "CCO")
-        };
-        let second = SelectedStructureEntry {
-            short_inchikey: Some("ABCDEFGHIJKLMN".to_string()),
-            library_hits: vec![
-                library_hit("libA", "liba", None, false),
-                library_hit("libB", "libb", Some(3), true),
-            ],
-            ..selected_structure_entry(2, Some("f2"), "CCO")
-        };
-
-        let merged_hits = merged_structure_library_hits(&[&first, &second]);
-        assert!(structure_matches_source_filter(
-            &merged_hits,
-            &[10, 10],
-            StructureSourceFilter::BothFirstSecond,
-            Some(&active)
-        ));
-        assert!(!structure_matches_source_filter(
-            &merged_hits,
-            &[10, 10],
-            StructureSourceFilter::OnlyFirst,
-            Some(&active)
-        ));
-        assert!(!structure_matches_source_filter(
-            &merged_hits,
-            &[10, 10],
-            StructureSourceFilter::OnlySecond,
-            Some(&active)
-        ));
-    }
-
-    #[test]
-    fn source_filter_respects_library_rank_limits() {
-        let active = ActiveMergedSearchExportInfo {
-            source_label: "merged".to_string(),
-            row_count: 1,
-            library_aliases: vec!["libA".to_string(), "libB".to_string()],
-            library_prefixes: vec!["liba".to_string(), "libb".to_string()],
-            library_rank_maxima: vec![10, 10],
-            inferred_query_key: None,
-        };
-        let library_hits = vec![
-            library_hit("libA", "liba", Some(5), true),
-            library_hit("libB", "libb", Some(2), true),
-        ];
-
-        assert!(structure_matches_source_filter(
-            &library_hits,
-            &[5, 2],
-            StructureSourceFilter::BothFirstSecond,
-            Some(&active)
-        ));
-        assert!(structure_matches_source_filter(
-            &library_hits,
-            &[4, 2],
-            StructureSourceFilter::OnlySecond,
-            Some(&active)
-        ));
-        assert!(!structure_matches_source_filter(
-            &library_hits,
-            &[4, 2],
-            StructureSourceFilter::BothFirstSecond,
-            Some(&active)
-        ));
-    }
-
-    #[test]
     fn default_structure_captions_skip_query_raw_name() {
         let columns = vec![
             "query_feature_id".to_string(),
@@ -7258,5 +5709,631 @@ mod tests {
     fn depict_cache_key_ignores_smiles_whitespace() {
         assert_eq!(depict_cache_key("C C O"), "CCO");
         assert_eq!(depict_cache_key(" \nC\tC O\r "), "CCO");
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn numeric_peak_area_styles_node_radii_with_adjustable_pivot() {
+        use crate::attributes::LoadedAttributeTable;
+
+        let creation = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = super::SpectralApp::new(&creation);
+        app.network = Some(sample_network(
+            &[(0, 0, 0), (1, 1, 0), (2, 2, 0), (3, 3, 0)],
+            &[],
+        ));
+        let table = AttributeTable::parse_tsv(
+            "query_node_id\tPeak area\n0\t0\n1\t10\n2\t100\n3\tmissing\n",
+        )
+        .expect("numeric node attributes");
+        app.set_node_attributes_table(
+            LoadedAttributeTable::new("quantification".to_string(), table),
+            Some("query_node_id"),
+            Some(NodeAttrMatchField::NodeId),
+        );
+        app.node_size_attr_column = Some(1);
+        app.node_size_min_radius = 3.0;
+        app.node_size_max_radius = 15.0;
+        app.node_size_pivot = 0.2;
+        let visible = std::collections::HashSet::from([0, 1, 2, 3]);
+        let radii = app
+            .node_attribute_sizing(app.network.as_ref().unwrap(), &visible)
+            .unwrap();
+        assert_eq!(radii[&0], 3.0);
+        assert_eq!(radii[&1], 6.0);
+        assert_eq!(radii[&2], 15.0);
+        assert!(!radii.contains_key(&3));
+        app.node_size_pivot = 0.5;
+        let linear = app
+            .node_attribute_sizing(app.network.as_ref().unwrap(), &visible)
+            .unwrap();
+        assert!((linear[&1] - 4.2).abs() < 1e-5);
+        assert_eq!(
+            super::node_radius_for_value(5.0, 5.0, 5.0, 3.0, 15.0, 0.2),
+            9.0
+        );
+
+        for id in 0..4 {
+            app.positions.insert(id, [id as f32 * 0.2, 0.0]);
+        }
+        app.node_size_pivot = 0.2;
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.draw_canvas(ui));
+            },
+        );
+        let drawn: Vec<f32> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| {
+                if let egui::Shape::Circle(circle) = &clipped.shape {
+                    Some(circle.radius)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(drawn.contains(&3.0), "{drawn:?}");
+        assert!(drawn.contains(&6.0), "{drawn:?}");
+        assert!(drawn.contains(&15.0), "{drawn:?}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn feature_search_link_reveals_and_centers_a_hidden_network_node() {
+        use crate::attributes::LoadedAttributeTable;
+
+        fn render_table(
+            app: &mut super::SpectralApp,
+            ctx: &egui::Context,
+            events: Vec<egui::Event>,
+        ) -> egui::FullOutput {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.draw_node_attributes_panel(ui, "navigation_test");
+                    });
+                },
+            )
+        }
+
+        fn link_position(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + egui::vec2(4.0, 4.0))
+                }
+                egui::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| link_position(shape, label))
+                }
+                _ => None,
+            }
+        }
+
+        let creation = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = super::SpectralApp::new(&creation);
+        app.network = Some(sample_network(&[(0, 0, 0), (1, 1, 0)], &[]));
+        app.positions.insert(0, [0.0, 0.0]);
+        app.positions.insert(1, [3.0, 2.0]);
+        let table = AttributeTable::parse_tsv("query_node_id\tcompound\n0\tA\n1\tB\n")
+            .expect("node attributes");
+        app.set_node_attributes_table(
+            LoadedAttributeTable::new("embedded".to_string(), table),
+            Some("query_node_id"),
+            Some(NodeAttrMatchField::NodeId),
+        );
+        app.component_selection = ComponentSelection::Component(0);
+        app.hide_singletons = true;
+        app.peak_filtered_node_ids = Some(std::collections::HashSet::from([0]));
+        app.table_node_filter = Some(std::collections::HashSet::from([0]));
+        app.node_attr_search_query = "f1".to_string();
+
+        let ctx = egui::Context::default();
+        let _ = render_table(&mut app, &ctx, Vec::new());
+        let output = render_table(&mut app, &ctx, Vec::new());
+        let link = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| link_position(&clipped.shape, "f1"))
+            .last()
+            .expect("feature link should be shown even when its node is filtered out");
+        for pressed in [true, false] {
+            render_table(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(link),
+                    egui::Event::PointerButton {
+                        pos: link,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        assert_eq!(app.selected_node_id, Some(1));
+        assert_eq!(app.component_selection, ComponentSelection::All);
+        assert!(!app.hide_singletons);
+        assert!(app.peak_filtered_node_ids.is_none());
+        assert!(app.table_node_filter.is_none());
+
+        let mut canvas_size = egui::Vec2::ZERO;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    canvas_size = ui.available_size_before_wrap();
+                    app.draw_canvas(ui);
+                });
+            },
+        );
+        assert!(app.view_state.zoom >= 2.0);
+        let position = app.positions[&1];
+        let scale = canvas_size.x.min(canvas_size.y) * 0.4 * app.view_state.zoom;
+        assert!((app.view_state.pan.x + position[0] * scale).abs() < 0.01);
+        assert!((app.view_state.pan.y + position[1] * scale).abs() < 0.01);
+        app.node_attr_search_query = "B".to_string();
+        let output = render_table(&mut app, &ctx, Vec::new());
+        let mode_button = output
+            .shapes
+            .iter()
+            .find_map(|clipped| link_position(&clipped.shape, "Search mode: Feature ID"))
+            .expect("search mode control");
+        for pressed in [true, false] {
+            render_table(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(mode_button),
+                    egui::Event::PointerButton {
+                        pos: mode_button,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        assert_eq!(
+            app.node_attr_search_mode,
+            super::NodeAttrSearchMode::AllAttributes
+        );
+        let output = render_table(&mut app, &ctx, Vec::new());
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|clipped| link_position(&clipped.shape, "f1").is_some())
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn result_directory_loads_ranked_hits_grouped_means_pies_and_preserves_peaks() {
+        use spectral_matcher::{
+            ComputeParams, LibrarySearchParams, NetworkBuildParams, NetworkRequest, ParseConfig,
+            SearchQueryKey as MatcherQueryKey, SearchRequest, SimilarityMetric,
+            build_network_artifact, run_search_request,
+        };
+
+        struct TemporaryDirectory(std::path::PathBuf);
+        impl Drop for TemporaryDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = TemporaryDirectory(std::env::temp_dir().join(format!(
+            "spectral-gui-result-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        )));
+        std::fs::create_dir(&directory.0).unwrap();
+        let query = "BEGIN IONS\nTITLE=query one\nFEATURE_ID=first\nPEPMASS=150\n100 10\n101 20\n102 30\n103 40\n104 50\nEND IONS\nBEGIN IONS\nTITLE=query two\nFEATURE_ID=second\nPEPMASS=150\n100 10\n101 20\n102 30\n103 40\n104 50\nEND IONS\nBEGIN IONS\nTITLE=no library match\nFEATURE_ID=third\nPEPMASS=300\n100 10\n101 20\n102 30\n103 40\n104 50\nEND IONS\n";
+        let library = "BEGIN IONS\nTITLE=Compound A\nFEATURE_ID=a\nSMILES=CCO\nPEPMASS=150\n100 10\n101 20\n102 30\n103 40\n104 50\nEND IONS\nBEGIN IONS\nTITLE=Compound B\nFEATURE_ID=b\nSMILES=CCN\nPEPMASS=150\n100 10\n101 20\n102 30\n103 40\n104 50\nEND IONS\n";
+        let compute = ComputeParams {
+            metric: SimilarityMetric::LinearCosine,
+            fragment_mz_tolerance: 0.02,
+            mz_power: 0.0,
+            intensity_power: 1.0,
+            top_n_peaks: None,
+        };
+        let network = build_network_artifact(NetworkRequest {
+            source_label: "query.mgf".to_string(),
+            mgf_text: Some(query.to_string()),
+            mgf_path: None,
+            parse: ParseConfig::default(),
+            build: NetworkBuildParams {
+                compute,
+                threshold: 0.1,
+                min_matched_peaks: 1,
+                top_k: 5,
+            },
+        })
+        .unwrap();
+        let search = run_search_request(SearchRequest {
+            query_source_label: "query.mgf".to_string(),
+            query_mgf_text: Some(query.to_string()),
+            query_mgf_path: None,
+            library_source_label: "library.mgf".to_string(),
+            library_mgf_text: Some(library.to_string()),
+            library_mgf_path: None,
+            parse: ParseConfig::default(),
+            search: LibrarySearchParams {
+                compute,
+                precursor_mz_tolerance: 0.1,
+                min_matched_peaks: 1,
+                min_similarity_threshold: 0.0,
+                top_n: 2,
+            },
+            taxonomy: None,
+            query_key: Some(MatcherQueryKey::FeatureId),
+        })
+        .unwrap();
+        assert_eq!(
+            search
+                .result
+                .hits
+                .iter()
+                .filter(|hit| hit.query_index == 1)
+                .count(),
+            2
+        );
+        assert!(search.result.hits.iter().all(|hit| hit.query_index != 2));
+        let quant = directory.0.join("quant.csv");
+        let metadata = directory.0.join("metadata.csv");
+        std::fs::write(
+            &quant,
+            "row ID,a Peak area,b Peak area,c Peak area,qc Peak area\nfirst,10,30,50,999\nsecond,0,20,,999\nthird,5,5,5,999\n",
+        ).unwrap();
+        std::fs::write(
+            &metadata,
+            "filename,sample_type,ATTRIBUTE_tissue,ATTRIBUTE_batch\na,sample,leaf,X\nb,sample,root,X\nc,sample,leaf,Y\nqc,QC,root,Z\n",
+        ).unwrap();
+        std::fs::write(
+            directory.0.join("result.toml"),
+            format!(
+                "network = \"network.json\"\nsearch = \"search.json\"\nfeature_quant_csv = {:?}\nsample_metadata_csv = {:?}\n",
+                quant.display().to_string(),
+                metadata.display().to_string(),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.0.join("network.json"),
+            serde_json::to_vec(&network).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.0.join("search.json"),
+            serde_json::to_vec(&search).unwrap(),
+        )
+        .unwrap();
+
+        let creation = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = super::SpectralApp::new(&creation);
+        app.load_result_directory(&directory.0);
+        assert!(app.error_message.is_none(), "{:?}", app.error_message);
+        assert_eq!(app.network.as_ref().unwrap().nodes.len(), 3);
+        assert_eq!(app.search_query_node_ids.len(), 3);
+        assert_eq!(
+            app.spectrum_peaks_for_node(app.search_query_node_ids[1])
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            app.search_results
+                .as_ref()
+                .unwrap()
+                .hits
+                .iter()
+                .filter(|hit| app.search_query_node_ids[hit.query_index]
+                    == app.search_query_node_ids[1])
+                .count(),
+            2
+        );
+        let ui_context = egui::Context::default();
+        let table = &app.node_attributes.as_ref().unwrap().table;
+        assert_eq!(table.rows.len(), 3);
+        let tissue_leaf = table
+            .columns
+            .iter()
+            .position(|column| column == "ATTRIBUTE_tissue:leaf")
+            .unwrap();
+        let tissue_root = table
+            .columns
+            .iter()
+            .position(|column| column == "ATTRIBUTE_tissue:root")
+            .unwrap();
+        let batch_x = table
+            .columns
+            .iter()
+            .position(|column| column == "ATTRIBUTE_batch:X")
+            .unwrap();
+        let batch_y = table
+            .columns
+            .iter()
+            .position(|column| column == "ATTRIBUTE_batch:Y")
+            .unwrap();
+        assert_eq!(table.rows[0][tissue_leaf], "30");
+        assert_eq!(table.rows[0][tissue_root], "30");
+        assert_eq!(table.rows[0][batch_x], "20");
+        assert_eq!(table.rows[0][batch_y], "50");
+        assert_eq!(table.rows[1][tissue_leaf], "0");
+        assert!(table.rows[1][batch_y].is_empty());
+        assert_eq!(table.rows[2][tissue_leaf], "5");
+        assert!(table.rows[2].iter().any(|value| value == "third"));
+        assert_eq!(app.pie_axes[0].categories, ["leaf", "root"]);
+        assert_eq!(app.pie_axis, Some(0));
+        assert_eq!(
+            app.pie_values[&app.search_query_node_ids[0]][0],
+            [30.0, 30.0]
+        );
+        let pie_context = egui::Context::default();
+        let pie_output = pie_context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.draw_canvas(ui));
+            },
+        );
+        let mesh_colors: std::collections::HashSet<_> = pie_output
+            .shapes
+            .iter()
+            .filter_map(|clipped| {
+                if let egui::Shape::Mesh(mesh) = &clipped.shape {
+                    Some(mesh.vertices[0].color)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(mesh_colors.contains(&app.pie_palettes[0].color(0, 2)));
+        assert!(mesh_colors.contains(&app.pie_palettes[0].color(1, 2)));
+        let pie_center = pie_output
+            .shapes
+            .iter()
+            .find_map(|clipped| {
+                if let egui::Shape::Mesh(mesh) = &clipped.shape {
+                    Some(mesh.vertices[0].pos)
+                } else {
+                    None
+                }
+            })
+            .expect("rendered node pie");
+        for pressed in [true, false] {
+            let _ = pie_context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 900.0),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(pie_center),
+                        egui::Event::PointerButton {
+                            pos: pie_center,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.draw_canvas(ui));
+                },
+            );
+        }
+        assert_eq!(
+            app.selected_node_id,
+            Some(app.network.as_ref().unwrap().nodes[0].id)
+        );
+        app.pie_palettes[0] = crate::pie_palette::PiePalette::Sequential;
+        app.pie_palettes[1] = crate::pie_palette::PiePalette::Diverging;
+        app.pie_axis = Some(1);
+        let style_context = egui::Context::default();
+        let render_style = |app: &mut super::SpectralApp, events: Vec<egui::Event>| {
+            style_context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 1000.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::SidePanel::left("palette_controls")
+                        .show(ctx, |ui| app.draw_controls(ui, ctx));
+                    egui::CentralPanel::default().show(ctx, |ui| app.draw_canvas(ui));
+                },
+            )
+        };
+        let styled_output = render_style(&mut app, Vec::new());
+        let styled_colors: std::collections::HashSet<_> = styled_output
+            .shapes
+            .iter()
+            .filter_map(|clipped| {
+                if let egui::Shape::Mesh(mesh) = &clipped.shape {
+                    Some(mesh.vertices.as_slice())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .map(|vertex| vertex.color)
+            .collect();
+        assert!(styled_colors.contains(&app.pie_palettes[1].color(0, 2)));
+        assert!(styled_colors.contains(&app.pie_palettes[1].color(1, 2)));
+        assert!(!styled_colors.contains(&app.pie_palettes[0].color(0, 2)));
+        assert!(
+            styled_output.shapes.iter().any(|clipped| {
+                let egui::Shape::Mesh(mesh) = &clipped.shape else {
+                    return false;
+                };
+                let (first, second) =
+                    mesh.indices
+                        .chunks_exact(3)
+                        .fold((0, 0), |(first, second), triangle| {
+                            let color = mesh.vertices[triangle[0] as usize].color;
+                            (
+                                first + usize::from(color == app.pie_palettes[1].color(0, 2)),
+                                second + usize::from(color == app.pie_palettes[1].color(1, 2)),
+                            )
+                        });
+                first > 0 && second > first * 2
+            }),
+            "20:50 group means should give the second category more than twice the pie area"
+        );
+        fn shape_label_pos(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + egui::vec2(5.0, 5.0))
+                }
+                egui::Shape::Vec(shapes) => shapes
+                    .iter()
+                    .find_map(|shape| shape_label_pos(shape, label)),
+                _ => None,
+            }
+        }
+        let label_pos = |output: &egui::FullOutput, label: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|clipped| shape_label_pos(&clipped.shape, label))
+        };
+        let pointer_events = |pos, pressed| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        let combo = label_pos(&styled_output, "Diverging").expect("rendered pie palette selector");
+        for pressed in [true, false] {
+            render_style(&mut app, pointer_events(combo, pressed));
+        }
+        // egui paints a newly opened combo popup on the following frame.
+        let opened_menu = render_style(&mut app, Vec::new());
+        let option = label_pos(&opened_menu, "Contrasting").expect("palette menu option");
+        for pressed in [true, false] {
+            render_style(&mut app, pointer_events(option, pressed));
+        }
+        assert_eq!(
+            app.pie_palettes[1],
+            crate::pie_palette::PiePalette::Contrasting
+        );
+        assert_eq!(
+            app.pie_palettes[0],
+            crate::pie_palette::PiePalette::Sequential
+        );
+        let output = ui_context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.draw_ranked_hits(ui, app.search_query_node_ids[1]);
+                });
+            },
+        );
+        fn collect_text(shape: &egui::Shape, labels: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => labels.push(text.galley.text().to_string()),
+                egui::Shape::Vec(shapes) => {
+                    for child in shapes {
+                        collect_text(child, labels);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut labels = Vec::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut labels);
+        }
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("#1 ·") && label.contains("Compound A")),
+            "{labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("#2 ·") && label.contains("Compound B")),
+            "{labels:?}"
+        );
+        let lotus = directory.0.join("lotus.csv");
+        std::fs::write(
+            &lotus,
+            concat!(
+                "structure_inchikey,organism_wikidata,organism_name,organism_taxonomy_01domain,organism_taxonomy_02kingdom,organism_taxonomy_03phylum,organism_taxonomy_04class,organism_taxonomy_05order,organism_taxonomy_06family,organism_taxonomy_07tribe,organism_taxonomy_08genus,organism_taxonomy_09species,organism_taxonomy_10varietas\n",
+                "ABCDEFGHIJKLMN-AAAA,http://www.wikidata.org/entity/Q1,Withania somnifera,Eukaryota,Archaeplastida,Streptophyta,Magnoliopsida,Solanales,Solanaceae,NA,Withania,Withania somnifera,NA\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.0.join("result.toml"),
+            format!(
+                "network = \"network.json\"\nsearch = \"search.json\"\nlotus_csv = \"{}\"\n",
+                lotus.display()
+            ),
+        )
+        .unwrap();
+        app.load_result_directory(&directory.0);
+        assert!(app.error_message.is_none(), "{:?}", app.error_message);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.lotus_load.is_some() && std::time::Instant::now() < deadline {
+            app.poll_lotus_load();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(app.lotus_metadata.is_some(), "{:?}", app.error_message);
+        assert_eq!(app.lotus_metadata.as_ref().unwrap().stats.rows, 1);
+
+        std::fs::remove_file(directory.0.join("search.json")).unwrap();
+        app.load_result_directory(&directory.0);
+        assert!(
+            app.error_message
+                .as_deref()
+                .unwrap()
+                .contains("search.json")
+        );
+        assert!(app.network.is_none());
+        assert!(app.search_results.is_none());
     }
 }

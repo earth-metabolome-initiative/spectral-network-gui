@@ -3748,8 +3748,6 @@ dependencies = [
  "ehttp",
  "js-sys",
  "mass_spectrometry",
- "poll-promise",
- "rayon",
  "rfd",
  "serde",
  "serde_json",
@@ -3757,7 +3755,6 @@ dependencies = [
  "toml",
  "urlencoding",
  "wasm-bindgen",
- "wasm-bindgen-futures",
  "web-sys",
 ]
 
